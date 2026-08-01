@@ -171,7 +171,7 @@ class SpectralAdapterLinear(nn.Module):
         if learn_scaling:
             self.log_scaling = nn.Parameter(
                 torch.tensor(math.log(max(scaling, 1e-6)),
-                             dtype=base_layer.weight.dtype))
+                             dtype=torch.float32))
         else:
             self.scaling = scaling
 
@@ -182,22 +182,22 @@ class SpectralAdapterLinear(nn.Module):
         # Compute DCT basis matrices (frozen buffers)
         # dct_in: selected q rows of n-dim DCT matrix → (q, n)
         # dct_out: selected p rows of m-dim DCT matrix → (p, m)
-        dtype = base_layer.weight.dtype
+        # Always float32 for DCT precision (critical for float16 base models like LLaMA)
         if freq_mode == "contiguous":
-            self.register_buffer('dct_in', _dct_basis(self.in_features, q, dtype))
-            self.register_buffer('dct_out', _dct_basis(self.out_features, p, dtype))
+            self.register_buffer('dct_in', _dct_basis(self.in_features, q, torch.float32))
+            self.register_buffer('dct_out', _dct_basis(self.out_features, p, torch.float32))
         else:
             freq_in = _generate_freq_indices(self.in_features, q, freq_mode, freq_exponent)
             freq_out = _generate_freq_indices(self.out_features, p, freq_mode, freq_exponent)
-            self.register_buffer('dct_in', _dct_basis_at_indices(self.in_features, freq_in, dtype))
-            self.register_buffer('dct_out', _dct_basis_at_indices(self.out_features, freq_out, dtype))
+            self.register_buffer('dct_in', _dct_basis_at_indices(self.in_features, freq_in, torch.float32))
+            self.register_buffer('dct_out', _dct_basis_at_indices(self.out_features, freq_out, torch.float32))
 
-        # Trainable coefficient matrix
+        # Trainable coefficient matrix — always float32 for optimizer precision
         if factored_rank > 0:
             # Factored: S = A @ B, where A ∈ R^{p × r}, B ∈ R^{r × q}
             # Params per module = p*r + r*q instead of p*q
-            self.coeffs_A = nn.Parameter(torch.zeros(p, factored_rank, dtype=dtype))
-            self.coeffs_B = nn.Parameter(torch.zeros(factored_rank, q, dtype=dtype))
+            self.coeffs_A = nn.Parameter(torch.zeros(p, factored_rank, dtype=torch.float32))
+            self.coeffs_B = nn.Parameter(torch.zeros(factored_rank, q, dtype=torch.float32))
             if d_initial > 0.0:
                 # Scale factor init so S = A@B has Std[S] = d_initial.
                 # Var[S_ij] = r * sigma_a^2 * sigma_b^2. With sigma_a = sigma_b = sigma:
@@ -207,7 +207,7 @@ class SpectralAdapterLinear(nn.Module):
                 nn.init.normal_(self.coeffs_B, mean=0, std=sigma)
         else:
             # Dense: S ∈ R^{p × q}
-            self.coeffs = nn.Parameter(torch.zeros(p, q, dtype=dtype))
+            self.coeffs = nn.Parameter(torch.zeros(p, q, dtype=torch.float32))
             if d_initial > 0.0:
                 nn.init.normal_(self.coeffs, mean=0, std=d_initial)
         # else: zeros → ΔW = 0 at start (identity adapter)
@@ -235,10 +235,14 @@ class SpectralAdapterLinear(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Base forward pass
         base_out = self.base_layer(x)
+        base_dtype = base_out.dtype
 
-        # Spectral adapter: factored DCT computation
+        # Spectral adapter: factored DCT computation in float32
+        # Cast input to float32 for adapter precision (DCT basis and coeffs are float32)
+        x_f32 = x.float()
+
         # Step 1: project input to q-dim DCT space
-        x_proj = F.linear(x, self.dct_in)       # (batch, seq, n) → (batch, seq, q)
+        x_proj = F.linear(x_f32, self.dct_in)   # (batch, seq, n) → (batch, seq, q)
         x_proj = self.dropout(x_proj)
 
         # Step 2: transform by trainable coefficients
@@ -252,7 +256,8 @@ class SpectralAdapterLinear(nn.Module):
         # Step 3: reconstruct in output space
         delta_out = F.linear(s_out, self.dct_out.t())
 
-        return base_out + self._get_scaling() * delta_out
+        # Cast back to base dtype before residual add
+        return base_out + self._get_scaling() * delta_out.to(base_dtype)
 
     def extra_repr(self) -> str:
         scaling_str = f"learn_scaling=True" if self.learn_scaling else f"scaling={self.scaling}"
@@ -275,7 +280,8 @@ class SpectralAdapterModel(nn.Module):
                  p: int = 32, q: int = 32, scaling: float = 1.0,
                  dropout: float = 0.0, d_initial: float = 0.0,
                  freq_mode: str = "contiguous", freq_exponent: float = 2.0,
-                 factored_rank: int = 0, learn_scaling: bool = False):
+                 factored_rank: int = 0, learn_scaling: bool = False,
+                 freeze_classifier_dense: bool = False):
         super().__init__()
         self.model = model
         self.target_modules = target_modules
@@ -293,8 +299,13 @@ class SpectralAdapterModel(nn.Module):
                              freq_exponent, factored_rank, learn_scaling)
 
         # Unfreeze classifier head (newly initialized, needs training)
+        # If freeze_classifier_dense=True, keep classifier.dense frozen to prevent
+        # the "fast classifier / slow adapter" race condition on RoBERTa-like models
+        # where the 590K-param dense layer overwhelms the small adapter.
         for name, param in model.named_parameters():
             if 'classifier' in name or 'score' in name:
+                if freeze_classifier_dense and 'classifier.dense' in name:
+                    continue  # keep frozen
                 param.requires_grad = True
 
     def _apply_adapters(self, target_modules, p, q, scaling, dropout, d_initial,
@@ -336,6 +347,11 @@ class SpectralAdapterModel(nn.Module):
             setattr(parent, attr_name, adapted)
             self.adapted_modules.append(name)
 
+    def gradient_checkpointing_enable(self, **kwargs):
+        """Delegate gradient checkpointing to the wrapped model."""
+        if hasattr(self.model, 'gradient_checkpointing_enable'):
+            self.model.gradient_checkpointing_enable(**kwargs)
+
     def forward(self, **kwargs):
         return self.model(**kwargs)
 
@@ -365,7 +381,8 @@ def get_spectral_adapter_model(model: nn.Module,
                                 freq_mode: str = "contiguous",
                                 freq_exponent: float = 2.0,
                                 factored_rank: int = 0,
-                                learn_scaling: bool = False) -> SpectralAdapterModel:
+                                learn_scaling: bool = False,
+                                freeze_classifier_dense: bool = False) -> SpectralAdapterModel:
     """
     Apply Truncated DCT Factored Adaptation to a model.
 
@@ -386,9 +403,12 @@ def get_spectral_adapter_model(model: nn.Module,
                        coverage at same param count (r=factored_rank). 0 = dense S.
         learn_scaling: If True, each adapter module gets a learnable log-space scaling
                        parameter initialized to log(scaling). Adds 1 param per module.
+        freeze_classifier_dense: If True, keep classifier.dense frozen to prevent
+                                 gradient collapse on RoBERTa-like models.
 
     Returns:
         SpectralAdapterModel wrapping the adapted model
     """
     return SpectralAdapterModel(model, target_modules, p, q, scaling, dropout, d_initial,
-                                freq_mode, freq_exponent, factored_rank, learn_scaling)
+                                freq_mode, freq_exponent, factored_rank, learn_scaling,
+                                freeze_classifier_dense)

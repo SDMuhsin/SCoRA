@@ -162,7 +162,7 @@ FOURIERFT_SCALING=150.0
 #       Used for: boolq, stsb, mrpc (and any untuned tasks).
 #       Trainable: 24 x 256 + 1,538 = 7,682 params
 #
-#     Mode B — Dense + scaling=2.0: p=q=16, d_initial=0.07, scaling=2.0
+#     Mode B — Dense + scaling=1.0: p=q=16, d_initial=0.07, scaling=1.0
 #       Used for: rte (only config that ties FourierFT on RTE).
 #       Trainable: 24 x 256 + 1,538 = 7,682 params
 #
