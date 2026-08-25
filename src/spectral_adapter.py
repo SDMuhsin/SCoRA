@@ -43,8 +43,24 @@ def _dct_basis(d: int, k: int, dtype: torch.dtype = torch.float32) -> torch.Tens
     return basis.to(dtype)
 
 
+def _random_orthonormal_basis(d: int, k: int, seed: int,
+                              dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """P.19: k random ORTHONORMAL rows in R^d -- the closest-generic control for
+    the DCT basis (PROCESS.md 5.8).
+
+    Rows are orthonormal, exactly like `_dct_basis`, so the per-parameter atom
+    Frobenius norm ||d dW / d S_ij||_F = scaling * ||dct_out_i|| * ||dct_in_j||
+    = scaling is IDENTICAL to the DCT arm, a priori, with spread exactly zero.
+    CARRY_FORWARD.md 4.4 is discharged by construction, not by tuning.
+    """
+    g = torch.Generator().manual_seed(int(seed))
+    a = torch.randn(d, k, generator=g, dtype=torch.float64)
+    q_, _ = torch.linalg.qr(a)              # (d, k), orthonormal COLUMNS
+    return q_.T.contiguous().to(dtype)      # (k, d), orthonormal ROWS
+
+
 def _generate_freq_indices(d: int, k: int, mode: str = "contiguous",
-                           exponent: float = 2.0) -> List[int]:
+                           exponent: float = 2.0, freq_seed: int = 0) -> List[int]:
     """
     Generate k frequency indices in [0, d-1] according to the chosen strategy.
 
@@ -58,14 +74,29 @@ def _generate_freq_indices(d: int, k: int, mode: str = "contiguous",
                               geometrically spread over [k, d//2].
               "geometric_half" → power-spaced indices over [0, d//4],
                               more conservative coverage than geometric.
+              "random_subset" → k distinct indices drawn uniformly from
+                              [0, d//2] (Q.1: the closest generic control for a
+                              claim about the frequency SET -- same DCT rows,
+                              same count, same band, no power law).
         exponent: Power for geometric spacing (default 2.0 = quadratic).
                   1.0 = linear (uniform), 3.0 = cubic (denser low-freq).
+        freq_seed: seed for "random_subset" only; ignored by every other mode.
 
     Returns:
         Sorted list of k unique integer indices.
     """
     if mode == "contiguous":
         return list(range(k))
+    elif mode == "random_subset":
+        # Q.1.  Same band as "geometric" ([0, d//2]) so the ONLY property that
+        # differs from the incumbent is the spacing law.  A dedicated Generator
+        # keeps this independent of global RNG state (and hence of the training
+        # seed), so the set is fixed across Mo5 exactly as the deployed object's
+        # set is (PROCESS.md 2.7).
+        half = d // 2
+        gen = torch.Generator().manual_seed(int(freq_seed))
+        perm = torch.randperm(half + 1, generator=gen)[:k]
+        return sorted(int(v) for v in perm)
     elif mode == "geometric":
         half = d // 2
         raw = [round(half * (i / (k - 1)) ** exponent) for i in range(k)]
@@ -108,7 +139,8 @@ def _generate_freq_indices(d: int, k: int, mode: str = "contiguous",
             unique_high.append(v)
         return sorted(low + unique_high)
     else:
-        raise ValueError(f"Unknown freq_mode: {mode!r}. Choose 'contiguous', 'geometric', 'geometric_half', or 'hybrid'.")
+        raise ValueError(f"Unknown freq_mode: {mode!r}. Choose 'contiguous', 'geometric', "
+                         f"'geometric_half', 'hybrid', or 'random_subset'.")
 
 
 def _dct_basis_at_indices(d: int, freq_indices: List[int],
@@ -153,8 +185,20 @@ class SpectralAdapterLinear(nn.Module):
                  scaling: float = 1.0, dropout: float = 0.0,
                  d_initial: float = 0.0, freq_mode: str = "contiguous",
                  freq_exponent: float = 2.0, factored_rank: int = 0,
-                 learn_scaling: bool = False):
+                 learn_scaling: bool = False, basis: str = "dct",
+                 basis_seed: int = 777, freq_seed: int = 0,
+                 core: str = "dense", core_k: int = 0):
         super().__init__()
+        if core not in ("dense", "sparse"):
+            raise ValueError(f"core must be dense|sparse, got {core!r}")
+        # P.19: 'random' swaps the DCT rows for random ORTHONORMAL rows.  Only
+        # the basis changes -- atom norm, p, q, cost class and launch count are
+        # all identical by construction.
+        if basis not in ("dct", "random"):
+            raise ValueError(f"basis must be dct|random, got {basis!r}")
+        self.basis = basis
+        self.basis_seed = int(basis_seed)
+        self.freq_seed = int(freq_seed)
         self.base_layer = base_layer
         if isinstance(base_layer, Conv1D):
             self.out_features = base_layer.nf
@@ -183,16 +227,27 @@ class SpectralAdapterLinear(nn.Module):
         # dct_in: selected q rows of n-dim DCT matrix → (q, n)
         # dct_out: selected p rows of m-dim DCT matrix → (p, m)
         # Always float32 for DCT precision (critical for float16 base models like LLaMA)
-        if freq_mode == "contiguous":
+        if basis == "random":
+            # distinct seeds per side so the two bases are independent
+            self.register_buffer('dct_in', _random_orthonormal_basis(
+                self.in_features, q, self.basis_seed))
+            self.register_buffer('dct_out', _random_orthonormal_basis(
+                self.out_features, p, self.basis_seed + 1))
+        elif freq_mode == "contiguous":
             self.register_buffer('dct_in', _dct_basis(self.in_features, q, torch.float32))
             self.register_buffer('dct_out', _dct_basis(self.out_features, p, torch.float32))
         else:
-            freq_in = _generate_freq_indices(self.in_features, q, freq_mode, freq_exponent)
-            freq_out = _generate_freq_indices(self.out_features, p, freq_mode, freq_exponent)
+            freq_in = _generate_freq_indices(d=self.in_features, k=q, mode=freq_mode,
+                                             exponent=freq_exponent, freq_seed=self.freq_seed)
+            freq_out = _generate_freq_indices(d=self.out_features, k=p, mode=freq_mode,
+                                              exponent=freq_exponent, freq_seed=self.freq_seed)
+            self.freq_in_indices = list(freq_in)
+            self.freq_out_indices = list(freq_out)
             self.register_buffer('dct_in', _dct_basis_at_indices(self.in_features, freq_in, torch.float32))
             self.register_buffer('dct_out', _dct_basis_at_indices(self.out_features, freq_out, torch.float32))
 
         # Trainable coefficient matrix — always float32 for optimizer precision
+        self.core = core
         if factored_rank > 0:
             # Factored: S = A @ B, where A ∈ R^{p × r}, B ∈ R^{r × q}
             # Params per module = p*r + r*q instead of p*q
@@ -205,6 +260,19 @@ class SpectralAdapterLinear(nn.Module):
                 sigma = math.sqrt(d_initial / math.sqrt(factored_rank))
                 nn.init.normal_(self.coeffs_A, mean=0, std=sigma)
                 nn.init.normal_(self.coeffs_B, mean=0, std=sigma)
+        elif core == "sparse":
+            # Q.13: k trainable scalars at fixed scattered locations in the p x q
+            # core.  Trainable count is EXACTLY core_k -- the p x q grid is never
+            # a Parameter, so the budget is honest (anti-cheating test 5).
+            if not (0 < core_k <= p * q):
+                raise ValueError(f"core_k must be in (0, {p*q}], got {core_k}")
+            self.core_k = int(core_k)
+            g = torch.Generator().manual_seed(int(basis_seed) + 31)
+            flat = torch.randperm(p * q, generator=g)[:core_k]
+            self.register_buffer("core_idx", torch.stack([flat // q, flat % q], 0))
+            self.coeffs_vals = nn.Parameter(torch.zeros(core_k, dtype=torch.float32))
+            if d_initial > 0.0:
+                nn.init.normal_(self.coeffs_vals, mean=0, std=d_initial)
         else:
             # Dense: S ∈ R^{p × q}
             self.coeffs = nn.Parameter(torch.zeros(p, q, dtype=torch.float32))
@@ -214,6 +282,44 @@ class SpectralAdapterLinear(nn.Module):
 
         # Optional dropout
         self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
+
+        # Q.11: remembered so a restart re-initialises exactly like a fresh start.
+        self.d_initial = float(d_initial)
+        self.freq_mode = freq_mode
+        self.freq_exponent = float(freq_exponent)
+        self.n_restarts = 0
+
+    @torch.no_grad()
+    def merge_and_restart(self, new_freq_seed: int) -> None:
+        """Q.11: fold the current dW into the frozen weight, then re-draw the
+        basis and reset the core.
+
+        Breaks `rank = activation waist` over TIME rather than over parameters:
+        the instantaneous waist stays q, peak memory stays q-dimensional, the
+        trainable parameter count is unchanged (the SAME p*q core is reused),
+        but the accumulated update  sum_r C_r^T S_r C_r  has rank <= R*min(p,q).
+
+        Only valid for the DCT `random_subset` path -- a fixed basis would make
+        every block share one span and change nothing (sum_r C^T S_r C
+        = C^T (sum_r S_r) C), which is exactly the null this is designed against.
+        """
+        if self.factored_rank > 0:
+            raise NotImplementedError("restart is not defined for a factored core")
+        dW = self.get_delta_weight()                      # (m, n), = scaling * Cout^T S Cin
+        w = self.base_layer.weight
+        w += dW.to(w.dtype)                               # frozen weight, in-place
+        fi = _generate_freq_indices(d=self.in_features, k=self.q, mode=self.freq_mode,
+                                    exponent=self.freq_exponent, freq_seed=new_freq_seed)
+        fo = _generate_freq_indices(d=self.out_features, k=self.p, mode=self.freq_mode,
+                                    exponent=self.freq_exponent, freq_seed=new_freq_seed)
+        self.freq_in_indices, self.freq_out_indices = list(fi), list(fo)
+        self.dct_in.copy_(_dct_basis_at_indices(self.in_features, fi, torch.float32).to(self.dct_in.dtype))
+        self.dct_out.copy_(_dct_basis_at_indices(self.out_features, fo, torch.float32).to(self.dct_out.dtype))
+        if self.d_initial > 0.0:
+            self.coeffs.normal_(mean=0.0, std=self.d_initial)
+        else:
+            self.coeffs.zero_()
+        self.n_restarts += 1
 
     def _get_scaling(self) -> float:
         """Return the effective scaling factor (learnable or fixed)."""
@@ -225,6 +331,10 @@ class SpectralAdapterLinear(nn.Module):
         """Return the effective S matrix (factored or dense)."""
         if self.factored_rank > 0:
             return self.coeffs_A @ self.coeffs_B
+        if self.core == "sparse":
+            S = torch.zeros(self.p, self.q, dtype=self.coeffs_vals.dtype,
+                            device=self.coeffs_vals.device)
+            return S.index_put((self.core_idx[0], self.core_idx[1]), self.coeffs_vals)
         return self.coeffs
 
     def get_delta_weight(self) -> torch.Tensor:
@@ -251,7 +361,7 @@ class SpectralAdapterLinear(nn.Module):
             x_mid = F.linear(x_proj, self.coeffs_B)   # (batch, seq, q) → (batch, seq, r)
             s_out = F.linear(x_mid, self.coeffs_A)     # (batch, seq, r) → (batch, seq, p)
         else:
-            s_out = F.linear(x_proj, self.coeffs)      # (batch, seq, q) → (batch, seq, p)
+            s_out = F.linear(x_proj, self._get_S())    # (batch, seq, q) → (batch, seq, p)
 
         # Step 3: reconstruct in output space
         delta_out = F.linear(s_out, self.dct_out.t())
@@ -280,6 +390,8 @@ class SpectralAdapterModel(nn.Module):
                  p: int = 32, q: int = 32, scaling: float = 1.0,
                  dropout: float = 0.0, d_initial: float = 0.0,
                  freq_mode: str = "contiguous", freq_exponent: float = 2.0,
+                 basis: str = "dct", basis_seed: int = 777, freq_seed: int = 0,
+                 core: str = "dense", core_k: int = 0,
                  factored_rank: int = 0, learn_scaling: bool = False,
                  freeze_classifier_dense: bool = False):
         super().__init__()
@@ -295,8 +407,14 @@ class SpectralAdapterModel(nn.Module):
             param.requires_grad = False
 
         # Apply adapters (this creates trainable coeffs)
-        self._apply_adapters(target_modules, p, q, scaling, dropout, d_initial, freq_mode,
-                             freq_exponent, factored_rank, learn_scaling)
+        self.basis = basis; self.basis_seed = basis_seed; self.freq_seed = freq_seed
+        self.core = core; self.core_k = core_k
+        self._apply_adapters(target_modules, p=p, q=q, scaling=scaling, dropout=dropout,
+                             d_initial=d_initial, freq_mode=freq_mode,
+                             freq_exponent=freq_exponent, factored_rank=factored_rank,
+                             basis=basis, basis_seed=basis_seed, freq_seed=freq_seed,
+                             core=core, core_k=core_k,
+                             learn_scaling=learn_scaling)
 
         # Unfreeze classifier head (newly initialized, needs training)
         # If freeze_classifier_dense=True, keep classifier.dense frozen to prevent
@@ -308,8 +426,26 @@ class SpectralAdapterModel(nn.Module):
                     continue  # keep frozen
                 param.requires_grad = True
 
+    @torch.no_grad()
+    def restart_bases(self, block_index: int, optimizer=None) -> int:
+        """Q.11: merge+restart every adapted module, then CLEAR the AdamW state
+        for the cores.  Clearing matters: the moments were accumulated in the
+        OLD basis and are meaningless in the new one."""
+        n = 0
+        for mod in self.modules():
+            if isinstance(mod, SpectralAdapterLinear):
+                mod.merge_and_restart(new_freq_seed=1000 * block_index + 7)
+                if optimizer is not None:
+                    st = optimizer.state.get(mod.coeffs)
+                    if st:
+                        st.clear()
+                n += 1
+        return n
+
     def _apply_adapters(self, target_modules, p, q, scaling, dropout, d_initial,
                         freq_mode="contiguous", freq_exponent=2.0, factored_rank=0,
+                        basis="dct", basis_seed=777, freq_seed=0,
+                        core="dense", core_k=0,
                         learn_scaling=False):
         """Replace target linear layers with SpectralAdapterLinear."""
         for name, module in list(self.model.named_modules()):
@@ -340,6 +476,9 @@ class SpectralAdapterModel(nn.Module):
                 module, p=layer_p, q=layer_q,
                 scaling=scaling, dropout=dropout,
                 d_initial=d_initial, freq_mode=freq_mode,
+                basis=getattr(self, 'basis', 'dct'), basis_seed=getattr(self, 'basis_seed', 777),
+                freq_seed=getattr(self, 'freq_seed', 0),
+                core=getattr(self, 'core', 'dense'), core_k=getattr(self, 'core_k', 0),
                 freq_exponent=freq_exponent,
                 factored_rank=factored_rank,
                 learn_scaling=learn_scaling,
@@ -382,6 +521,8 @@ def get_spectral_adapter_model(model: nn.Module,
                                 freq_exponent: float = 2.0,
                                 factored_rank: int = 0,
                                 learn_scaling: bool = False,
+                                basis: str = "dct", basis_seed: int = 777,
+                                freq_seed: int = 0, core: str = "dense", core_k: int = 0,
                                 freeze_classifier_dense: bool = False) -> SpectralAdapterModel:
     """
     Apply Truncated DCT Factored Adaptation to a model.
@@ -409,6 +550,13 @@ def get_spectral_adapter_model(model: nn.Module,
     Returns:
         SpectralAdapterModel wrapping the adapted model
     """
-    return SpectralAdapterModel(model, target_modules, p, q, scaling, dropout, d_initial,
-                                freq_mode, freq_exponent, factored_rank, learn_scaling,
-                                freeze_classifier_dense)
+    # ALL-KEYWORD (P.19): a positional call here silently misaligns once any
+    # parameter is inserted into SpectralAdapterModel.__init__ -- which is
+    # exactly the bug adding `basis` introduced.
+    return SpectralAdapterModel(model, target_modules, p=p, q=q, scaling=scaling,
+                                dropout=dropout, d_initial=d_initial,
+                                freq_mode=freq_mode, freq_exponent=freq_exponent,
+                                factored_rank=factored_rank, learn_scaling=learn_scaling,
+                                basis=basis, basis_seed=basis_seed, freq_seed=freq_seed,
+                                core=core, core_k=core_k,
+                                freeze_classifier_dense=freeze_classifier_dense)
