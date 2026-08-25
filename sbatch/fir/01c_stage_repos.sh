@@ -55,6 +55,28 @@ echo "############ staging author clones — $(date -u +%FT%TZ) ############"
 fir_load_modules_cpu || exit 1
 fir_link_scratch     || exit 1
 
+# ⚠ REACHABILITY FIRST. Everything below is `git clone https://github.com/...`,
+#   and an unreachable host makes git hang on connect rather than fail, which on
+#   a login node looks exactly like a slow clone. 00's reachability list did not
+#   include github.com until 2026-08-25, so this stage's one external dependency
+#   had never been tested at all. Check it in seconds, with an explicit timeout.
+echo
+echo "--- github.com reachable? (01c's only external dependency) ---"
+if command -v curl >/dev/null 2>&1; then
+    gh_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 https://github.com 2>/dev/null)
+    echo "  https://github.com -> HTTP ${gh_code:-<no response>}"
+    case "$gh_code" in
+        2*|3*) : ;;
+        *) echo "  ⛔ github.com is NOT reachable from this node."
+           echo "     The clones below would HANG, not fail. Stopping here instead."
+           exit 1 ;;
+    esac
+else
+    echo "  (no curl — skipping the precheck; a hang below means an unreachable host)"
+fi
+# ⚠ and make git itself refuse to hang, belt and braces
+export GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=30
+
 # repo:commit:probe-file   — the commits are the ones the DEV BOX measured against.
 # ⛔ Probe the exact FILE the verifier opens, not the directory: a clone that
 #   fetched but left its pin unchecked-out passes a bare -d test.
