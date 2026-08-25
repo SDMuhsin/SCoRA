@@ -155,7 +155,17 @@ fir_log_to() {
     local f="./logs/${tag}_$(date -u +%Y%m%dT%H%M%SZ).log"
     export FIR_LOGGING=1
     echo "### transcript -> $f"
-    "$FIR_SELF" "$@" 2>&1 | tee "$f"
+    # ⚠⚠ RE-EXEC THROUGH bash, NOT THE PATH DIRECTLY.
+    #    `"$FIR_SELF" "$@"` requires the EXECUTE BIT, but every usage line in this
+    #    tree says `bash sbatch/fir/<script>.sh`, which does not. So the mode bit
+    #    silently became load-bearing: 02_download_cache.sh and 03_preflight.sh
+    #    were committed 100644 and 02 died `Permission denied` (exit 126) on fir
+    #    2026-08-25 -- AFTER the user had correctly invoked it with `bash`.
+    #    Re-execing through bash makes the bit irrelevant and matches the
+    #    documented invocation. (The local test that "verified" fir_log_to used
+    #    chmod +x on its fixture, so it could only ever exercise the executable
+    #    case -- a test that cannot see the failure it is meant to catch.)
+    bash "$FIR_SELF" "$@" 2>&1 | tee "$f"
     local rc=${PIPESTATUS[0]}          # ⚠ preserve the SCRIPT's status, not tee's
     echo "### $tag exit=$rc" | tee -a "$f"
     echo "### transcript: $f"
