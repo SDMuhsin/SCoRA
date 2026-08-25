@@ -103,7 +103,10 @@ fi
 # ---------------------------------------------------------------------------
 hr "7. INTERNET REACHABILITY FROM THE LOGIN NODE"
 # The download step needs HuggingFace; the venv build may need PyPI.
-for host in pypi.org huggingface.co; do
+# ⚠ github.com added 2026-08-25: 01c_stage_repos.sh CLONES the authors' LoCA and
+#   QWHA trees from GitHub, and this list tested only pypi and HF -- so the one
+#   host a whole stage depends on was never probed.
+for host in pypi.org huggingface.co github.com; do
     printf "%-20s " "$host"
     if command -v curl >/dev/null 2>&1; then
         code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 12 "https://$host" 2>/dev/null)
