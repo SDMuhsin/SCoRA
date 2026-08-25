@@ -240,6 +240,15 @@ fir_export_offline() {
     #    puts it on PYTHONPATH. `PYTHONPATH=/some/dir` DELETES NUMPY on Alliance
     #    clusters. This never reproduces on a dev box, where numpy is in
     #    site-packages. Applies at RUN time too, inside job scripts.
+    # ⚠⚠ USER-SITE PACKAGES SHADOW THE VENV. On fir 2026-08-25 every traceback in
+    #    03_preflight resolved to ~/.local/lib/python3.11/site-packages -- torch,
+    #    transformers and huggingface_hub were NOT the pinned ones we installed.
+    #    A venv is not automatically insulated: whether ~/.local is on sys.path
+    #    depends on how the venv was created. Setting this makes it explicit and
+    #    is a no-op when ~/.local is empty.
+    #    ⛔ Diagnose with sbatch/fir/00d_probe_runtime.sh before assuming this is
+    #      THE cause -- it prints where every package actually resolves from.
+    export PYTHONNOUSERSITE=1
     export PYTHONPATH="${PYTHONPATH:-}:$(pwd)/src"
     mkdir -p "$HF_HOME"
 }
@@ -313,6 +322,24 @@ pins = {"torch": ("$FIR_PIN_TORCH", torch.__version__),
         "datasets": ("$FIR_PIN_DATASETS", datasets.__version__),
         "peft": ("$FIR_PIN_PEFT", peft.__version__)}
 drift = {k: v for k, v in pins.items() if v[0] and not v[1].startswith(v[0])}
+# ⚠⚠ A VERSION CHECK CANNOT SEE A DIFFERENT BUILD, AND THAT IS WHAT MATTERS.
+#    `2.10.0`, `2.10.0+cu128` and `2.10.0+computecanada` all pass
+#    startswith("2.10.0") -- yet they are different wheels, and peak memory is
+#    allocator- and kernel-sensitive. On fir 2026-08-25 the gate printed
+#    "torch build: 2.10.0" (no label) and PASSED while every traceback in the
+#    same job resolved to ~/.local, i.e. the venv was being shadowed and the
+#    check was structurally blind to it.
+#    ⇒ report the build label AND where torch actually loaded from.
+import torch as _t
+_lbl = _t.__version__.split("+", 1)
+_where = _t.__file__ or "?"
+print(f"  torch build label   : {'+' + _lbl[1] if len(_lbl) > 1 else '<NONE>'}")
+print(f"  torch loaded from   : {_where}")
+if ".local" in _where:
+    print("  ⛔⛔ torch is loading from USER SITE (~/.local), NOT the venv.")
+    print("      The pinned stack is NOT what will run. Set PYTHONNOUSERSITE=1 or")
+    print("      remove the shadowing packages; see sbatch/fir/00d_probe_runtime.sh.")
+    sys.exit(1)
 for k, (w, g) in drift.items():
     print(f"  ⚠⚠ {k}: pinned {w}, installed {g} — this is a DIFFERENT EXPERIMENT.")
 if drift: sys.exit(1)

@@ -17,6 +17,21 @@ OK, BAD = "PASS", "FAIL"
 fails = []
 
 
+# ⚠⚠ DEFAULT DEVICE IS RESOLVED, NOT HARDCODED.
+#    This defaulted to "cuda:1" -- a DEV-BOX artifact (2 GPUs there). A Slurm job
+#    with `--gpus=h100:1` sees exactly ONE device, so cuda:1 raises
+#    `CUDA error: invalid device ordinal`, which on fir 2026-08-25 was mis-read as
+#    a bit-identity failure. Resolve from what is actually present.
+def _default_device():
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "cuda:0"
+    except Exception:
+        pass
+    return "cpu"
+
+
 def check(name, cond, detail=""):
     tag = OK if cond else BAD
     if not cond:
@@ -248,9 +263,10 @@ def gate_flops(dev):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--device", default="cuda:1")
+    ap.add_argument("--device", default=None,
+                    help="default: cuda:0 if present, else cpu (was hardcoded cuda:1)")
     a = ap.parse_args()
-    dev = a.device
+    dev = a.device or _default_device()   # None => resolve from what is present
     torch.manual_seed(0)
     print(f"=== coset adapter verification, device={dev} ===")
     gate_branch_exactness(dev)
