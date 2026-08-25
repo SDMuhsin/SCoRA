@@ -126,6 +126,7 @@ J.7 Haar arm at matched `k`, matched Theta(d) cost class and matched atom norm.
 """
 from __future__ import annotations
 
+import contextlib
 import math
 from typing import List, Optional, Sequence, Tuple
 
@@ -196,6 +197,63 @@ def block_wht_unnorm(x: torch.Tensor, runs: Sequence[Tuple[int, int]]) -> torch.
     for B, cnt in runs:
         seg = x[..., off:off + B * cnt].reshape(*lead, cnt, B)
         outs.append(fwht_unnorm(seg, B).reshape(*lead, B * cnt))
+        off += B * cnt
+    return torch.cat(outs, dim=-1)
+
+
+@contextlib.contextmanager
+def _exact_matmul(hmats: Optional[dict]):
+    """Force the adapter's block GEMMs to true fp32.
+
+    TF32 truncates the mantissa to 10 bits, which would make the GEMM
+    realisation differ from the butterfly at ~1e-3 relative and break P.1's
+    claim that the two realise the SAME `dW`.  This is a CPU-side flag, so it
+    costs no kernel launch.  It must wrap the backward too -- forward and
+    backward at different precisions is a silent gradient bug.
+    """
+    if hmats is None or hmats.get("_tf32", False) or not torch.cuda.is_available():
+        yield
+        return
+    prev = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        yield
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = prev
+
+
+def hadamard_dense(B: int, dtype=torch.float64) -> torch.Tensor:
+    """The dense unnormalised Hadamard matrix `H_B` (entries +/-1), built by
+    running `fwht_unnorm` on the identity so it is EXACTLY the same linear map
+    the butterfly realises -- never an independently-derived matrix.
+
+    `H_B` is symmetric, so `Bl x` for one block is the single GEMM `x @ H_B`.
+    """
+    eye = torch.eye(B, dtype=dtype)
+    return fwht_unnorm(eye, B)
+
+
+def block_wht_gemm(x: torch.Tensor, runs: Sequence[Tuple[int, int]],
+                   hmats: dict) -> torch.Tensor:
+    """`Bl x` -- identical map to `block_wht_unnorm`, realised as ONE batched
+    GEMM per distinct block size instead of `log2(B)` sequential butterfly
+    stages.
+
+    P.1's measured point: on this hardware the adapter is dispatch-bound, so
+    `B` multiply-accumulates per element in one kernel beats `log2(B)` additions
+    per element spread over `log2(B)` dependent kernels.  Arithmetically this is
+    STRICTLY WORSE (B vs log2 B per element) and that is reported, not hidden.
+    """
+    if len(runs) == 1:
+        B, cnt = runs[0]
+        lead = tuple(x.shape[:-1])
+        return torch.matmul(x.reshape(*lead, cnt, B),
+                            hmats[B]).reshape(*lead, B * cnt)
+    outs, off = [], 0
+    lead = tuple(x.shape[:-1])
+    for B, cnt in runs:
+        seg = x[..., off:off + B * cnt].reshape(*lead, cnt, B)
+        outs.append(torch.matmul(seg, hmats[B]).reshape(*lead, B * cnt))
         off += B * cnt
     return torch.cat(outs, dim=-1)
 
@@ -428,7 +486,7 @@ def bwht_delta_apply(x: torch.Tensor, vals: torch.Tensor,
                      runs_n, runs_m,
                      perm_n: torch.Tensor, invperm_m: torch.Tensor,
                      dn: Optional[torch.Tensor], dm: Optional[torch.Tensor],
-                     m: int) -> torch.Tensor:
+                     m: int, hmats: Optional[dict] = None) -> torch.Tensor:
     """dW x = A_m^T ( C ( A_n x ) ),  x: (b, n) -> (b, m).  No m x n tensor.
 
     `A_n = D_n Bl_n P_n`  and  `A_m^T = P_m^T Bl_m D_m`  (Bl symmetric).
@@ -436,15 +494,22 @@ def bwht_delta_apply(x: torch.Tensor, vals: torch.Tensor,
     normalisations have been folded into `vals` -- so the transform performs
     ZERO multiplications.
     """
-    z = block_wht_unnorm(x.index_select(-1, perm_n), runs_n)    # (b, n) Bl_n P_n x
-    if dn is not None:
-        z = z * dn
-    contrib = z.index_select(-1, cols) * vals[pidx]             # (b, mu*k)
-    y = torch.zeros(x.shape[0], m, dtype=z.dtype, device=z.device)
-    y = y.index_add(-1, rows, contrib)                          # (b, m)  C z
-    if dm is not None:
-        y = y * dm
-    return block_wht_unnorm(y, runs_m).index_select(-1, invperm_m)   # P_m^T Bl_m .
+    # `hmats is None` -> the shipped butterfly path, bit-identical to pre-P.1.
+    if hmats is None:
+        _bl = block_wht_unnorm
+    else:
+        def _bl(t, runs):
+            return block_wht_gemm(t, runs, hmats)
+    with _exact_matmul(hmats):
+        z = _bl(x.index_select(-1, perm_n), runs_n)             # (b, n) Bl_n P_n x
+        if dn is not None:
+            z = z * dn
+        contrib = z.index_select(-1, cols) * vals[pidx]         # (b, mu*k)
+        y = torch.zeros(x.shape[0], m, dtype=z.dtype, device=z.device)
+        y = y.index_add(-1, rows, contrib)                      # (b, m)  C z
+        if dm is not None:
+            y = y * dm
+        return _bl(y, runs_m).index_select(-1, invperm_m)       # P_m^T Bl_m .
 
 
 class _BwhtFn(torch.autograd.Function):
@@ -460,32 +525,32 @@ class _BwhtFn(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x, vals, rows, cols, pidx, runs_n, runs_m,
-                perm_n, invperm_m, dn, dm, m):
+                perm_n, invperm_m, dn, dm, m, hmats=None):
         with torch.no_grad():
             out = bwht_delta_apply(x, vals, rows, cols, pidx, runs_n, runs_m,
-                                   perm_n, invperm_m, dn, dm, m)
+                                   perm_n, invperm_m, dn, dm, m, hmats)
         ctx.save_for_backward(x, vals)
         ctx.tables = (rows, cols, pidx, runs_n, runs_m, perm_n, invperm_m,
-                      dn, dm, m)
+                      dn, dm, m, hmats)
         return out
 
     @staticmethod
     def backward(ctx, grad_out):
         x, vals = ctx.saved_tensors
         (rows, cols, pidx, runs_n, runs_m, perm_n, invperm_m,
-         dn, dm, m) = ctx.tables
+         dn, dm, m, hmats) = ctx.tables
         need_x = ctx.needs_input_grad[0]
-        with torch.enable_grad():
+        with _exact_matmul(hmats), torch.enable_grad():
             xd = x.detach().requires_grad_(need_x)
             vd = vals.detach().requires_grad_(True)
             out = bwht_delta_apply(xd, vd, rows, cols, pidx, runs_n, runs_m,
-                                   perm_n, invperm_m, dn, dm, m)
+                                   perm_n, invperm_m, dn, dm, m, hmats)
             tgt = [xd, vd] if need_x else [vd]
             grads = torch.autograd.grad(out, tgt, grad_out.contiguous(),
                                         allow_unused=True)
         gx = grads[0] if need_x else None
         gv = grads[1] if need_x else grads[0]
-        return (gx, gv) + (None,) * 10
+        return (gx, gv) + (None,) * 11
 
 
 class BwhtLinear(nn.Module):
@@ -496,8 +561,20 @@ class BwhtLinear(nn.Module):
                  fourierft_scaling: float = 150.0,
                  scaling: Optional[float] = None,
                  init_std: float = 1.0, no_recompute: bool = False,
-                 support: str = "random"):
+                 support: str = "random",
+                 realization: str = "butterfly", gemm_tf32: bool = False):
         super().__init__()
+        # P.1: `realization` changes ONLY how the fixed orthogonal map `A` is
+        # evaluated -- never `A` itself, never `dW`, never the support, never
+        # the atom norm.  "butterfly" is the shipped default, so every existing
+        # call is bit-identical to pre-P.1.
+        if realization not in ("butterfly", "gemm"):
+            raise ValueError(f"realization must be butterfly|gemm, got {realization!r}")
+        self.realization = realization
+        # TF32 truncates the mantissa to 10 bits; a B=256 GEMM against a +/-1
+        # Hadamard would then differ from the butterfly at ~1e-3 relative, which
+        # fails P.1's G1 gate.  Exact by default; TF32 is an explicit ablation.
+        self.gemm_tf32 = bool(gemm_tf32)
         # `no_recompute=True` keeps the naive autograd graph (stashes the
         # Theta(b*mu*k) gather).  ABLATION / gate use only -- the default path
         # recomputes and stashes nothing marginal.
@@ -555,6 +632,13 @@ class BwhtLinear(nn.Module):
             self.dn = self.dn_vec
             self.dm = self.dm_vec
 
+        # P.1: dense +/-1 Hadamard per distinct block size, built by running the
+        # butterfly on the identity (so it is the SAME map, not a re-derivation)
+        # in fp64 and cast once.  Buffers, so `.to(device)` carries them.
+        self._hkeys = sorted({*self.sizes_n, *self.sizes_m}) if realization == "gemm" else []
+        for B in self._hkeys:
+            self.register_buffer(f"H_{B}", hadamard_dense(B).to(wdt), persistent=False)
+
         # PEFT's own init verbatim: `torch.randn(n_frequency)`, std = 1.0.
         self.spectrum = nn.Parameter(torch.randn(n_frequency, dtype=wdt) * init_std)
 
@@ -564,15 +648,23 @@ class BwhtLinear(nn.Module):
         dm = getattr(self, "dm_vec", None) if not self.uniform else None
         return dn, dm
 
+    def _hmats(self):
+        if self.realization != "gemm":
+            return None
+        d = {B: getattr(self, f"H_{B}") for B in self._hkeys}
+        d["_tf32"] = self.gemm_tf32
+        return d
+
     def delta_apply(self, x: torch.Tensor) -> torch.Tensor:
         shp = x.shape
         xf = x.reshape(-1, shp[-1])
         dn, dm = self._tables()
         vals = self.spectrum * (self.scaling * self.fold)
         fn = bwht_delta_apply if self.no_recompute else _BwhtFn.apply
+        hmats = self._hmats()
         out = fn(xf, vals, self.rows, self.cols, self.pidx,
                  self.runs_n, self.runs_m, self.perm_n, self.invperm_m,
-                 dn, dm, self.m)
+                 dn, dm, self.m, hmats)
         return out.reshape(*shp[:-1], self.m)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -655,10 +747,12 @@ class BwhtAdapterModel(nn.Module):
                  fourierft_scaling: float = 150.0,
                  scaling: Optional[float] = None, init_std: float = 1.0,
                  freeze_classifier_dense: bool = False,
-                 support: str = "random"):
+                 support: str = "random", realization: str = "butterfly",
+                 gemm_tf32: bool = False):
         super().__init__()
         self.model = model
         self.support = support
+        self.realization = realization
         self.target_modules = list(target_modules)
         self.n_frequency, self.mu, self.seed, self.block = \
             n_frequency, mu, seed, block
@@ -680,7 +774,8 @@ class BwhtAdapterModel(nn.Module):
                                  mu=mu, support_seed=seed,
                                  fourierft_scaling=fourierft_scaling,
                                  scaling=scaling, init_std=init_std,
-                                 support=support)
+                                 support=support, realization=realization,
+                                 gemm_tf32=gemm_tf32)
             adapted.to(module.weight.device)
             setattr(parent, attr, adapted)
             self.adapted_modules.append(name)

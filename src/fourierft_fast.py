@@ -408,3 +408,81 @@ class FourierFTFastLinear(nn.Module):
         return (f"in_features={self.in_features}, out_features={self.out_features}, "
                 f"k={self.n_frequency}, scaling={self.scaling}, "
                 f"recompute={self.recompute}, use_rfft={self.use_rfft}")
+
+
+# --------------------------------------------------------------------------- #
+#  Harness wiring (P.1)                                                        #
+# --------------------------------------------------------------------------- #
+#  `fourierft-fast` is the MANDATORY control for every cost claim in this repo
+#  (PROCESS.md 5.1), but until P.1 it existed only at adapter level and was NOT
+#  reachable from `src/train_glue.py` -- so the primary end-to-end throughput
+#  metric could not be measured against it at all.  This closes that gap.
+#
+#  It is an EXACT re-evaluation of FourierFT's own dW (verify_fourierft_fast.py:
+#  384 cases, max rel err 1.8e-6 fp32 / 6.0e-15 fp64), so any accuracy number it
+#  produces is FourierFT's, not a new method's.
+
+class FourierFTFastAdapterModel(nn.Module):
+    """Wraps `model`, replacing matched `nn.Linear`s with `FourierFTFastLinear`.
+
+    Mirrors `BwhtAdapterModel`'s interface exactly so the harness treats it the
+    same way (same target-module handling, same classifier unfreezing, same
+    `print_trainable_parameters` / `get_adapter_params`).
+    """
+
+    def __init__(self, model: nn.Module, target_modules, n_frequency: int = 1000,
+                 scaling: float = 150.0, seed: int = 777,
+                 init_weights: bool = False, recompute: bool = True,
+                 use_rfft: bool = False, freeze_classifier_dense: bool = False):
+        super().__init__()
+        self.model = model
+        self.target_modules = list(target_modules)
+        self.n_frequency = n_frequency
+        self.adapted_modules = []
+        for p in model.parameters():
+            p.requires_grad = False
+        for name, module in list(model.named_modules()):
+            if not isinstance(module, nn.Linear):
+                continue
+            if not any(t in name for t in self.target_modules):
+                continue
+            parts = name.rsplit(".", 1)
+            if len(parts) == 2:
+                parent = dict(model.named_modules())[parts[0]]
+                attr = parts[1]
+            else:
+                parent, attr = model, parts[0]
+            adapted = FourierFTFastLinear(module, n_frequency=n_frequency,
+                                          scaling=scaling, random_loc_seed=seed,
+                                          init_weights=init_weights,
+                                          recompute=recompute, use_rfft=use_rfft)
+            adapted.to(module.weight.device)
+            setattr(parent, attr, adapted)
+            self.adapted_modules.append(name)
+        for name, p in model.named_parameters():
+            if "classifier" in name or "score" in name:
+                if freeze_classifier_dense and "classifier.dense" in name:
+                    continue
+                p.requires_grad = True
+
+    def gradient_checkpointing_enable(self, **kw):
+        if hasattr(self.model, "gradient_checkpointing_enable"):
+            self.model.gradient_checkpointing_enable(**kw)
+
+    def forward(self, **kw):
+        return self.model(**kw)
+
+    def print_trainable_parameters(self):
+        tr = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        tot = sum(p.numel() for p in self.parameters())
+        print(f"trainable params: {tr:,} || all params: {tot:,} || "
+              f"trainable%: {tr / tot * 100:.4f}")
+        return tr
+
+    def get_adapter_params(self) -> int:
+        return sum(p.numel() for n, p in self.named_parameters()
+                   if p.requires_grad and "spectrum" in n)
+
+
+def get_fourierft_fast_model(model: nn.Module, target_modules, **kw):
+    return FourierFTFastAdapterModel(model, target_modules, **kw)

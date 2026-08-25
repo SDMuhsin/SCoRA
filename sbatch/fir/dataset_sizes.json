@@ -1,0 +1,82 @@
+{
+ "boolq": {
+  "eval": 3270,
+  "label_counts": {
+   "0": 1237,
+   "1": 2033
+  },
+  "majority": 0.6217125382262997,
+  "train": 9427
+ },
+ "cb": {
+  "eval": 56,
+  "label_counts": {
+   "0": 23,
+   "1": 28,
+   "2": 5
+  },
+  "majority": 0.5,
+  "train": 250
+ },
+ "cola": {
+  "eval": 1043,
+  "label_counts": {
+   "0": 322,
+   "1": 721
+  },
+  "majority": 0.6912751677852349,
+  "train": 8551
+ },
+ "mnli": {
+  "eval": 9815,
+  "label_counts": {
+   "0": 3479,
+   "1": 3123,
+   "2": 3213
+  },
+  "majority": 0.3544574630667346,
+  "train": 392702
+ },
+ "mrpc": {
+  "eval": 408,
+  "label_counts": {
+   "0": 129,
+   "1": 279
+  },
+  "majority": 0.6838235294117647,
+  "train": 3668
+ },
+ "qnli": {
+  "eval": 5463,
+  "label_counts": {
+   "0": 2702,
+   "1": 2761
+  },
+  "majority": 0.5053999633900788,
+  "train": 104743
+ },
+ "rte": {
+  "eval": 277,
+  "label_counts": {
+   "0": 146,
+   "1": 131
+  },
+  "majority": 0.5270758122743683,
+  "train": 2490
+ },
+ "sst2": {
+  "eval": 872,
+  "label_counts": {
+   "0": 428,
+   "1": 444
+  },
+  "majority": 0.5091743119266054,
+  "train": 67349
+ },
+ "stsb": {
+  "eval": 1500,
+  "label_counts": null,
+  "majority": null,
+  "train": 5749
+ }
+}

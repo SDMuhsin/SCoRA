@@ -96,6 +96,16 @@ def GEMM(b: int, m: int, n: int) -> float:
     return 2.0 * b * m * n
 
 
+def _haar_tail(d: int) -> int:
+    """Final approximation-block length of the Mallat pyramid on length `d`
+    (halve while even and > 1).  d=768 -> 3.  Mirrors haar_lengths() in
+    src/haar_adapter.py, which is the shipped operator."""
+    L = d
+    while L % 2 == 0 and L > 1:
+        L //= 2
+    return L
+
+
 def theoretical_flops(arm: str, m: int, n: int, b: int, k: int, r: int = 1) -> dict:
     """Exact op-count for ONE module, ONE unmerged forward over `b` tokens.
 
@@ -124,6 +134,65 @@ def theoretical_flops(arm: str, m: int, n: int, b: int, k: int, r: int = 1) -> d
     elif arm == "lora_matched_k":
         f = GEMM(b, r, n) + GEMM(b, m, r) + res
         bwd = 2 * (GEMM(b, r, n) + GEMM(b, m, r))
+    elif arm.startswith("slr_factored"):
+        # R.29/R.44: dW = scaling * u v^T with u = C^T beta, v = C^T alpha.
+        # Per forward: rebuild u,v once (2*m*s + 2*n*t, NOT per token); per token:
+        # (x . v) then scale*u.  s=t=k//(2*r) so that r*(s+t) == k params.
+        s_ = max(1, k // (2 * r))
+        f = GEMM(b, r, n) + GEMM(b, m, r) + res + 2 * m * s_ + 2 * n * s_
+        bwd = 2 * (GEMM(b, r, n) + GEMM(b, m, r)) + 2 * (2 * m * s_ + 2 * n * s_)
+    elif arm.startswith("lyra_factored"):
+        # LYRA: dW = U D V^T, U:m x p and V:n x q FIXED DCT columns, D:p x q dense.
+        # p*q = k params.  Symmetric split p=q=sqrt(k) is LYRA's own floor [R.44].
+        p_ = q_ = max(1, int(round(k ** 0.5)))
+        f = GEMM(b, q_, n) + GEMM(b, p_, q_) + GEMM(b, m, p_) + res
+        bwd = 2 * (GEMM(b, q_, n) + GEMM(b, p_, q_) + GEMM(b, m, p_))
+    elif arm.startswith("qwha"):
+        # R.187 -- QWHA (ICLR'26).  Its forward does NOT build dW.  Per forward it
+        # transforms the FROZEN WEIGHT into the Walsh-Hadamard domain (a d x d WHT,
+        # once, amortised over b tokens), adds the k-sparse spectrum, and transforms
+        # the INPUT (per token), then does the dense GEMM the frozen layer would have
+        # done anyway.  WHT is additions-only: n*log2(n) adds per length-n vector.
+        WHT = lambda L: L * math.log2(L)
+        f = (m * WHT(n)          # wht(W0): m rows of length n, ONCE per forward
+             + 2 * k             # add the sparse spectrum (scale + add)
+             + b * WHT(n)        # wht(x): per token
+             + res)
+        # the dense GEMM is the frozen layer's own cost and is excluded by the
+        # convention (CARRY_FORWARD 5.1: exclude W0 x, which every arm pays).
+        bwd = 2 * b * WHT(n) + 2 * k + m * WHT(n)
+    elif arm.startswith("loca_factored"):
+        # R.180 -- LoCA (ICLR'25, arXiv 2502.06820) evaluated WITHOUT materialising:
+        # dW x = alpha * sum_i a_i C_{l_i1}^T (D_{l_i2} . x).  Each of the k terms costs
+        # one length-n dot product (2n) plus one length-m axpy (2m) => 2k(m+n) per token.
+        f = b * (2 * k * (m + n) + m) + res
+        bwd = 2 * b * (2 * k * (m + n))
+    elif arm.startswith("loca_stock"):
+        # LoCA AS PUBLISHED (paper 4.2): build the dense dW as a sum of k rank-1 outer
+        # products of DCT rows -- "reduces the computation complexity of iDCT from
+        # O(p^2 q^2) to O(Bpq)" -- then apply it as a dense GEMM.  The build is once per
+        # forward; the GEMM is per token.
+        f = 2 * k * m * n + GEMM(b, m, n) + res
+        bwd = 2 * GEMM(b, m, n) + 2 * k * m * n
+    elif arm.startswith("waveft_factored"):
+        # R.165 -- WaveFT / WaveletFT / DWTSG at their OWN FLOOR: dW = H_m^T C H_n
+        # evaluated as H_m^T( C ( H_n x ) ), never materialised.  H is the orthonormal
+        # Haar/Mallat pyramid: cost(H_d) = 2(d - r_d) adds + d mults = 3d - 2 r_d flops,
+        # NO log factor (src/haar_adapter.py, [derived] and counted there).
+        # Core: mu*k occupied cells, each one mul + one add = 2*mu*k.
+        # mu (the placement multiplicity) is passed in `r`; WaveFT as published is mu=1.
+        mu = max(1, int(round(r)))
+        rn, rm = _haar_tail(n), _haar_tail(m)
+        f = b * ((3 * n - 2 * rn) + 2 * mu * k + (3 * m - 2 * rm) + m) + res
+        # bwd: synthesis^T(g) + [grad_x: core^T + analysis^T] + [grad_c: 2 flop/cell]
+        bwd = b * ((3 * m - 2 * rm) + 2 * mu * k + (3 * n - 2 * rn) + n + 2 * mu * k)
+    elif arm.startswith("waveft_stock"):
+        # WaveFT AS PUBLISHED: build the dense m x n dW by a 2-D inverse Haar transform
+        # of the sparse coefficient matrix (3d - 2r per vector, m + n vectors), then a
+        # dense GEMM.  The build is once per forward; the GEMM is per token.
+        rn, rm = _haar_tail(n), _haar_tail(m)
+        f = m * (3 * n - 2 * rn) + n * (3 * m - 2 * rm) + GEMM(b, m, n) + res
+        bwd = 2 * GEMM(b, m, n) + m * (3 * n - 2 * rn) + n * (3 * m - 2 * rm)
     elif arm == "sparseft_ideal":
         # gather x[cols] (0 flop) + k mul + k add per token, scatter into m outputs
         f = b * (2 * k) + res
@@ -221,6 +290,17 @@ def build_arm(arm: str, d: int, k: int, device) -> tuple:
             use_rfft="rfft" in arm, recompute="recompute" in arm)
     elif arm == "lora_matched_k":
         mod = LoRALinear(base, r=r)
+    elif arm.startswith("slr_factored"):
+        from slr_adapter import SLRLinear
+        r_ = 1
+        s_ = max(1, k // (2 * r_))
+        mod = SLRLinear(base, rank=r_, s=s_, seed=777, materialise=False, init="matched")
+        r = r_
+    elif arm.startswith("lyra_factored"):
+        # LYRA, at ITS OWN FLOOR: p=q=sqrt(k) minimises 2d(p+q) subject to pq=k [R.44].
+        from spectral_adapter import SpectralAdapterLinear
+        p_ = max(1, int(round(k ** 0.5)))
+        mod = SpectralAdapterLinear(base, p=p_, q=p_, scaling=0.2, d_initial=0.07)
     elif arm == "sparseft_dense_impl":
         mod = SparseAdapterLinear(base, k=k, scaling=1.0, support="random", seed=777)
     elif arm == "sparseft_ideal":

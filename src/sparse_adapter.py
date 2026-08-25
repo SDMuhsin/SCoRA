@@ -79,6 +79,21 @@ def _select_support(out_features: int, in_features: int, k: int,
         g = torch.Generator()
         g.manual_seed(int(seed))
         flat = torch.randperm(num, generator=g)[:k]
+    elif support == "permutation":
+        # [R.73 4] THE ISOLATING ARM.  k cells on k DISTINCT rows and k DISTINCT columns
+        # (a partial permutation matrix pattern).  Same k, same atom norm, same PR/d^2 as
+        # 'random' -- but numrank rises from ~198 to k, because no row or column is reused.
+        # This separates RANK from DELOCALISATION in the [R.73] contrast, where the two
+        # differ in the SAME direction and cannot be attributed.
+        if k > min(out_features, in_features):
+            raise ValueError(
+                f"permutation support needs k <= min(m,n); got k={k}, "
+                f"min={min(out_features, in_features)}")
+        g = torch.Generator()
+        g.manual_seed(int(seed))
+        r_sel = torch.randperm(out_features, generator=g)[:k]
+        c_sel = torch.randperm(in_features, generator=g)[:k]
+        flat = r_sel.long() * in_features + c_sel.long()
     elif support == "topk_magnitude":
         assert weight is not None, "topk_magnitude support requires the base weight"
         # Express the weight in ΔW's (out, in) layout.
@@ -94,7 +109,7 @@ def _select_support(out_features: int, in_features: int, k: int,
     else:
         raise ValueError(
             f"Unknown support mode: {support!r}. "
-            "Choose 'random', 'topk_magnitude' or 'topk_grad'.")
+            "Choose 'random', 'permutation', 'topk_magnitude' or 'topk_grad'.")
     rows = (flat // in_features).long()
     cols = (flat % in_features).long()
     return rows, cols
