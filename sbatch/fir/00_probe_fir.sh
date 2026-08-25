@@ -198,11 +198,13 @@ hr "13. HUGGINGFACE TOKEN + GATED-MODEL ACCESS (google/gemma-2b)"
 #    FAILS with "Access to model google/gemma-2b is restricted".  So this probe
 #    reports BOTH locations rather than whichever happens to be in scope.
 echo "HF_TOKEN env         : ${HF_TOKEN:+present}${HF_TOKEN:-<unset>}"
+echo "./.hf_token (repo root, searched FIRST) : $([ -s ./.hf_token ] && echo present || echo ABSENT)"
 echo "~/.cache/huggingface/token : $([ -s "$HOME/.cache/huggingface/token" ] && echo present || echo ABSENT)"
 echo "./data/token (HF_HOME=./data) : $([ -s ./data/token ] && echo present || echo ABSENT)"
 echo
 echo "--- can we actually reach the gated repo? (metadata only, no download) ---"
-TOK="${HF_TOKEN:-$(cat "$HOME/.cache/huggingface/token" 2>/dev/null)}"
+TOK="${HF_TOKEN:-$(cat ./.hf_token 2>/dev/null || cat "$HOME/.cache/huggingface/token" 2>/dev/null)}"
+TOK="$(printf '%s' "$TOK" | tr -d '[:space:]')"
 if [ -n "$TOK" ] && command -v curl >/dev/null 2>&1; then
     code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 \
            -H "Authorization: Bearer $TOK" \

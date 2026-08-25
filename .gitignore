@@ -6,3 +6,9 @@ results
 logs
 scratchpad
 temp/
+# ⛔⛔ CREDENTIALS. .hf_token lives in the repo root (it is where the HF token is
+#    kept for the gated google/gemma-2b pull). It was NOT ignored until 2026-08-25
+#    and a `git add -A` would have COMMITTED AND PUBLISHED it to a public repo.
+.hf_token
+*.token
+hf_token*

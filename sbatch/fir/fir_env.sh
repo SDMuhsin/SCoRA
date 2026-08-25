@@ -178,7 +178,12 @@ fir_export_online() {
     export HF_HUB_DISABLE_XET=1     # the xet backend has produced stalled/partial pulls here
     if [ -z "${HF_TOKEN:-}" ]; then
         local t
-        for t in "$HOME/.cache/huggingface/token" "$HF_HOME/token"; do
+        # ⚠ `./.hf_token` (repo root) is FIRST because it is where this project
+        #   actually keeps it. It was added 2026-08-25 after the token was copied
+        #   there and this function would not have found it -- stage 02 would have
+        #   reported "token ABSENT" while the credential sat in the working dir.
+        #   ⛔ It is gitignored (.gitignore); NEVER commit it.
+        for t in "./.hf_token" "$HOME/.cache/huggingface/token" "$HF_HOME/token"; do
             [ -s "$t" ] && { HF_TOKEN="$(tr -d '[:space:]' < "$t")"; export HF_TOKEN; break; }
         done
     fi
