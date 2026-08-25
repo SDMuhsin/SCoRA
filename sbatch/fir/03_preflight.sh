@@ -55,7 +55,7 @@ done
 # ---- fail on the LOGIN node before asking for a GPU -------------------------
 if ! $LOCAL && [ -z "${SLURM_JOB_ID:-}" ]; then
     echo "--- login-node gate (fail here, not 40 minutes into an allocation) ---"
-    fir_assert_env cpu || { echo "environment not sane — refusing to submit"; exit 1; }
+    fir_assert_env cpu 02 || { echo "environment not sane — refusing to submit"; exit 1; }
     env/bin/python scripts/fir_arms.py --selftest   >/dev/null || { echo "FAIL: fir_arms selftest"; exit 1; }
     env/bin/python scripts/fir_plan.py --selftest   >/dev/null || { echo "FAIL: fir_plan selftest"; exit 1; }
     echo "  instrument selftests: OK"
