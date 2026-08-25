@@ -42,14 +42,19 @@ if [ -n "${PIP_CONFIG_FILE:-}" ] && [ -f "${PIP_CONFIG_FILE}" ]; then
     sed 's/^/    /' "${PIP_CONFIG_FILE}"
 fi
 
-# ⚠ Resolve in a THROWAWAY venv, not the module python: --dry-run still consults
-#   what is already importable, and the module environment already has numpy,
-#   pandas and friends from scipy-stack, which would mask a missing pin.
+# ⚠ Resolve in a THROWAWAY venv rather than the module python, so the probe cannot
+#   leave anything behind and cannot be polluted by an earlier attempt.
+#   ⛔ IT IS CREATED --system-site-packages ON PURPOSE, AND THE EARLIER COMMENT HERE
+#      CLAIMED THE OPPOSITE. 01_setup_venv.sh's venv is --system-site-packages
+#      (REQUIRED: numpy comes from the scipy-stack module and `import datasets`
+#      dies without it), so a probe without it would resolve a DIFFERENT
+#      environment from the one the job runs -- which is the whole failure class
+#      FIR_SETUP Law 1 is about. Fidelity beats isolation here.
 TMPV="${FIR_SCRATCH_ROOT}/.depprobe_venv"
 echo
 echo "--- throwaway resolver venv at $TMPV ---"
 mkdir -p "$(dirname "$TMPV")"
-rm -rf "$TMPV"
+rm -rf "$TMPV" "$CONS"
 python -m venv --system-site-packages "$TMPV" >/dev/null 2>&1 || {
     echo "FAIL: could not create the probe venv"; exit 1; }
 PY="$TMPV/bin/python"
@@ -125,7 +130,12 @@ else
     echo "    ✅ the whole set resolves"
     # ⭐ name the BUILD, not just the version: 2.10.0+computecanada != 2.10.0+cu128,
     #   and peak memory is allocator- and kernel-sensitive.
-    echo "$out" | grep -oE "torch-[0-9][^ ]*" | head -2 | sed 's/^/    torch build: /'
+    # ⚠ anchor on a word boundary: an earlier version used `torch-[0-9][^ ]*` and
+    #   matched `galore-torch-1.0`, printing a second, bogus line
+    #   "torch build: torch-1.0-py3-none-any.whl.metadata". A status line that
+    #   lies is worse than none.
+    echo "$out" | grep -oE "(^|[^-[:alnum:]])torch-[0-9][^ ]*" | sed 's/^[^t]*//' \
+        | head -1 | sed 's/^/    torch build: /'
 fi
 
 rm -rf "$TMPV"
