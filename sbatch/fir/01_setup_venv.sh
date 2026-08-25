@@ -250,18 +250,21 @@ stage "sentencepiece (gemma tokenizer) + protobuf" \
 # ===========================================================================
 # --- 5. FINAL GATE
 # ===========================================================================
-# ⚠ FIR_ASSERT_SKIP_TEMP=1 IS A REAL DEPENDENCY ORDER, NOT AN ESCAPE HATCH.
-#   01c_stage_repos.sh clones the authors' LoCA/QWHA trees and needs this venv,
-#   so it can only run AFTER this script.  Without the flag, a COMPLETELY CORRECT
-#   fresh setup could never pass its own closing gate and would always end
-#   "SETUP INCOMPLETE" — observed on fir 2026-08-14.  01c and 03_preflight do NOT
-#   set it, so nothing reaches a GPU unchecked.
+# ⚠⚠ `fir_assert_env cpu 01` — THE STAGE ARGUMENT IS LOAD-BEARING.
+#   Two of the gate's checks need artifacts a LATER stage creates: the temp/
+#   clones come from 01c, and the offline HF cache comes from 02.  Run
+#   unconditionally, this gate demands what cannot exist yet and a COMPLETELY
+#   CORRECT FRESH SETUP ALWAYS ENDS "SETUP INCOMPLETE" — observed on fir
+#   2026-08-25, and on the sibling project in 2026-08 before that.
+#   Passing `01` says "only stage 01 has run"; later-stage checks are SKIPPED
+#   WITH THEIR REASON.  03_preflight passes no stage, so every check is enforced
+#   before anything reaches a GPU.
 #
 # `cpu` because this is a LOGIN NODE: a GPU-dependent check here would condemn a
 #   working environment.  Verification must be no more privileged than the node
 #   it runs on.
 echo
-if FIR_ASSERT_SKIP_TEMP=1 fir_assert_env cpu; then
+if fir_assert_env cpu 01; then
     echo
     echo "############ SETUP OK ############"
     echo "next:  bash sbatch/fir/01c_stage_repos.sh     # authors' clones for the bit-identity gates"

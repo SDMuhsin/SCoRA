@@ -54,7 +54,17 @@ FIR_ACCOUNT_CPU="${FIR_ACCOUNT_CPU:-def-seokbum_cpu}"
 #    => code on /project; env/, data/, temp/ on /scratch behind SYMLINKS, so
 #       every existing `./env/bin/python` and `$(pwd)/data` reference in the repo
 #       keeps working with no edit.
-FIR_SCRATCH_ROOT="${FIR_SCRATCH_ROOT:-${SCRATCH:-/scratch/$USER}/lora_research_signal}"
+# ⚠⚠ DERIVED FROM THE REPO DIRECTORY, NOT HARDCODED.
+#    This was literally `.../lora_research_signal` while the checkout on fir is
+#    named `SCoRA` [observed 2026-08-25]. Harmless on its own -- but the SCoRA
+#    branch carries LYRA's full history, so BOTH repos can plausibly be checked
+#    out on the same account, and with a hardcoded name they would SHARE ONE
+#    /scratch root: one venv, one HF cache, one runs/ directory, silently.
+#    Two different experiments writing into one environment is precisely the
+#    class of collision this file exists to prevent, and it fails silently.
+#    Override with FIR_SCRATCH_ROOT if you deliberately want them shared.
+FIR_REPO_NAME="${FIR_REPO_NAME:-$(basename "$(readlink -f "$(pwd)")")}"
+FIR_SCRATCH_ROOT="${FIR_SCRATCH_ROOT:-${SCRATCH:-/scratch/$USER}/$FIR_REPO_NAME}"
 FIR_VENV_REAL="${FIR_VENV_REAL:-$FIR_SCRATCH_ROOT/env}"
 FIR_DATA_REAL="${FIR_DATA_REAL:-$FIR_SCRATCH_ROOT/data}"
 FIR_TEMP_REAL="${FIR_TEMP_REAL:-$FIR_SCRATCH_ROOT/temp}"
@@ -226,11 +236,48 @@ fir_export_offline() {
 
 # --- THE GATE ----------------------------------------------------------------
 # Fail on the LOGIN NODE, not 40 minutes into an allocation.
-#   fir_assert_env cpu   — no CUDA check (login node)
-#   fir_assert_env gpu   — inside an allocation
+#   fir_assert_env <cpu|gpu> [stage]
+#     cpu / gpu   — whether a CUDA check is legal on this node type
+#     stage       — the stage that has JUST COMPLETED: 01 | 01c | 02 | all
+#                   (default `all`: every check runs)
+#
+# ⛔⛔ WHY THE `stage` ARGUMENT EXISTS — FIR_SETUP C15, WHICH I REPRODUCED.
+#    Some checks here need an artifact that a LATER stage creates:
+#        the temp/ clones      are made by 01c
+#        the offline HF cache  is made by 02
+#    ...but this gate is 01's closing gate. Run unconditionally, it demands
+#    artifacts that cannot exist yet, so a COMPLETELY CORRECT FRESH SETUP CAN
+#    NEVER PASS ITS OWN GATE and always ends "SETUP INCOMPLETE".
+#
+#    That happened on fir 2026-08-25. The `temp/` half had been guarded by an
+#    ad-hoc FIR_ASSERT_SKIP_TEMP flag; the offline-cache half had not, because
+#    the first instance was fixed and the CLASS was never enumerated -- the exact
+#    mistake FIR_SETUP Law 4 is about ("enumerate a control across every arm the
+#    moment it fails on one").
+#
+#    ⇒ Ad-hoc per-check flags are the bug. EVERY check now DECLARES the stage its
+#      precondition comes from, via `_need <stage>`, and a check whose stage has
+#      not run yet is SKIPPED WITH ITS REASON rather than failing. Adding a new
+#      check forces you to declare a stage; you cannot silently omit one.
+#      ⛔ Nothing reaches a GPU unchecked: 03_preflight calls this with no stage
+#        argument, so every check is enforced there.
+_fir_stage_num() {
+    case "$1" in
+        01)  echo 1 ;;
+        01c) echo 2 ;;
+        02)  echo 3 ;;
+        all|03|"") echo 99 ;;
+        *)   echo "fir_assert_env: unknown stage '$1'" >&2; echo -1 ;;
+    esac
+}
+
 fir_assert_env() {
-    local want="${1:-gpu}" rc=0
-    echo "--- fir_assert_env ($want) ---"
+    local want="${1:-gpu}" stage="${2:-all}" rc=0
+    local _have; _have="$(_fir_stage_num "$stage")"
+    [ "$_have" -lt 0 ] && return 1
+    echo "--- fir_assert_env ($want, after stage $stage) ---"
+    # _need <stage> -> 0 if that stage has run (so the check should execute)
+    _need() { local n; n="$(_fir_stage_num "$1")"; [ "$_have" -ge "$n" ]; }
     [ -d ./src ] || { echo "FAIL: not in repo root (no ./src)"; return 1; }
     [ -x "$FIR_VENV/bin/python" ] || { echo "FAIL: no venv at $FIR_VENV — run 01_setup_venv.sh"; return 1; }
 
@@ -314,8 +361,8 @@ PY
     #     escape hatch: 01c needs the venv, so it can only run after 01, and
     #     without the flag a correct fresh setup always ends "SETUP INCOMPLETE".
     #     01 sets it; 01c and 03_preflight do NOT.
-    if [ -n "${FIR_ASSERT_SKIP_TEMP:-}" ]; then
-        echo "  temp/ author clones: SKIPPED (FIR_ASSERT_SKIP_TEMP -> run 01c next)"
+    if ! _need 01c; then
+        echo "  temp/ author clones: SKIPPED — created by stage 01c, which has not run yet"
     else
         local miss="" probe
         for probe in "LoCA/peft/src/peft/tuners/loca/dct_utils.py" \
@@ -334,6 +381,9 @@ PY
 
     # (d) AN OFFLINE LOAD, EXACTLY AS A COMPUTE NODE WILL DO IT. In a subshell so
     #     the offline exports do not leak into the caller.
+    if ! _need 02; then
+        echo "  offline model cache: SKIPPED — populated by stage 02, which has not run yet"
+    else
     ( fir_export_offline
       "$FIR_VENV/bin/python" - <<PY || exit 1
 import sys
@@ -349,6 +399,7 @@ except Exception as e:
     sys.exit(1)
 PY
     ) || rc=1
+    fi
 
     [ $rc -eq 0 ] && echo "--- fir_assert_env PASSED ---" || echo "--- fir_assert_env FAILED ---"
     return $rc

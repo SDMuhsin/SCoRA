@@ -105,8 +105,8 @@ done
 [ $rc -eq 0 ] || { echo; echo "############ STAGING FAILED ############"; exit 1; }
 
 echo
-echo "--- gate (temp/ now enforced: FIR_ASSERT_SKIP_TEMP is NOT set here) ---"
-fir_assert_env cpu || { echo "############ STAGING OK but ENV GATE FAILED ############"; exit 1; }
+echo "--- gate at stage 01c (temp/ now ENFORCED; the stage-02 cache check is not) ---"
+fir_assert_env cpu 01c || { echo "############ STAGING OK but ENV GATE FAILED ############"; exit 1; }
 echo
 echo "############ 01c_stage_repos OK ############"
 echo "next: bash sbatch/fir/02_download_cache.sh   # LOGIN node only"
