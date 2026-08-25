@@ -79,6 +79,23 @@ def retry(fn, what, n=4):
                 raise
             time.sleep(5 * i)
 
+# ⚠ THE PORT REFERENCE BACKBONE. scripts/fir_backbone_port.py --verify-emit
+#   computes the roberta-base REFERENCE column before comparing, so 03_preflight
+#   stage C needs it cached. 02 previously fetched only $FIR_MODEL, and stage C
+#   died offline with LocalEntryNotFoundError on fir 2026-08-25 -- a gap in the
+#   cache list, not a fault in the port table.
+for _ref in ["roberta-base"]:
+    print(f"--- reference backbone {_ref} ---")
+    try:
+        p_ = retry(lambda: snapshot_download(_ref, allow_patterns=["*.json", "*.txt",
+                                                                   "*.safetensors", "tokenizer*",
+                                                                   "merges.txt", "vocab.json"]),
+                   f"snapshot {_ref}")
+        print(f"  OK  {p_}")
+    except Exception as e:
+        print(f"  ⛔ FAILED: {type(e).__name__}: {str(e)[:200]}")
+        sys.exit(1)
+
 print(f"--- model {MODEL} ---")
 # ⚠ GATED REPO. If the token did not resolve, this is where it shows — and the
 #   message is explicit rather than a 401 traceback.
@@ -159,6 +176,13 @@ try:
     print(f"  model weights OK  ({len(st)} shard(s))")
 except Exception as e:
     print(f"  ⛔ weights: {type(e).__name__}: {str(e)[:200]}"); bad.append("weights")
+
+# the reference backbone must load offline too -- 03 stage C needs it
+try:
+    AutoConfig.from_pretrained("roberta-base")
+    print("  reference backbone roberta-base OK (needed by --verify-emit)")
+except Exception as e:
+    print(f"  ⛔ roberta-base: {type(e).__name__}: {str(e)[:160]}"); bad.append("roberta-base")
 
 from datasets import load_dataset
 import evaluate

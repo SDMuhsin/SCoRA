@@ -110,23 +110,58 @@ fir_assert_env gpu || rc=1
 
 echo; echo "=== B. BIT-IDENTITY GATES under peft $(python -c 'import peft;print(peft.__version__)') ==="
 echo "    ⛔ These decide whether the fir comparator IS the dev-box comparator."
-b_fail=""
+# ⛔⛔ RECORD THE OUTCOME, NEVER PREDICT IT (FIR_SETUP G5).
+#    The first version of this block treated ANY non-zero exit as "the comparator
+#    moved under peft 0.18.1" -- the failure it was written expecting. On fir
+#    2026-08-25 that produced a FALSE headline: verify_loca_adapter died on a
+#    `SyntaxError` inside its own generated driver (so it compared NOTHING) and
+#    verify_fourierft_fast died on `CUDA error: invalid device ordinal` (an
+#    environment fault), yet both were reported as bit-identity failures.
+#    "The verifier crashed" and "the verifier found a difference" are OPPOSITE
+#    meanings, and a check that cannot tell them apart is worse than no check.
+#    ⇒ three outcomes, read out of each verifier's OWN output:
+#       MISMATCH — it ran and the numbers differ   => the pin decision's real bill
+#       ERROR    — it could not run at all         => says NOTHING about numerics
+#       OK       — it ran and matched
+b_mismatch=""; b_error=""
 for v in verify_merged_fourierft verify_qwha_adapter verify_loca_adapter verify_fourierft_fast; do
     echo "--- $v ---"
-    if python "src/$v.py" 2>&1 | tail -20; then
+    # ⚠ --device EXPLICITLY. verify_fourierft_fast defaulted to `cuda:1`, a dev-box
+    #   artifact; a Slurm job with --gpus=h100:1 has only cuda:0 and it raised
+    #   "invalid device ordinal". The default is resolved now, but pass it anyway:
+    #   gate on what we hand the tool, not on its default (FIR_SETUP Law 2).
+    vdev=""
+    case "$v" in verify_fourierft_fast|verify_coset_adapter) vdev="--device cuda:0" ;; esac
+    vout="$(python "src/$v.py" $vdev 2>&1)"; vrc=$?
+    echo "$vout" | tail -25
+    if [ $vrc -eq 0 ]; then
         echo "  $v: OK"
+        continue
+    fi
+    # An interpreter-level fault means the harness never got to compare anything.
+    if echo "$vout" | grep -qE "SyntaxError|ModuleNotFoundError|ImportError|CUDA error|AcceleratorError|FileNotFoundError|No such file|Permission denied"; then
+        echo "  ⚠ $v: ERROR — the verifier could not RUN. This is NOT a numerical finding."
+        b_error="$b_error $v"
     else
-        echo "  ⛔ $v: FAILED"
-        b_fail="$b_fail $v"
+        echo "  ⛔ $v: MISMATCH — it ran and the numbers differ."
+        b_mismatch="$b_mismatch $v"
     fi
 done
-if [ -n "$b_fail" ]; then
+if [ -n "$b_error" ]; then
     echo
-    echo "⛔⛔ BIT-IDENTITY FAILURE:$b_fail"
-    echo "   The FourierFT/LoCA/QWHA comparator on fir is NOT the one every dev-box"
-    echo "   number was measured against. This is a RESULT, not a bug to route around:"
-    echo "   report it, and do not quote a fir table alongside a dev-box table until it"
-    echo "   is understood. (peft pin: $FIR_PIN_PEFT vs dev box 0.13.2.)"
+    echo "⚠⚠ VERIFIER(S) FAILED TO RUN:$b_error"
+    echo "   These say NOTHING about whether the comparator moved. The bit-identity"
+    echo "   question is UNANSWERED for them until they execute. Fix the harness, then"
+    echo "   re-run -- do not read this as either a pass or a fail."
+    rc=1
+fi
+if [ -n "$b_mismatch" ]; then
+    echo
+    echo "⛔⛔ BIT-IDENTITY MISMATCH:$b_mismatch"
+    echo "   These RAN and disagreed. The FourierFT/LoCA/QWHA comparator on fir is NOT"
+    echo "   the one every dev-box number was measured against. This is a RESULT, not a"
+    echo "   bug to route around: report it, and do not quote a fir table alongside a"
+    echo "   dev-box table until it is understood. (peft $FIR_PIN_PEFT vs dev box 0.13.2.)"
     rc=1
 fi
 

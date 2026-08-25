@@ -83,7 +83,23 @@ def bit_identity(in_f, out_f, k, scale, seed):
         fh.write(src)
     r = subprocess.run([sys.executable, drv], capture_output=True, text=True, cwd=ROOT)
     if r.returncode != 0:
-        return None, r.stderr.strip().splitlines()[-1] if r.stderr else "subprocess failed"
+        # ⛔ KEEP THE CONTEXT, NOT JUST THE LAST LINE.  This used to return
+        # `stderr.splitlines()[-1]`, which for a SyntaxError yields only
+        # "SyntaxError: unterminated string literal (detected at line 86)" and
+        # THROWS AWAY THE FILE NAME -- the one fact needed to act on it.  Seen on
+        # fir 2026-08-25, where it made the failure undiagnosable from the log and
+        # (worse) got mis-read as a bit-identity mismatch.  FIR_SETUP C13: an error
+        # report that omits the message/location is unactionable.
+        err = (r.stderr or "").strip()
+        if not err:
+            return None, f"subprocess failed rc={r.returncode} with no stderr"
+        lines = err.splitlines()
+        # the last line is the exception; the File "..." lines say WHERE
+        where = [l.strip() for l in lines if l.strip().startswith('File "')]
+        tail = lines[-1]
+        ctx = f"  [{' <- '.join(where[-2:])}]" if where else ""
+        return None, f"{tail}{ctx}  (full stderr: {len(lines)} lines)\n" + \
+                     "\n".join("        | " + l for l in lines[-12:])
     theirs_dW = torch.load(fout)["dW"]
     ours_dW = ours_layer.get_delta_weight().detach()
     return torch.equal(ours_dW, theirs_dW), f"max|diff| = {(ours_dW - theirs_dW).abs().max():.3e}"

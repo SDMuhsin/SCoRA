@@ -17,7 +17,7 @@ Tolerances are fixed a priori and are NOT to be loosened:
     float32 : 1e-5 relative (expectation ~1e-6)
     float64 : 1e-12 relative (expectation ~1e-14)
 
-Usage:  env/bin/python src/verify_fourierft_fast.py [--device cuda:1]
+Usage:  env/bin/python src/verify_fourierft_fast.py [--device cuda:0]
 """
 
 import argparse
@@ -53,6 +53,21 @@ VARIANTS = [
 ]
 
 
+# ⚠⚠ DEFAULT DEVICE IS RESOLVED, NOT HARDCODED.
+#    This defaulted to "cuda:1" -- a DEV-BOX artifact (2 GPUs there). A Slurm job
+#    with `--gpus=h100:1` sees exactly ONE device, so cuda:1 raises
+#    `CUDA error: invalid device ordinal`, which on fir 2026-08-25 was mis-read as
+#    a bit-identity failure. Resolve from what is actually present.
+def _default_device():
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "cuda:0"
+    except Exception:
+        pass
+    return "cpu"
+
+
 def rel_err(a: torch.Tensor, b: torch.Tensor) -> float:
     """max-abs difference relative to the max-abs of the reference."""
     denom = b.abs().max()
@@ -61,7 +76,8 @@ def rel_err(a: torch.Tensor, b: torch.Tensor) -> float:
     return float((a - b).abs().max() / denom)
 
 
-def run(device: str = "cuda:1", batch: int = 64, seq: int = 3) -> int:
+def run(device: str = None, batch: int = 64, seq: int = 3) -> int:
+    device = device or _default_device()
     torch.manual_seed(0)
     dev = torch.device(device)
     rows = []
@@ -187,7 +203,8 @@ def no_materialisation_test(dev: torch.device, b: int = 8, k: int = 1000) -> int
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--device", default="cuda:1")
+    ap.add_argument("--device", default=None,
+                    help="default: cuda:0 if present, else cpu (was hardcoded cuda:1)")
     ap.add_argument("--batch", type=int, default=64)
     args = ap.parse_args()
     sys.exit(1 if run(args.device, args.batch) else 0)

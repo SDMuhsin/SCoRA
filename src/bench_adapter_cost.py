@@ -84,6 +84,21 @@ K = 1000
 #    complex += complex (scatter)    = 2 flop
 #    real   += real  (residual add)  = 1 flop
 
+# ⚠⚠ DEFAULT DEVICE IS RESOLVED, NOT HARDCODED.
+#    This defaulted to "cuda:1" -- a DEV-BOX artifact (2 GPUs there). A Slurm job
+#    with `--gpus=h100:1` sees exactly ONE device, so cuda:1 raises
+#    `CUDA error: invalid device ordinal`, which on fir 2026-08-25 was mis-read as
+#    a bit-identity failure. Resolve from what is actually present.
+def _default_device():
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "cuda:0"
+    except Exception:
+        pass
+    return "cpu"
+
+
 def FFT_C(L: int) -> float:
     return 5.0 * L * math.log2(L)
 
@@ -449,7 +464,8 @@ FIELDS = ["rep", "gpu_util_pct", "gpu_mem_used_MiB",
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--device", default="cuda:1")
+    ap.add_argument("--device", default=None,
+                    help="default: cuda:0 if present, else cpu (was hardcoded cuda:1)")
     ap.add_argument("--out", default="results/j2_cost_bench.csv")
     ap.add_argument("--ds", type=int, nargs="+", default=DS)
     ap.add_argument("--bs", type=int, nargs="+", default=BS)
@@ -458,7 +474,7 @@ def main():
     ap.add_argument("--repeats", type=int, default=3)
     args = ap.parse_args()
 
-    device = torch.device(args.device)
+    device = torch.device(args.device or _default_device())   # None => resolve
     torch.cuda.set_device(device)
     gpu = torch.cuda.get_device_name(device)
     rng = random.Random(args.seed)
