@@ -222,7 +222,12 @@ hr "14. LUSTRE flock SEMANTICS (decides whether a shared CSV writer is safe)"
 #   inherit -- and note this repo writes ONE CSV PER CELL anyway (the upsert key
 #   omits seed; scripts/r304_upsert_gate.py enforces it), so it does not depend on
 #   the answer.  Report it regardless: it is a property of the cluster.
-for m in "${SCRATCH:-/scratch/$USER}" "$HOME" "${PROJECT:-$HOME}"; do
+# ⚠ `$PROJECT` is UNSET on fir [measured 2026-08-25], so an earlier version of this
+#   loop fell back to "${PROJECT:-$HOME}" and probed /home TWICE while never probing
+#   /project at all -- the very filesystem the repo lives on. Resolve it from the cwd
+#   instead, which is where the repo actually is.
+FIR_PROJECT_GUESS="$(readlink -f "$(pwd)" 2>/dev/null)"
+for m in "${SCRATCH:-/scratch/$USER}" "$HOME" "${PROJECT:-$FIR_PROJECT_GUESS}"; do
     echo "--- $m ---"
     findmnt -o TARGET,SOURCE,FSTYPE,OPTIONS --target "$m" 2>&1 | head -4
 done

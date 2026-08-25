@@ -35,6 +35,7 @@ through `PIPESTATUS`.
 | # | command | node | must print |
 |---|---|---|---|
 | 0 | `bash sbatch/fir/00_probe_fir.sh` | login | a fact dump (changes nothing) |
+| 0c | `bash sbatch/fir/00c_probe_deps.sh` | login | `DEPS RESOLVE` |
 | 1 | `bash sbatch/fir/01_setup_venv.sh` | login | `SETUP OK` |
 | 1c | `bash sbatch/fir/01c_stage_repos.sh` | login | `01c_stage_repos OK` |
 | 2 | `bash sbatch/fir/02_download_cache.sh` | login | `ALL OFFLINE LOADS OK` |
@@ -53,6 +54,14 @@ lineage's history cost a GPU allocation.
 * **`00`** — read-only. Modules and their order, gres strings per partition, account names
   (`_gpu`/`_cpu`), python version, `/project` vs `/scratch` **space AND inodes**, PyPI reachability,
   §13 the gemma token, §14 Lustre `flock` semantics.
+* **`0c`** — ⛔ **run this before `01`.** `avail_wheels` in `00` §6 reports only the wheelhouse
+  **DEFAULTS** (on fir: torch 2.13.0 / transformers 5.14.1 / peft 0.19.1 / datasets 5.0.0), so §6
+  looks alarming and proves nothing — the older pins are generally present as `+computecanada` but
+  are not listed. ⚠ `pip index versions` is unreliable (experimental, misreports flat PEP-503
+  indexes; it once reported "No matching distribution" for a package that installs fine).
+  **Only `pip install --dry-run` can settle it**, which is what `0c` does — in a throwaway venv, so
+  scipy-stack's numpy/pandas cannot mask a missing pin, and resolving `requirements.txt` **as a
+  set**, because pins that each resolve alone can still conflict together.
 * **`01`** — venv + the pinned stack, then `requirements.txt` **under a constraints file**.
   ⛔ Not a hand-list: `train_glue.py` has ~48 unguarded module-scope imports, so a package no arm
   uses still kills every arm, and hand-listing provably cannot converge.
