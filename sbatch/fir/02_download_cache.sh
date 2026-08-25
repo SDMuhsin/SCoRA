@@ -191,6 +191,13 @@ PY
 ) || { echo "############ CACHE INCOMPLETE ############"; exit 1; }
 
 echo
-echo "cache size: $(du -sh ./data 2>/dev/null | cut -f1)   files: $(find -L ./data -type f 2>/dev/null | wc -l)"
+# ⚠ `du -shL`, NOT `du -sh`. ./data is a SYMLINK to /scratch, and du does not
+#   follow a symlink ARGUMENT -- it measures the link itself and reports 0.
+#   On fir 2026-08-25 this printed "cache size: 0" immediately after a
+#   successful 4.69 GiB download. FIR_SETUP B4 documents exactly this for
+#   `find` (hence `find -L` everywhere here); `du` is the same trap and was
+#   missed BECAUSE the doc names find. A status line that lies is worse than
+#   none -- this one is the only evidence the model actually landed.
+echo "cache size: $(du -shL ./data 2>/dev/null | cut -f1)   files: $(find -L ./data -type f 2>/dev/null | wc -l)"
 echo "############ ALL OFFLINE LOADS OK ############"
 echo "next: sbatch/fir/03_preflight.sh   # 1-GPU job; re-runs the bit-identity gates under peft $FIR_PIN_PEFT"
