@@ -44,21 +44,41 @@ def load(run_root):
         try:
             val = float(row.get(col, "nan"))
         except (TypeError, ValueError):
-            continue
-        if math.isnan(val):
-            continue
+            val = float("nan")
         try:
             be = float(row.get("best_epoch", "nan"))
         except (TypeError, ValueError):
             be = float("nan")
-        out[cid] = {"val": val, "metric": col, "best_epoch": be, "task": task}
+        try:
+            acc = float(row.get("accuracy", "nan"))
+        except (TypeError, ValueError):
+            acc = float("nan")
+        # ⛔ A NaN METRIC IS A RESULT, NOT AN ABSENCE. The first version skipped it,
+        #   so a cell that RAN AND DIVERGED was counted as "missing" -- while its
+        #   `done` marker said it succeeded. Two parts of the same report would have
+        #   disagreed, and the reading "the sweep did not finish" is the opposite of
+        #   the truth, which is "this hyperparameter blows the model up". lr=4.0 is
+        #   deliberately on this grid, so this is the expected outcome for some cells.
+        out[cid] = {"val": val, "metric": col, "best_epoch": be, "task": task,
+                    "accuracy": acc, "diverged": math.isnan(val)}
     return out
+
+
+def _accuracy_floor():
+    """MRPC's majority-class rate -- the accuracy a constant predictor scores.
+    Read from the MEASURED dataset sizes, never typed in."""
+    S = H.FP.sizes()
+    lc = S.get(H.TASK, {}).get("label_counts")
+    if not lc:
+        return None
+    counts = {int(k): v for k, v in lc.items()}
+    return max(counts.values()) / sum(counts.values())
 
 
 def coverage(run_root, arms=None):
     want = [H.cell_id(c) for c in H.cells(arms)]
     got = load(run_root)
-    done = {c for c in want if c in got}
+    done = {c for c in want if c in got}          # includes diverged cells: they RAN
     failed = {os.path.basename(p) for p in glob.glob(os.path.join(run_root, "fail", "*"))}
     missing = [c for c in want if c not in done]
     return want, got, done, failed, missing
@@ -84,19 +104,41 @@ def report(run_root, arms=None, top=15):
         lines.append("  nothing to rank yet.")
         return lines
     metric = got[next(iter(done))]["metric"]
+    diverged = sorted(c for c in done if got[c]["diverged"])
+    scored = [c for c in done if not got[c]["diverged"]]
+    acc_floor = _accuracy_floor()
     lines.append(f"  metric: {metric} (MRPC's own primary metric)"
                  + (f"   collapse floor {floor:.4f}" if floor is not None else ""))
-    dead = [c for c in done if floor is not None and got[c]["val"] <= floor + 1e-9]
+    # ⚠ ON MRPC THE F1 FLOOR IS HIGH: predicting all-positive scores F1 0.8122
+    #   because 279/408 eval pairs are positive. So F1 SEPARATES POORLY here --
+    #   0.85 is 0.04 above a constant predictor. Accuracy's floor is the 0.6838
+    #   majority rate, so it discriminates far better. The RANKING stays on the
+    #   task's declared primary metric; accuracy is printed beside it so a cell
+    #   near the F1 floor cannot be mistaken for a cell that learned.
+    if acc_floor is not None:
+        lines.append(f"  ⚠ that floor is HIGH ({floor:.4f}): an all-positive predictor scores it. "
+                     f"accuracy is shown too (its floor is {acc_floor:.4f}).")
+    if diverged:
+        lines.append(f"  ⛔ {len(diverged)} cell(s) RAN AND DIVERGED (no finite {metric}) -- "
+                     f"that is a result about the hyperparameter, not a missing cell:")
+        for c in diverged[:6]:
+            lines.append(f"       {c}")
+    dead = [c for c in scored if floor is not None and got[c]["val"] <= floor + 1e-9]
     if dead:
-        lines.append(f"  ⚠ {len(dead)}/{len(done)} finished cells are AT OR BELOW the "
+        lines.append(f"  ⚠ {len(dead)}/{len(scored)} scored cells are AT OR BELOW the "
                      f"collapse floor -- they ran, they did not learn.")
-    rank = sorted(done, key=lambda c: -got[c]["val"])
+    rank = sorted(scored, key=lambda c: -got[c]["val"])
+    if not rank:
+        lines.append("  no cell produced a finite metric.")
+        return lines
     lines.append("")
-    lines.append(f"  top {min(top, len(rank))} of {len(done)}  "
+    lines.append(f"  top {min(top, len(rank))} of {len(scored)}  "
                  f"⚠ ONE SEED: read this as a REGION, not an order")
-    lines.append(f"    {'cell':58s} {metric:>8s}  best_ep")
+    lines.append(f"    {'cell':58s} {metric:>8s} {'acc':>7s}  best_ep")
     for c in rank[:top]:
-        lines.append(f"    {c:58s} {got[c]['val']:8.4f}  {got[c]['best_epoch']:.0f}")
+        a = got[c]["accuracy"]
+        astr = "    n/a" if math.isnan(a) else f"{a:7.4f}"
+        lines.append(f"    {c:58s} {got[c]['val']:8.4f} {astr}  {got[c]['best_epoch']:.0f}")
     # per-arm best, because the two arms are separate baselines
     for arm in (arms or H.ARMS):
         sub = [c for c in rank if f"-{arm}-" in c]
@@ -160,6 +202,18 @@ def selftest():
         L = report(d)
         ck(any("collapse floor" in l for l in L), "the metric-aware floor is reported")
         ck(any("did not learn" in l for l in L), "CONTROL: a floor-value cell is flagged")
+
+        # ⛔ A DIVERGED CELL (NaN metric) IS A RESULT, NOT A MISSING CELL
+        with open(os.path.join(d, "csv", H.cell_id(cs[4]) + ".csv"), "w", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=["task_name", "f1", "accuracy", "best_epoch"])
+            w.writeheader(); w.writerow({"task_name": "mrpc", "f1": "nan",
+                                         "accuracy": "nan", "best_epoch": 1})
+        L = report(d)
+        ck(any("RAN AND DIVERGED" in l for l in L), "a NaN cell is reported as DIVERGED")
+        ck(any(H.cell_id(cs[4]) in l for l in L), "the diverged cell is NAMED")
+        ck(not any(f"missing e.g.: {H.cell_id(cs[4])}" in l for l in L),
+           "CONTROL: it is NOT also counted as missing (done/ says it ran)")
+        ck(any("its floor is" in l for l in L), "the accuracy floor is printed beside F1's")
 
         # a failure marker is surfaced
         open(os.path.join(d, "fail", H.cell_id(cs[3])), "w").write("exit=1 elapsed=9s")
