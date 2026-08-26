@@ -219,12 +219,15 @@ def t_provenance():
     check("fir_print_provenance prints a commit", re.search(r"commit: [0-9a-f]{7,}", r.stdout),
           r.stdout + r.stderr)
     check("...and how many files are uncommitted", "uncommitted files:" in r.stdout, r.stdout)
-    for f in ("01_setup_venv.sh", "01c_stage_repos.sh", "02_download_cache.sh", "03_preflight.sh"):
+    for f in ("01_setup_venv.sh", "01c_stage_repos.sh", "02_download_cache.sh",
+              "03_preflight.sh", "04_hp_sweep.sh"):
         src = open(os.path.join(FIR, f)).read()
         n = len([l for l in src.splitlines()
                  if l.strip().startswith("fir_print_provenance")])
         # 03 prints it twice on purpose: once on the login node, once in the job body.
-        want = 2 if f == "03_preflight.sh" else 1
+        # 04 prints it on the submit path and on --status (never in the array task,
+        # where 160 copies of a git call would be noise, not evidence).
+        want = 2 if f in ("03_preflight.sh", "04_hp_sweep.sh") else 1
         check(f"{f} prints its provenance", n == want, f"{n} call(s), want {want}")
 
 
