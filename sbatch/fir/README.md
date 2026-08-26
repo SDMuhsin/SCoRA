@@ -146,3 +146,26 @@ bash sbatch/fir/02_download_cache.sh --verify-only        # offline loads only, 
 
 Every stage is **idempotent**: re-running verifies and repairs rather than rebuilding
 (`01` takes `--fresh` if you really want a rebuild).
+
+
+---
+
+## 5. ⛔ Do not MOVE a venv
+
+`bin/activate` hardcodes `VIRTUAL_ENV` as an **absolute path fixed at creation time**. Moving the
+venv directory leaves `activate` pointing at the old path: it still "succeeds", prepends a
+**nonexistent** directory to `PATH`, and bare `python` silently becomes the module python — no
+torch, no peft.
+
+⚠ It is invisible to every check that calls `./env/bin/python` **explicitly**, which is most of
+them. On fir 2026-08-26 the env gate PASSED (explicit path, torch loaded from the venv) while all
+four bit-identity verifiers died on `ModuleNotFoundError: No module named 'torch'` in the same job.
+
+Now guarded three ways: `01` treats a relocated venv as **unhealthy and rebuilds it**, the env gate
+reports `RELOCATED VENV` and fails, and `03` calls `$FIR_VENV/bin/python` explicitly so it never
+depends on `PATH` at all.
+
+**If you need the venv somewhere else, rebuild it — do not `mv` it:**
+```bash
+bash sbatch/fir/01_setup_venv.sh --fresh
+```

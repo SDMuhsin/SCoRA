@@ -108,7 +108,17 @@ rc=0
 echo; echo "=== A. environment gate (GPU) ==="
 fir_assert_env gpu || rc=1
 
-echo; echo "=== B. BIT-IDENTITY GATES under peft $(python -c 'import peft;print(peft.__version__)') ==="
+# ⚠⚠ CALL THE VENV INTERPRETER EXPLICITLY, NEVER BARE `python`.
+# A venv is not relocatable: bin/activate hardcodes an absolute VIRTUAL_ENV, so
+# after the venv directory is moved, `activate` succeeds, puts a NONEXISTENT dir
+# on PATH, and bare `python` is the MODULE python -- no torch, no peft. On fir
+# 2026-08-26 that made all four verifiers die on ModuleNotFoundError while the
+# env gate PASSED, because the gate calls "$FIR_VENV/bin/python" explicitly.
+# FIR_SETUP E6 says the same thing for the login-node report jobs.
+PY_BIN="$FIR_VENV/bin/python"
+[ -x "$PY_BIN" ] || { echo "FAIL: no interpreter at $PY_BIN"; exit 1; }
+echo "interpreter: $PY_BIN  ($("$PY_BIN" -V 2>&1))"
+echo; echo "=== B. BIT-IDENTITY GATES under peft $("$PY_BIN" -c 'import peft;print(peft.__version__)') ==="
 echo "    ⛔ These decide whether the fir comparator IS the dev-box comparator."
 # ⛔⛔ RECORD THE OUTCOME, NEVER PREDICT IT (FIR_SETUP G5).
 #    The first version of this block treated ANY non-zero exit as "the comparator
@@ -132,7 +142,7 @@ for v in verify_merged_fourierft verify_qwha_adapter verify_loca_adapter verify_
     #   gate on what we hand the tool, not on its default (FIR_SETUP Law 2).
     vdev=""
     case "$v" in verify_fourierft_fast|verify_coset_adapter) vdev="--device cuda:0" ;; esac
-    vout="$(python "src/$v.py" $vdev 2>&1)"; vrc=$?
+    vout="$("$PY_BIN" "src/$v.py" $vdev 2>&1)"; vrc=$?
     echo "$vout" | tail -25
     if [ $vrc -eq 0 ]; then
         echo "  $v: OK"
@@ -168,10 +178,10 @@ fi
 echo; echo "=== C. port table reproduces on this stack ==="
 # ⭐ The adapters are pure torch, so a difference here means torch/transformers/peft
 #   moved a layer. Tolerance is float32-reduction-aware and its firing is gated.
-python scripts/fir_backbone_port.py --model "$FIR_MODEL" --verify-emit || rc=1
+"$PY_BIN" scripts/fir_backbone_port.py --model "$FIR_MODEL" --verify-emit || rc=1
 
 echo; echo "=== D. ALL NINE ARMS TRAIN, WITH RECEIPTS ==="
-python scripts/fir_preflight_arms.py \
+"$PY_BIN" scripts/fir_preflight_arms.py \
     --targets "$P_TARGETS" --port-mode "$P_PORT_MODE" --task "$P_TASK" \
     --steps "$P_STEPS" --run-root "$FIR_RUN_ROOT/preflight" || rc=1
 
