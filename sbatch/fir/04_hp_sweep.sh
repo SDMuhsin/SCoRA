@@ -55,7 +55,7 @@ while [ $# -gt 0 ]; do
 done
 
 SWEEP_ROOT="$FIR_RUN_ROOT/hpsweep"
-mkdir -p "$SWEEP_ROOT"/{csv,logs,done,fail}
+mkdir -p "$SWEEP_ROOT"/{csv,logs,done,fail,started}
 
 # ===========================================================================
 # THE ARRAY TASK BODY (one cell).  Runs on a compute node.
@@ -74,6 +74,14 @@ if [ -n "$LOCAL_ONE" ]; then
     PY_BIN="$FIR_VENV/bin/python"          # ⚠ never bare `python` (a moved venv)
     [ -x "$PY_BIN" ] || { echo "FAIL: no interpreter at $PY_BIN"; exit 1; }
     rm -f "$SWEEP_ROOT/fail/$cid"
+    # ⛔⛔ A CELL KILLED AT THE --time WALL RECORDS NOTHING.
+    #   Slurm SIGKILLs the task, so the `fail/` writer below never runs: `--status`
+    #   would show done=0 failed=0 -- IDENTICAL to "never started". On a first-ever
+    #   sweep against an UNMEASURED wall-clock that is the single most likely
+    #   outcome, and it would look like nothing happened. A start marker makes
+    #   "started and vanished" a distinguishable state.
+    echo "job=${SLURM_JOB_ID:-none} node=$(hostname) start=$(date -u +%FT%TZ)" \
+        > "$SWEEP_ROOT/started/$cid"
     t0=$SECONDS
     "$PY_BIN" scripts/fir_hp_run_cell.py --cell "$cid" --run-root "$SWEEP_ROOT"
     rc=$?
@@ -108,8 +116,46 @@ if $STATUS; then
                         NR, a[1], a[int((NR+1)/2)], a[NR], s/NR}'
         echo "  ⚠ size --time from the MAX, not the median: --time is a hard kill."
     fi
-    [ "$NFAIL" -gt 0 ] && { echo "--- failures ---"; for f in "$SWEEP_ROOT"/fail/*; do
-        echo "  $(basename "$f"): $(head -1 "$f")"; done; }
+    if [ "$NFAIL" -gt 0 ]; then
+        echo "--- failures (exit != 0, or a receipt check that refused the cell) ---"
+        for f in "$SWEEP_ROOT"/fail/*; do
+            echo "  ⛔ $(basename "$f")"
+            sed 's/^/       /' "$f" | head -26
+        done
+    fi
+    # started, but neither done nor failed => it was KILLED (the --time wall, an
+    # OOM kill, a node fault). Nothing else in this tree can see that state.
+    DIED=""
+    for m in "$SWEEP_ROOT"/started/*; do
+        [ -e "$m" ] || continue
+        c="$(basename "$m")"
+        [ -f "$SWEEP_ROOT/done/$c" ] && continue
+        [ -f "$SWEEP_ROOT/fail/$c" ] && continue
+        DIED="$DIED $c"
+    done
+    if [ -n "$DIED" ]; then
+        echo "--- ⛔ STARTED AND NEVER FINISHED (killed: --time wall / OOM / node fault) ---"
+        for c in $DIED; do
+            echo "  $c   [$(cat "$SWEEP_ROOT/started/$c")]"
+            echo "     slurm log: $SWEEP_ROOT/logs/slurm_*_*.out ; cell log: $SWEEP_ROOT/logs/$c.log"
+        done
+        echo "  ⚠ If these hit the wall, RAISE --time. A killed cell records no exit code,"
+        echo "    which is exactly why the start marker exists."
+    fi
+    # ⭐ COPY THE EVIDENCE INTO ./logs SO IT TRAVELS. The array's own output lives
+    #   on /scratch (correct: /project is inode-bound), but /scratch does NOT get
+    #   scp'd back, so a failure was invisible to anyone reading ./logs -- the only
+    #   channel this project actually has. Bounded: failed + died cells only.
+    COLLECT="./logs/hpsweep"; mkdir -p "$COLLECT"
+    n_c=0
+    for c in $DIED $(cd "$SWEEP_ROOT/fail" 2>/dev/null && ls 2>/dev/null); do
+        [ -f "$SWEEP_ROOT/logs/$c.log" ] && { cp "$SWEEP_ROOT/logs/$c.log" "$COLLECT/"; n_c=$((n_c+1)); }
+    done
+    for f in "$SWEEP_ROOT"/logs/slurm_*.out; do
+        [ -e "$f" ] || continue
+        cp "$f" "$COLLECT/" 2>/dev/null && n_c=$((n_c+1))
+    done
+    echo "--- collected $n_c file(s) into $COLLECT (scp ./logs as usual) ---"
     echo
     echo "read: env/bin/python scripts/fir_hp_read.py --run-root $SWEEP_ROOT"
     exit 0
