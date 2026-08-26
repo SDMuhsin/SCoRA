@@ -162,9 +162,19 @@ if ! venv_is_healthy; then
 fi
 # shellcheck disable=SC1091
 source "$FIR_VENV/bin/activate" || exit 1
-echo "venv python: $(python -V 2>&1) at $(command -v python)"
+# ⚠⚠ CALL THE VENV INTERPRETER EXPLICITLY FROM HERE DOWN, NEVER BARE `python`.
+#   `activate` only PREPENDS to PATH, and it prepends the absolute path baked in
+#   at creation time. If the venv directory was ever moved, that path does not
+#   exist, activate still succeeds, and bare `python` is the MODULE python -- so
+#   `python -m pip install` would install into the module environment (or fail),
+#   and every check below would test the wrong interpreter. venv_not_relocated()
+#   above makes that impossible here, but the SAME line in 02_download_cache.sh
+#   had no such guard, so this is enumerated rather than argued (FIR_SETUP Law 4).
+VPY="$FIR_VENV/bin/python"
+echo "venv python: $("$VPY" -V 2>&1) at $VPY"
+echo "  PYTHONNOUSERSITE=${PYTHONNOUSERSITE:-<unset>}  (must be 1, or pip may no-op against ~/.local)"
 
-python -m pip install -q --upgrade pip setuptools wheel packaging ninja || exit 1
+"$VPY" -m pip install -q --upgrade pip setuptools wheel packaging ninja || exit 1
 
 # ⚠ THE TORCH GUARD. A pip stage can silently DOWNGRADE torch by pulling a
 # dependency that pins an older one — which is exactly what happened on fir
@@ -175,7 +185,7 @@ python -m pip install -q --upgrade pip setuptools wheel packaging ninja || exit 
 # Re-assert the pin after EVERY stage so the culprit is named at the moment it acts.
 assert_torch_pin() {
     local where="$1"
-    python - <<PY || { echo "FAIL: torch pin broken by: $where"; exit 1; }
+    "$VPY" - <<PY || { echo "FAIL: torch pin broken by: $where"; exit 1; }
 import sys, torch
 want, got = "${FIR_PIN_TORCH}", torch.__version__
 if not got.startswith(want):
@@ -186,11 +196,62 @@ if not got.startswith(want):
 PY
 }
 
-stage() {   # stage <label> <import-check> -- <pip args...>
-    local label="$1" check="$2"; shift 3
+# ⛔⛔ THE DEFECT THAT COST THIS SESSION A ROUND TRIP, fir 2026-08-26.
+#   `python -m pip install torch==2.10.0` into a FRESHLY CREATED, EMPTY venv
+#   printed "Requirement already satisfied" and installed NOTHING — because the
+#   venv is --system-site-packages, ~/.local holds torch 2.10.0 / transformers
+#   4.51.3 / datasets 4.5.0 / peft 0.18.1 (the SAME versions we pin), and pip
+#   counts those as satisfying the requirement. The stage's own post-install
+#   check then did `import torch; print(torch.__version__)`, imported ~/.local,
+#   printed `2.10.0`, and PASSED. Four stages in a row passed against packages
+#   that were never installed. 01 declared the venv built; the next compute-node
+#   job, where PYTHONNOUSERSITE=1 removes ~/.local, died on `import transformers`.
+#
+#   Two fixes, and BOTH are needed:
+#     1. fir_env.sh now exports PYTHONNOUSERSITE=1 at source time, so pip cannot
+#        see ~/.local and actually installs. That is the CAUSE fix.
+#     2. this one — every stage now asserts its packages resolve INSIDE the venv
+#        directory. That is the CONTROL, and it is the part that can fail. A
+#        version check cannot distinguish "installed here" from "already present
+#        somewhere else"; only the path can. ⛔ Do not delete it as redundant with
+#        (1): it is what will catch the NEXT way the venv ends up empty.
+assert_in_venv() {   # assert_in_venv <label> "<mod> <mod> ..."
+    local label="$1" mods="$2" vreal
+    [ -n "$mods" ] || return 0
+    vreal="$(readlink -f "$FIR_VENV_REAL")"
+    FIR_CHECK_MODS="$mods" FIR_CHECK_VENV="$vreal" "$VPY" - <<'PY' || {
+import importlib, os, sys
+venv = os.path.realpath(os.environ["FIR_CHECK_VENV"])
+bad = []
+for m in os.environ["FIR_CHECK_MODS"].split():
+    try:
+        mod = importlib.import_module(m)
+    except Exception as e:
+        print(f"  ⛔ {m}: import FAILED right after install: {type(e).__name__}: {str(e)[:200]}")
+        bad.append(m); continue
+    f = os.path.realpath(getattr(mod, "__file__", "") or "")
+    if not f.startswith(venv + os.sep):
+        print(f"  ⛔ {m} resolves OUTSIDE the venv -> {f or '<no __file__>'}")
+        bad.append(m)
+if bad:
+    print(f"     expected everything under: {venv}")
+    print("     pip reported success and the version check passed, but the packages")
+    print("     are not IN the venv. This is the --system-site-packages + ~/.local")
+    print("     'already satisfied' no-op. PYTHONNOUSERSITE should have prevented it;")
+    print("     check it is exported, then re-run. Manual escape hatch:")
+    print("       python -m pip install --ignore-installed <pkgs>")
+    sys.exit(1)
+print(f"  location: all in venv ({len(os.environ['FIR_CHECK_MODS'].split())} modules)")
+PY
+        echo "FAIL: packages for '$label' are not installed in the venv"; exit 1; }
+}
+
+stage() {   # stage <label> <import-check> <modules-that-must-be-in-the-venv> -- <pip args...>
+    local label="$1" check="$2" mods="$3"; shift 4
     echo; echo "--- $label ---"
-    python -m pip install "$@" || { echo "FAIL: pip install for $label"; exit 1; }
-    python -c "$check" || { echo "FAIL: post-install verification for $label"; exit 1; }
+    "$VPY" -m pip install "$@" || { echo "FAIL: pip install for $label"; exit 1; }
+    "$VPY" -c "$check" || { echo "FAIL: post-install verification for $label"; exit 1; }
+    assert_in_venv "$label" "$mods"
     assert_torch_pin "$label"
 }
 
@@ -204,6 +265,7 @@ stage() {   # stage <label> <import-check> -- <pip args...>
 #     ⛔ NO --index-url. See the header.
 stage "torch==$FIR_PIN_TORCH" \
       "import torch; print('  torch', torch.__version__)" \
+      "torch" \
       -- -q "torch==$FIR_PIN_TORCH"
 
 # --- 4. the pinned HF stack, installed TOGETHER so pip resolves them as a set
@@ -212,6 +274,7 @@ stage "pinned HF stack" \
       "import transformers, datasets, peft, accelerate, evaluate; \
 print('  transformers', transformers.__version__, '| datasets', datasets.__version__, \
 '| peft', peft.__version__, '| accelerate', accelerate.__version__, '| evaluate', evaluate.__version__)" \
+      "transformers datasets peft accelerate evaluate huggingface_hub" \
       -- -q "transformers==$FIR_PIN_TRANSFORMERS" "datasets==$FIR_PIN_DATASETS" \
             "peft==$FIR_PIN_PEFT" "accelerate==$FIR_PIN_ACCELERATE" \
             "evaluate==$FIR_PIN_EVALUATE"
@@ -226,6 +289,7 @@ print('  transformers', transformers.__version__, '| datasets', datasets.__versi
 #     stage is seconds.  ⛔ DO NOT TIDY THIS AWAY AS REDUNDANT.
 stage "triton (NOT transitive on every torch build — see comment)" \
       "import triton; print('  triton', triton.__version__)" \
+      "triton" \
       -- -q triton
 
 # --- 4c. ⚠⚠ THE REPO'S OWN requirements.txt, UNDER A CONSTRAINTS FILE.
@@ -258,6 +322,7 @@ echo; echo "--- constraints file ($CONSTRAINTS) ---"; cat "$CONSTRAINTS"
 stage "requirements.txt (under constraints)" \
       "import adapters, galore_torch, lion_pytorch, sklearn, scipy, pandas, filelock; \
 print('  requirements leaf packages import OK')" \
+      "adapters galore_torch lion_pytorch" \
       -- -q -r requirements.txt -c "$CONSTRAINTS"
 
 # --- 4d. sentencepiece: gemma's tokenizer is SentencePiece-backed.  It is NOT in
@@ -266,6 +331,7 @@ print('  requirements leaf packages import OK')" \
 #     reason, rather than discovered on a compute node.
 stage "sentencepiece (gemma tokenizer) + protobuf" \
       "import sentencepiece; print('  sentencepiece', sentencepiece.__version__)" \
+      "sentencepiece" \
       -- -q sentencepiece protobuf
 
 # ===========================================================================

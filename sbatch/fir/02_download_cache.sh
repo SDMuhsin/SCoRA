@@ -52,11 +52,17 @@ fir_link_scratch     || exit 1
 [ -x "$FIR_VENV/bin/python" ] || { echo "FAIL: no venv — run 01_setup_venv.sh"; exit 1; }
 # shellcheck disable=SC1091
 source "$FIR_VENV/bin/activate" || exit 1
+# ⚠⚠ bare `python` was used below until 2026-08-26. activate prepends the
+#   absolute path stamped at creation time, so after the venv was moved on fir
+#   bare `python` became the MODULE python and this stage would have downloaded
+#   (and "verified") the cache with a completely different transformers/datasets.
+#   Call the interpreter explicitly; the symlink ./env makes it path-stable.
+VPY="$FIR_VENV/bin/python"
 
 if ! $VERIFY_ONLY; then
     echo; echo "=== DOWNLOAD (online) ==="
     fir_export_online          # ⚠ resolves HF_TOKEN explicitly — see fir_env.sh
-    P_TASKS="$P_TASKS" FIR_MODEL="$FIR_MODEL" python - <<'PY' || exit 1
+    P_TASKS="$P_TASKS" FIR_MODEL="$FIR_MODEL" "$VPY" - <<'PY' || exit 1
 import os, sys, time
 from huggingface_hub import snapshot_download
 from datasets import load_dataset
@@ -148,7 +154,7 @@ fi
 echo; echo "=== VERIFY (offline, as a compute node will do it) ==="
 (
   fir_export_offline
-  P_TASKS="$P_TASKS" FIR_MODEL="$FIR_MODEL" python - <<'PY'
+  P_TASKS="$P_TASKS" FIR_MODEL="$FIR_MODEL" "$VPY" - <<'PY'
 import os, sys
 TASKS = [t.strip() for t in os.environ["P_TASKS"].split(",") if t.strip()]
 MODEL = os.environ["FIR_MODEL"]
