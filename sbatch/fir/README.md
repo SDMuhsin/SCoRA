@@ -208,3 +208,32 @@ package with and without user-site.
 ⭐ All three are exercised locally, in both directions, by
 `env/bin/python scripts/fir_shell_gates.py --selftest` — the shell layer is no longer the one part
 of this tree that can only be tested by a user running it on the cluster.
+
+---
+
+## 7. Stage 04 — the MRPC hyperparameter sweep
+
+```bash
+bash sbatch/fir/04_hp_sweep.sh --canary 2     # ⭐ ALWAYS FIRST — measures a cell
+bash sbatch/fir/04_hp_sweep.sh --status       # coverage + MEASURED seconds/cell
+bash sbatch/fir/04_hp_sweep.sh --time HH:MM:SS [--concurrent N]   # the rest
+env/bin/python scripts/fir_hp_read.py --run-root "$FIR_RUN_ROOT/hpsweep"
+```
+
+**160 cells** = 2 arms (`fftm`, `fftstock`) × 5 `learning_rate` × 4 `scaling` × 4 `classifier_lr`,
+on **MRPC**, `q_o`, **1 seed (42)**, **5 epochs** (575 steps/cell). One Slurm array, one cell per
+task. Grid: `scripts/fir_hp_plan.py --show`.
+
+**It assumes cells will fail.** Cells are independent; `done/<id>` is written only after exit 0 and
+holds the elapsed seconds; a failure writes `fail/<id>` with the exit code and log tail. **Re-running
+the script is the recovery procedure** — it submits only the indices with no `done` marker, so a
+resume never re-queues a finished cell (which would still allocate an H100 to say "already done").
+
+⛔ **Do not skip the canary.** `--time` is a hard kill on fir, and the per-cell wall-clock for
+gemma-2b on an H100 has never been measured — the preflight's 8-step cells are startup-dominated.
+The canary runs **one cell per arm** (not the first two lines, which are both `fftm`), then
+`--status` prints min/median/max seconds. Size `--time` from the **max**.
+
+⭐ Each cell verifies **its own** receipts: a lone sweep cell has no cross-arm comparison, so
+`fir_hp_run_cell.py` derives the module count from `trainable − head` and refuses to write a `done`
+marker if the adapter attached to nothing — the failure that exits 0 and produces a plausible F1.
