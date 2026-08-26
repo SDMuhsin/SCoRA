@@ -146,7 +146,13 @@ if $STATUS; then
     #   on /scratch (correct: /project is inode-bound), but /scratch does NOT get
     #   scp'd back, so a failure was invisible to anyone reading ./logs -- the only
     #   channel this project actually has. Bounded: failed + died cells only.
-    COLLECT="./logs/hpsweep"; mkdir -p "$COLLECT"
+    # ⛔⛔ OVERRIDABLE, AND THAT IS NOT A NICETY. This path was HARDCODED, so
+    #   fir_shell_gates.py -- which runs --status against a temp sweep root -- still
+    #   collected into the REAL ./logs/hpsweep, and then cleaned it up afterwards.
+    #   Running the test suite therefore DELETED the canary logs and CSVs a user had
+    #   just scp'd there. A test must never be able to reach a real artifact
+    #   directory; the fixture now points this somewhere disposable.
+    COLLECT="${FIR_COLLECT_DIR:-./logs/hpsweep}"; mkdir -p "$COLLECT"
     n_c=0
     for c in $DIED $(cd "$SWEEP_ROOT/fail" 2>/dev/null && ls 2>/dev/null); do
         [ -f "$SWEEP_ROOT/logs/$c.log" ] && { cp "$SWEEP_ROOT/logs/$c.log" "$COLLECT/"; n_c=$((n_c+1)); }
