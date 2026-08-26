@@ -231,9 +231,48 @@ def t_provenance():
         check(f"{f} prints its provenance", n == want, f"{n} call(s), want {want}")
 
 
+def t_sweep_status_sees_a_killed_cell():
+    """04's --status must distinguish "killed" from "never started".
+
+    ⛔ A cell killed at the --time wall is SIGKILLed, so the fail-marker writer
+      never runs: done=0 failed=0 -- byte-identical to a sweep that never
+      launched. On a first sweep against an unmeasured wall-clock that is the most
+      likely outcome. Both directions are exercised: the section must appear when
+      a start marker has no outcome, and must NOT appear once it does."""
+    tmp = tempfile.mkdtemp()
+    try:
+        root = os.path.join(tmp, "runs", "hpsweep")
+        for d in ("csv", "logs", "done", "fail", "started"):
+            os.makedirs(os.path.join(root, d))
+        r0 = sh(f'bash sbatch/fir/04_hp_sweep.sh --status',
+                env={"FIR_SCRATCH_ROOT": tmp, "FIR_LOGGING": "1"})
+        cid = open(os.path.join(root, "cells.txt")).read().split("\n")[0]
+        check("--status runs on an empty sweep root", "cells: 160" in r0.stdout,
+              r0.stdout + r0.stderr)
+        check("CONTROL: nothing is reported as killed before anything starts",
+              "STARTED AND NEVER FINISHED" not in r0.stdout, r0.stdout)
+
+        open(os.path.join(root, "started", cid), "w").write("job=1 node=x start=y")
+        r1 = sh('bash sbatch/fir/04_hp_sweep.sh --status',
+                env={"FIR_SCRATCH_ROOT": tmp, "FIR_LOGGING": "1"})
+        check("a started-but-unfinished cell is reported as KILLED",
+              "STARTED AND NEVER FINISHED" in r1.stdout and cid in r1.stdout, r1.stdout)
+
+        open(os.path.join(root, "done", cid), "w").write("123")
+        r2 = sh('bash sbatch/fir/04_hp_sweep.sh --status',
+                env={"FIR_SCRATCH_ROOT": tmp, "FIR_LOGGING": "1"})
+        check("...and STOPS being reported once it finishes",
+              "STARTED AND NEVER FINISHED" not in r2.stdout, r2.stdout)
+        check("the measured per-cell seconds are reported", "median=123" in r2.stdout, r2.stdout)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        shutil.rmtree(os.path.join(ROOT, "logs", "hpsweep"), ignore_errors=True)
+
+
 def main():
     for t in (t_syntax, t_nousersite_exported, t_assert_in_venv, t_stage_callsites,
-              t_no_bare_python, t_env_gate_location_check, t_provenance):
+              t_no_bare_python, t_env_gate_location_check, t_provenance,
+              t_sweep_status_sees_a_killed_cell):
         t()
     print(f"selftest: {_P[0]} passed, {_P[1]} failed")
     return 1 if _P[1] else 0
