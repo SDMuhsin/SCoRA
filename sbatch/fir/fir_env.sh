@@ -200,6 +200,25 @@ fir_log_to() {
     exit $rc
 }
 
+# --- WHICH COMMIT IS THIS? -----------------------------------------------------
+# ⛔⛔ 2026-08-26: a fix was committed here, pushed to the WRONG remote branch
+#   (`git push scora HEAD` writes refs/heads/scora; the fir checkout follows
+#   `main`), and the next fir log came back showing the OLD behaviour. Diagnosing
+#   that cost a full round trip, and every byte needed to spot it in one second
+#   was missing from the log: it never said which commit produced it.
+#   ⇒ every stage prints its provenance FIRST. A log that cannot identify the code
+#     that wrote it cannot be used as evidence about that code.
+fir_print_provenance() {
+    local sha branch dirty
+    sha="$(git rev-parse --short HEAD 2>/dev/null || echo '<not a git checkout>')"
+    branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+    dirty="$(git status --porcelain 2>/dev/null | wc -l)"
+    echo "commit: $sha on $branch  (uncommitted files: $dirty)"
+    echo "        ⚠ compare against the sha that was pushed. If it is older, the pull"
+    echo "          did not land -- check WHICH REF you are on, that is how it went"
+    echo "          wrong before:  git fetch --all && git log --oneline -3 @{u}"
+}
+
 # --- CACHES A LIBRARY WILL OTHERWISE PUT ON $HOME ----------------------------
 # /home is 48 GiB and quota-bound, and it is a network filesystem. triton's JIT
 # cache defaulting to $HOME/.triton produced `OSError: [Errno 5] Input/output

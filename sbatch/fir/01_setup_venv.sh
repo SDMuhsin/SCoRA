@@ -53,6 +53,7 @@ done
 
 echo "############ fir venv setup — $(date -u +%FT%TZ) ############"
 echo "repo (on /project): $(pwd)"
+fir_print_provenance
 
 # --- 0. modules FIRST, in the load-bearing order (cudnn is only visible after cuda)
 fir_load_modules_gpu || { echo "FAIL: module load '$FIR_MODULES_GPU'"; exit 1; }

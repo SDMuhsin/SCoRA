@@ -208,9 +208,29 @@ def t_env_gate_location_check():
           "cannot resolve the venv root" in r3.stdout, r3.stdout[-400:])
 
 
+def t_provenance():
+    """Every stage must print the commit it is running from.
+
+    ⛔ 2026-08-26: a fix was pushed to the wrong remote ref, fir pulled and ran the
+      OLD code, and the returned log was indistinguishable from one produced by the
+      new code -- it never said which commit wrote it. A log that cannot identify
+      its own code cannot be evidence about that code."""
+    r = sh(f'source "{ENV_SH}"; fir_print_provenance')
+    check("fir_print_provenance prints a commit", re.search(r"commit: [0-9a-f]{7,}", r.stdout),
+          r.stdout + r.stderr)
+    check("...and how many files are uncommitted", "uncommitted files:" in r.stdout, r.stdout)
+    for f in ("01_setup_venv.sh", "01c_stage_repos.sh", "02_download_cache.sh", "03_preflight.sh"):
+        src = open(os.path.join(FIR, f)).read()
+        n = len([l for l in src.splitlines()
+                 if l.strip().startswith("fir_print_provenance")])
+        # 03 prints it twice on purpose: once on the login node, once in the job body.
+        want = 2 if f == "03_preflight.sh" else 1
+        check(f"{f} prints its provenance", n == want, f"{n} call(s), want {want}")
+
+
 def main():
     for t in (t_syntax, t_nousersite_exported, t_assert_in_venv, t_stage_callsites,
-              t_no_bare_python, t_env_gate_location_check):
+              t_no_bare_python, t_env_gate_location_check, t_provenance):
         t()
     print(f"selftest: {_P[0]} passed, {_P[1]} failed")
     return 1 if _P[1] else 0

@@ -52,6 +52,7 @@ for a in "$@"; do
 done
 
 echo "############ staging author clones — $(date -u +%FT%TZ) ############"
+fir_print_provenance
 fir_load_modules_cpu || exit 1
 fir_link_scratch     || exit 1
 

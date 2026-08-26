@@ -54,6 +54,7 @@ done
 
 # ---- fail on the LOGIN node before asking for a GPU -------------------------
 if ! $LOCAL && [ -z "${SLURM_JOB_ID:-}" ]; then
+    fir_print_provenance
     echo "--- login-node gate (fail here, not 40 minutes into an allocation) ---"
     fir_assert_env cpu 02 || { echo "environment not sane — refusing to submit"; exit 1; }
     env/bin/python scripts/fir_arms.py --selftest   >/dev/null || { echo "FAIL: fir_arms selftest"; exit 1; }
@@ -97,6 +98,7 @@ echo "############ PREFLIGHT — $(date -u +%FT%TZ) ############"
 #   attributed, and one bad node ate 17 cells on the sibling project before the
 #   pattern became visible.
 echo "node=$(hostname)  JOB=${SLURM_JOB_ID:-none}  NODELIST=${SLURM_JOB_NODELIST:-none}"
+fir_print_provenance
 fir_load_modules_gpu || exit 1
 # shellcheck disable=SC1091
 source "$FIR_VENV/bin/activate" || exit 1
