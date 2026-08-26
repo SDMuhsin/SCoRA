@@ -111,6 +111,39 @@ for spec in "${REPOS[@]}"; do
             echo "  ⛔ FAIL: cannot check out $commit — REFUSING a branch-tip fallback"
             rc=1; continue; }
     fi
+    # ⛔⛔ APPLY THE REPAIR PATCH. THIS IS NOT OPTIONAL POLISH.
+    #    Both upstream repos are BROKEN AS PUBLISHED at their pinned commits:
+    #      LoCA peft/src/peft/tuners/loca/config.py:86 has an UNTERMINATED STRING
+    #        LITERAL -- the module cannot be imported by any Python at all.
+    #      qwha peft/src/peft/tuners/{qwha,fourierft}/hadamard.py import
+    #        `fast_hadamard_transform` UNGUARDED, and take that path whenever the
+    #        tensor is on CUDA. Without the compiled extension the authors' layer
+    #        raises ModuleNotFoundError -- ON A GPU ONLY, which is why a CPU run
+    #        never sees it.
+    #    The dev box had both repaired BY HAND, and temp/ is gitignored, so the
+    #    repairs never travelled: fir cloned pristine and both bit-identity
+    #    verifiers failed [observed 2026-08-25]. Worse, it means every
+    #    "bit-identical" claim in this repo had been measured against locally
+    #    patched author code with no record of the patch.
+    #    ⇒ the patches are now TRACKED here, applied on every checkout, and a
+    #      patch that will not apply is a HARD FAILURE -- silently running against
+    #      unpatched (i.e. unimportable) upstream code is the worse outcome.
+    patch="$(pwd)/sbatch/fir/patches/${name}.patch"
+    if [ -f "$patch" ]; then
+        if git -C "$dir" apply --check "$patch" 2>/dev/null; then
+            git -C "$dir" apply "$patch" && echo "  repair patch APPLIED: sbatch/fir/patches/${name}.patch"
+        elif git -C "$dir" apply --reverse --check "$patch" 2>/dev/null; then
+            echo "  repair patch already applied (idempotent re-run)"
+        else
+            echo "  ⛔ FAIL: ${name}.patch neither applies nor is already applied."
+            echo "     The upstream tree at ${commit:0:12} is not what the patch was made"
+            echo "     against. REFUSING to continue: unpatched upstream does not import."
+            rc=1; continue
+        fi
+    else
+        echo "  ⚠ no repair patch for $name (none needed, or it is MISSING)"
+    fi
+
     if [ -e "$dir/$probe" ]; then
         echo "  probe OK: $probe"
     else
@@ -125,6 +158,23 @@ for spec in "${REPOS[@]}"; do
 done
 
 [ $rc -eq 0 ] || { echo; echo "############ STAGING FAILED ############"; exit 1; }
+
+# ⭐ THE RECEIPT: does the authors' code actually IMPORT after patching?
+#   `git apply` succeeding proves the text changed, not that the module loads.
+#   This is the check that would have caught the LoCA syntax error directly.
+echo
+echo "--- do the authors' modules IMPORT? (the receipt, not the flag) ---"
+for spec in "LoCA|peft/src|peft.tuners.loca.layer" "qwha|peft/src|peft.tuners.qwha.hadamard"; do
+    IFS='|' read -r name sub mod <<< "$spec"
+    if ( cd "$(pwd)" && PYTHONPATH="$(pwd)/temp/$name/$sub:${PYTHONPATH:-}" \
+         "$FIR_VENV/bin/python" -c "import importlib,sys; importlib.import_module('$mod'); print('    $mod: OK')" 2>&1 | tail -5 ); then
+        :
+    else
+        echo "    ⛔ $mod FAILED to import even after patching"
+        rc=1
+    fi
+done
+[ $rc -eq 0 ] || { echo; echo "############ STAGING FAILED (authors' code does not import) ############"; exit 1; }
 
 echo
 echo "--- gate at stage 01c (temp/ now ENFORCED; the stage-02 cache check is not) ---"

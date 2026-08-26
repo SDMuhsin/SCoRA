@@ -102,14 +102,24 @@ else
     echo "  $HOME/.local/lib does not exist -- user-site shadowing is NOT the story"
 fi
 
-# 1. exactly as 03_preflight sets things up
-( fir_export_offline; report "AS 03_PREFLIGHT RUNS IT (fir_export_offline)" )
+# ⛔⛔ THIS A/B WAS BROKEN AND COULD NOT FAIL [fixed 2026-08-26].
+#    The first version ran block 1 as `fir_export_offline` and block 2 as
+#    `fir_export_offline; export PYTHONNOUSERSITE=1`. But PYTHONNOUSERSITE=1 was
+#    ADDED TO fir_export_offline itself in the same change -- so BOTH blocks had
+#    it set, the two blocks were identical by construction, and the comparison
+#    measured nothing while looking like a controlled experiment.
+#    A control that cannot fail is not a control. Block 1 now explicitly UNSETS
+#    it, so the two sides genuinely differ.
+( fir_export_offline; unset PYTHONNOUSERSITE
+  report "USER-SITE ALLOWED (PYTHONNOUSERSITE unset) — the pre-fix behaviour" )
 
-# 2. with user-site explicitly disabled, to see whether that is the difference
 ( fir_export_offline; export PYTHONNOUSERSITE=1
-  report "WITH PYTHONNOUSERSITE=1 (does this change what resolves?)" )
+  report "USER-SITE DISABLED (PYTHONNOUSERSITE=1) — what fir_export_offline now does" )
 
 echo
 echo "############ RUNTIME PROBE COMPLETE — send the whole transcript ############"
 echo "⛔ This script diagnoses nothing by itself. Compare the two blocks above:"
-echo "   if they differ, user-site packages were shadowing the venv."
+echo "   if they differ, user-site packages WERE shadowing the venv and"
+echo "   PYTHONNOUSERSITE=1 is what fixes it. If they are IDENTICAL, ~/.local was"
+echo "   never on the venv's sys.path and the ~/.local frames seen in a traceback"
+echo "   came from somewhere else -- keep looking, do not declare it solved."

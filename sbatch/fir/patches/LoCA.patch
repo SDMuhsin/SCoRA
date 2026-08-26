@@ -1,0 +1,14 @@
+diff --git a/peft/src/peft/tuners/loca/config.py b/peft/src/peft/tuners/loca/config.py
+index df4b358..fc8904a 100644
+--- a/peft/src/peft/tuners/loca/config.py
++++ b/peft/src/peft/tuners/loca/config.py
+@@ -83,7 +83,8 @@ class LoCAConfig(PeftConfig):
+         default=True,
+         metadata={
+             "help": (
+-                "How to initialize the weights of the loca layers. Passing True (default)
++                "How to initialize the weights of the loca layers. Passing True (default) "
++                "results in the authors' zero initialisation of the coefficients."
+             ),
+         },
+     )

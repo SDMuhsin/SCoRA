@@ -335,6 +335,11 @@ _lbl = _t.__version__.split("+", 1)
 _where = _t.__file__ or "?"
 print(f"  torch build label   : {'+' + _lbl[1] if len(_lbl) > 1 else '<NONE>'}")
 print(f"  torch loaded from   : {_where}")
+# ⛔ RETRACTED 2026-08-26: an earlier note here reasoned "no build label => not the
+#    computecanada wheel". WRONG, and measured on fir: torch imported FROM THE VENV
+#    reports `2.10.0` with build_label=<NONE>. The Alliance wheel does not carry a
+#    local version label at runtime, so the label proves nothing either way.
+#    The PATH is the evidence, not the version string.
 if ".local" in _where:
     print("  ⛔⛔ torch is loading from USER SITE (~/.local), NOT the venv.")
     print("      The pinned stack is NOT what will run. Set PYTHONNOUSERSITE=1 or")
