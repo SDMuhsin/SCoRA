@@ -245,7 +245,8 @@ def t_sweep_status_sees_a_killed_cell():
         for d in ("csv", "logs", "done", "fail", "started"):
             os.makedirs(os.path.join(root, d))
         r0 = sh(f'bash sbatch/fir/04_hp_sweep.sh --status',
-                env={"FIR_SCRATCH_ROOT": tmp, "FIR_LOGGING": "1"})
+                env={"FIR_SCRATCH_ROOT": tmp, "FIR_LOGGING": "1",
+                     "FIR_COLLECT_DIR": os.path.join(tmp, "collected")})
         cid = open(os.path.join(root, "cells.txt")).read().split("\n")[0]
         check("--status runs on an empty sweep root", "cells: 160" in r0.stdout,
               r0.stdout + r0.stderr)
@@ -254,19 +255,27 @@ def t_sweep_status_sees_a_killed_cell():
 
         open(os.path.join(root, "started", cid), "w").write("job=1 node=x start=y")
         r1 = sh('bash sbatch/fir/04_hp_sweep.sh --status',
-                env={"FIR_SCRATCH_ROOT": tmp, "FIR_LOGGING": "1"})
+                env={"FIR_SCRATCH_ROOT": tmp, "FIR_LOGGING": "1",
+                     "FIR_COLLECT_DIR": os.path.join(tmp, "collected")})
         check("a started-but-unfinished cell is reported as KILLED",
               "STARTED AND NEVER FINISHED" in r1.stdout and cid in r1.stdout, r1.stdout)
 
         open(os.path.join(root, "done", cid), "w").write("123")
         r2 = sh('bash sbatch/fir/04_hp_sweep.sh --status',
-                env={"FIR_SCRATCH_ROOT": tmp, "FIR_LOGGING": "1"})
+                env={"FIR_SCRATCH_ROOT": tmp, "FIR_LOGGING": "1",
+                     "FIR_COLLECT_DIR": os.path.join(tmp, "collected")})
         check("...and STOPS being reported once it finishes",
               "STARTED AND NEVER FINISHED" not in r2.stdout, r2.stdout)
         check("the measured per-cell seconds are reported", "median=123" in r2.stdout, r2.stdout)
+        # ⛔ the collection went to the FIXTURE, not to ./logs/hpsweep -- assert it,
+        #   because the first version of this test deleted a user's scp'd canary logs
+        #   from the real directory as "cleanup".
+        check("--status collects into the fixture, never into ./logs/hpsweep",
+              os.path.isdir(os.path.join(tmp, "collected"))
+              and not os.path.exists(os.path.join(ROOT, "logs", "hpsweep")),
+              "the real collection directory was touched by a test")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-        shutil.rmtree(os.path.join(ROOT, "logs", "hpsweep"), ignore_errors=True)
 
 
 def main():
