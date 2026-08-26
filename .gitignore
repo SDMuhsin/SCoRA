@@ -12,3 +12,4 @@ temp/
 .hf_token
 *.token
 hf_token*
+*.log
