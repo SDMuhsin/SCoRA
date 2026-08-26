@@ -71,7 +71,28 @@ fir_link_scratch || exit 1
 # Observed on fir 2026-08-11. Validate by RUNNING the interpreter, not by stat.
 venv_is_healthy() {
     [ -x "$FIR_VENV/bin/python" ] && [ -f "$FIR_VENV/bin/activate" ] \
-        && "$FIR_VENV/bin/python" -c "import sys, ensurepip" >/dev/null 2>&1
+        && "$FIR_VENV/bin/python" -c "import sys, ensurepip" >/dev/null 2>&1 \
+        && venv_not_relocated
+}
+
+# ⛔⛔ A MOVED VENV IS A BROKEN VENV, AND EVERY EXPLICIT-PATH CHECK MISSES IT.
+#    bin/activate hardcodes VIRTUAL_ENV as an absolute path fixed at creation.
+#    Move the directory and activate still "succeeds" -- it just prepends a
+#    NONEXISTENT dir to PATH, so bare `python` becomes the module python with no
+#    torch and no peft. Observed on fir 2026-08-26 after the venv was moved from
+#    .../lora_research_signal to .../SCoRA (a migration this project suggested).
+#    01 reported SETUP OK because venv_is_healthy tested only the explicit
+#    "$FIR_VENV/bin/python" path -- exactly the check that cannot see it.
+#    ⇒ treat relocation as UNHEALTHY so a plain re-run repairs it.
+venv_not_relocated() {
+    local act="$FIR_VENV/bin/activate" stamp real
+    [ -f "$act" ] || return 1
+    real="$(readlink -f "$FIR_VENV" 2>/dev/null)"
+    stamp="$(sed -n 's/^VIRTUAL_ENV=["'"'"']\{0,1\}\([^"'"'"']*\)["'"'"']\{0,1\}$/\1/p' "$act" | head -1)"
+    [ -n "$stamp" ] || return 0
+    [ "$(readlink -f "$stamp" 2>/dev/null)" = "$real" ] && return 0
+    echo "    venv was MOVED: activate says $stamp, actually at $real -> rebuilding"
+    return 1
 }
 
 if $FRESH && [ -d "$FIR_VENV_REAL" ]; then

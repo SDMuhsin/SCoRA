@@ -323,7 +323,7 @@ pins = {"torch": ("$FIR_PIN_TORCH", torch.__version__),
         "peft": ("$FIR_PIN_PEFT", peft.__version__)}
 drift = {k: v for k, v in pins.items() if v[0] and not v[1].startswith(v[0])}
 # ⚠⚠ A VERSION CHECK CANNOT SEE A DIFFERENT BUILD, AND THAT IS WHAT MATTERS.
-#    `2.10.0`, `2.10.0+cu128` and `2.10.0+computecanada` all pass
+#    2.10.0, 2.10.0+cu128 and 2.10.0+computecanada all pass
 #    startswith("2.10.0") -- yet they are different wheels, and peak memory is
 #    allocator- and kernel-sensitive. On fir 2026-08-25 the gate printed
 #    "torch build: 2.10.0" (no label) and PASSED while every traceback in the
@@ -337,7 +337,7 @@ print(f"  torch build label   : {'+' + _lbl[1] if len(_lbl) > 1 else '<NONE>'}")
 print(f"  torch loaded from   : {_where}")
 # ⛔ RETRACTED 2026-08-26: an earlier note here reasoned "no build label => not the
 #    computecanada wheel". WRONG, and measured on fir: torch imported FROM THE VENV
-#    reports `2.10.0` with build_label=<NONE>. The Alliance wheel does not carry a
+#    reports '2.10.0' with build_label=<NONE>. The Alliance wheel does not carry a
 #    local version label at runtime, so the label proves nothing either way.
 #    The PATH is the evidence, not the version string.
 if ".local" in _where:
@@ -350,6 +350,33 @@ for k, (w, g) in drift.items():
 if drift: sys.exit(1)
 print(f"  pinned stack OK  (torch build: {torch.__version__})")
 PY
+
+    # (a2) ⚠⚠ IS THE VENV ACTUALLY ON $PATH? A venv is NOT RELOCATABLE: bin/activate
+    #      hardcodes VIRTUAL_ENV as an ABSOLUTE path fixed at creation time. Moving
+    #      the venv directory leaves activate pointing at the OLD path, which it
+    #      prepends to PATH -- so bare `python` silently falls through to the module
+    #      python with no torch and no peft.
+    #      ⛔ THIS EXACT THING HAPPENED ON FIR 2026-08-26, after the venv was moved
+    #        from .../lora_research_signal to .../SCoRA. Every check here passed,
+    #        because they all call "$FIR_VENV/bin/python" EXPLICITLY through the
+    #        symlink -- and every stage that used bare `python` then died on
+    #        ModuleNotFoundError. A gate that only tests the explicit path cannot
+    #        see the PATH the job actually uses.
+    local _act="$FIR_VENV/bin/activate" _venv_real
+    _venv_real="$(readlink -f "$FIR_VENV" 2>/dev/null)"
+    if [ -f "$_act" ]; then
+        local _stamp
+        _stamp="$(sed -n 's/^VIRTUAL_ENV=["'"'"']\{0,1\}\([^"'"'"']*\)["'"'"']\{0,1\}$/\1/p' "$_act" | head -1)"
+        if [ -n "$_stamp" ] && [ "$(readlink -f "$_stamp" 2>/dev/null)" != "$_venv_real" ]; then
+            echo "  ⛔ RELOCATED VENV: bin/activate says VIRTUAL_ENV=$_stamp"
+            echo "     but the venv really lives at $_venv_real"
+            echo "     activate will put a NONEXISTENT dir on PATH and bare 'python'"
+            echo "     will NOT be this venv. Rebuild: bash sbatch/fir/01_setup_venv.sh --fresh"
+            rc=1
+        else
+            echo "  venv is not relocated (activate stamp matches)"
+        fi
+    fi
 
     # (b) ⚠⚠ IMPORT WHAT THE JOB IMPORTS. This is the check that ends the
     #     missing-module round trips, and it REPLACES curating a package list.
