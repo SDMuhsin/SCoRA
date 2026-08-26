@@ -1,0 +1,64 @@
+diff --git a/peft/src/peft/tuners/fourierft/hadamard.py b/peft/src/peft/tuners/fourierft/hadamard.py
+index 002b8cc..4afad43 100644
+--- a/peft/src/peft/tuners/fourierft/hadamard.py
++++ b/peft/src/peft/tuners/fourierft/hadamard.py
+@@ -1,11 +1,16 @@
+ # Adapted from https://github.com/spcl/QuaRot/blob/main/quarot/functional/hadamard.py
+ import torch, math
+-import fast_hadamard_transform
++try:
++    import fast_hadamard_transform
++    _HAS_FHT = True
++except ImportError:
++    fast_hadamard_transform = None
++    _HAS_FHT = False
+ 
+ def wht(X):
+     n = X.shape[-1]
+     hadK, K = get_hadK(n)
+-    if X.is_cuda:
++    if X.is_cuda and _HAS_FHT:
+         return matmul_hadU_cuda(X, hadK, K) * math.sqrt(n)
+     else:
+         return matmul_hadU(X) * math.sqrt(n)
+@@ -14,7 +19,7 @@ def wht(X):
+ def iwht(X):
+     n = X.shape[-1]
+     hadK, K = get_hadK(n)
+-    if X.is_cuda:
++    if X.is_cuda and _HAS_FHT:
+         return matmul_hadUt_cuda(X, hadK, K) / math.sqrt(n)
+     else:
+         return matmul_hadUt(X) / math.sqrt(n)
+diff --git a/peft/src/peft/tuners/qwha/hadamard.py b/peft/src/peft/tuners/qwha/hadamard.py
+index 002b8cc..fd98dd9 100644
+--- a/peft/src/peft/tuners/qwha/hadamard.py
++++ b/peft/src/peft/tuners/qwha/hadamard.py
+@@ -1,11 +1,16 @@
+ # Adapted from https://github.com/spcl/QuaRot/blob/main/quarot/functional/hadamard.py
+ import torch, math
+-import fast_hadamard_transform
++try:                                    # made optional so the layer imports without
++    import fast_hadamard_transform      # the compiled CUDA extension (./temp repair)
++    _HAS_FHT = True
++except ImportError:
++    fast_hadamard_transform = None
++    _HAS_FHT = False
+ 
+ def wht(X):
+     n = X.shape[-1]
+     hadK, K = get_hadK(n)
+-    if X.is_cuda:
++    if X.is_cuda and _HAS_FHT:
+         return matmul_hadU_cuda(X, hadK, K) * math.sqrt(n)
+     else:
+         return matmul_hadU(X) * math.sqrt(n)
+@@ -14,7 +19,7 @@ def wht(X):
+ def iwht(X):
+     n = X.shape[-1]
+     hadK, K = get_hadK(n)
+-    if X.is_cuda:
++    if X.is_cuda and _HAS_FHT:
+         return matmul_hadUt_cuda(X, hadK, K) / math.sqrt(n)
+     else:
+         return matmul_hadUt(X) / math.sqrt(n)
