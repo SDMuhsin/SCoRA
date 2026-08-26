@@ -47,6 +47,7 @@ done
 echo "############ offline cache — $(date -u +%FT%TZ) ############"
 echo "tasks : $P_TASKS"
 echo "model : $FIR_MODEL"
+fir_print_provenance
 fir_load_modules_cpu || exit 1
 fir_link_scratch     || exit 1
 [ -x "$FIR_VENV/bin/python" ] || { echo "FAIL: no venv — run 01_setup_venv.sh"; exit 1; }
