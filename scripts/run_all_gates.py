@@ -41,6 +41,7 @@ GATES = [
     ("scripts/fir_plan.py",            "[fir] cell planner: target rewrite, derived lr/warmup, one CSV per cell"),
     ("scripts/fir_preflight_arms.py",  "[fir] receipts: every arm attached, budgets agree ACROSS arms"),
     ("src/verify_head_trainable.py",   "[fir] the classification head is TRAINABLE on a DECODER, all 9 wrappers"),
+    ("scripts/fir_shell_gates.py",     "[fir] the SHELL layer: venv-location controls, no bare python, both directions"),
     ("scripts/r237_confirm_gen.py",   "5-seed confirmation block generator"),
     ("scripts/r236_gate_columns.py",  "results-row columns"),
     ("scripts/r239_gate_subsample.py", "--max_train_samples on GLUE"),

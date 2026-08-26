@@ -23,6 +23,34 @@
 #       scripts/r304_upsert_gate.py. Do not point two cells at one CSV.
 # =============================================================================
 
+# --- ⛔⛔ USER-SITE SHADOWING — EXPORTED AT SOURCE TIME, LOGIN NODE INCLUDED ----
+# `~/.local/lib/python3.11/site-packages` on this account holds a FULL torch /
+# transformers / peft / datasets / accelerate / huggingface_hub stack [MEASURED,
+# 00d_probe_runtime, 2026-08-26]. The venv is built --system-site-packages
+# (numpy comes from the scipy-stack module), so ~/.local is on sys.path unless
+# this is set.
+#
+# ⛔⛔ IT IS NOT ONLY AN IMPORT HAZARD. IT IS AN *INSTALL* HAZARD, AND THAT IS THE
+#    ONE THAT ACTUALLY FIRED, ON FIR 2026-08-26:
+#      01_setup_venv.sh rebuilt the venv with this variable UNSET. pip then saw
+#      ~/.local's torch 2.10.0 / transformers 4.51.3 / datasets 4.5.0 /
+#      peft 0.18.1 — THE SAME VERSIONS WE PIN — said "Requirement already
+#      satisfied", and installed NOTHING INTO THE NEW VENV. Every post-install
+#      check then imported ~/.local, printed exactly the pinned version, and
+#      PASSED. The empty venv only surfaced on the next compute-node job, where
+#      fir_export_offline sets this and `import transformers` died.
+#    ⇒ setting it only on the compute node made the login node and the compute
+#      node resolve packages DIFFERENTLY — FIR_SETUP Law 1 verbatim. It belongs
+#      here, at source time, so every stage, check and job sees one sys.path.
+#
+# ⚠ It is a no-op when ~/.local is empty, and it does NOT hide the module stack:
+#   --system-site-packages and PYTHONPATH (numpy, scipy) are unaffected. Only
+#   ~/.local is removed.
+# ⚠ If a LOGIN-NODE TOOL ever lived in ~/.local this would break it. Measured:
+#   pip and virtualenv both come from CVMFS, not ~/.local; and 01's creation
+#   cascade falls back to stdlib `python -m venv` if virtualenv fails at all.
+export PYTHONNOUSERSITE=1
+
 # --- MODULES -----------------------------------------------------------------
 # ⚠ ORDER IS LOAD-BEARING. `module avail cudnn` returns "No module(s) found" on
 #   its own: cudnn is CUDA-dependent in the Lmod hierarchy and only becomes
@@ -248,6 +276,11 @@ fir_export_offline() {
     #    is a no-op when ~/.local is empty.
     #    ⛔ Diagnose with sbatch/fir/00d_probe_runtime.sh before assuming this is
     #      THE cause -- it prints where every package actually resolves from.
+    #    ⚠ KEPT DELIBERATELY, THOUGH fir_env.sh NOW EXPORTS IT AT SOURCE TIME (see
+    #      the top of this file). Having it ONLY here is what let stage 01 install
+    #      into nothing; having it in BOTH places costs nothing and survives
+    #      someone calling fir_export_offline from a shell that never sourced the
+    #      header.
     export PYTHONNOUSERSITE=1
     export PYTHONPATH="${PYTHONPATH:-}:$(pwd)/src"
     mkdir -p "$HF_HOME"
@@ -303,6 +336,16 @@ fir_assert_env() {
     # (a) FLOOR CHECK ONLY. The real check is (b). ⛔ DO NOT GROW THIS LIST — a
     #     hand-curated set of "core" packages cannot track train_glue.py's
     #     module-scope imports, and curating it IS the bug (FIR_SETUP C11).
+    # ⚠ THE OVERRIDE EXISTS SO THE CONTROL BELOW CAN BE MADE TO FIRE, and for no
+    #   other reason: scripts/fir_shell_gates.py points it at a nonexistent root
+    #   to prove the check is not vacuous. Unset (always, on fir) it is the venv.
+    local _vreal; _vreal="$(readlink -f "${FIR_ASSERT_VENV_ROOT_OVERRIDE:-$FIR_VENV}" 2>/dev/null)"
+    # ⛔ FAIL CLOSED. `readlink -f` prints NOTHING when a parent component does not
+    #   exist, and an empty root made os.path.realpath("") resolve to the CWD --
+    #   under which every package trivially "resolved inside" and the whole check
+    #   silently passed. Caught by its own negative control in fir_shell_gates.py,
+    #   which is exactly the job of a negative control.
+    [ -n "$_vreal" ] || { echo "FAIL: cannot resolve the venv root ($FIR_VENV)"; return 1; }
     "$FIR_VENV/bin/python" - <<PY || rc=1
 import importlib, sys
 bad = []
@@ -332,19 +375,43 @@ drift = {k: v for k, v in pins.items() if v[0] and not v[1].startswith(v[0])}
 #    ⇒ report the build label AND where torch actually loaded from.
 import torch as _t
 _lbl = _t.__version__.split("+", 1)
-_where = _t.__file__ or "?"
 print(f"  torch build label   : {'+' + _lbl[1] if len(_lbl) > 1 else '<NONE>'}")
-print(f"  torch loaded from   : {_where}")
 # ⛔ RETRACTED 2026-08-26: an earlier note here reasoned "no build label => not the
 #    computecanada wheel". WRONG, and measured on fir: torch imported FROM THE VENV
 #    reports '2.10.0' with build_label=<NONE>. The Alliance wheel does not carry a
 #    local version label at runtime, so the label proves nothing either way.
 #    The PATH is the evidence, not the version string.
-if ".local" in _where:
-    print("  ⛔⛔ torch is loading from USER SITE (~/.local), NOT the venv.")
-    print("      The pinned stack is NOT what will run. Set PYTHONNOUSERSITE=1 or")
-    print("      remove the shadowing packages; see sbatch/fir/00d_probe_runtime.sh.")
+#
+# ⛔⛔ A VERSION IS NOT A LOCATION, AND ONLY THE LOCATION IS EVIDENCE.
+#    Fired on fir 2026-08-26: a freshly rebuilt venv contained NONE of the pinned
+#    packages (pip saw the same versions in ~/.local and no-op'd), yet every
+#    version check passed because it imported ~/.local. And checking only torch,
+#    only for the substring ".local", was the same mistake one layer in: it is a
+#    two-name allow-list against one specific shadow. ⇒ assert that EVERY pinned
+#    package resolves INSIDE THIS VENV, and print where it came from when it does
+#    not. Anything outside is a different experiment, whatever its version says.
+#    ⚠ numpy/scipy/pandas are deliberately ABSENT here: they legitimately come
+#      from the scipy-stack MODULE (--system-site-packages), so demanding they be
+#      in the venv would fail a correct environment.
+import importlib, os
+_venv = os.path.realpath("$_vreal")
+_outside = []
+for _m in ["torch", "transformers", "datasets", "peft", "accelerate", "evaluate",
+           "huggingface_hub"]:
+    _f = os.path.realpath(getattr(importlib.import_module(_m), "__file__", "") or "")
+    if not _f.startswith(_venv + os.sep):
+        _outside.append((_m, _f))
+if _outside:
+    print(f"  ⛔⛔ NOT RESOLVING FROM THE VENV ({_venv}):")
+    for _m, _f in _outside:
+        print(f"      {_m:16} -> {_f or '<no __file__>'}")
+    print("      The pinned stack is NOT what will run. Either ~/.local is shadowing")
+    print("      the venv (fir_env.sh exports PYTHONNOUSERSITE=1 -- check it survived),")
+    print("      or the venv is EMPTY because pip reported 'already satisfied' against")
+    print("      ~/.local. Rebuild: bash sbatch/fir/01_setup_venv.sh --fresh")
+    print("      Diagnose: bash sbatch/fir/00d_probe_runtime.sh")
     sys.exit(1)
+print(f"  pinned packages     : all 7 resolve inside {_venv}")
 for k, (w, g) in drift.items():
     print(f"  ⚠⚠ {k}: pinned {w}, installed {g} — this is a DIFFERENT EXPERIMENT.")
 if drift: sys.exit(1)

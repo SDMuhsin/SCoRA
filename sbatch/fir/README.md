@@ -169,3 +169,42 @@ depends on `PATH` at all.
 ```bash
 bash sbatch/fir/01_setup_venv.sh --fresh
 ```
+
+---
+
+## 6. ⛔⛔ `--system-site-packages` + a populated `~/.local` = a venv that installs NOTHING
+
+**Measured on fir 2026-08-26.** `01` rebuilt the venv, and every stage passed:
+
+```
+--- torch==2.10.0 ---            torch 2.10.0
+--- pinned HF stack ---          transformers 4.51.3 | datasets 4.5.0 | peft 0.18.1 | ...
+```
+
+**Not one of those packages was installed.** The venv is created
+`--system-site-packages` (numpy comes from the `scipy-stack` module), this account's
+`~/.local/lib/python3.11/site-packages` already held torch 2.10.0 / transformers 4.51.3 /
+datasets 4.5.0 / peft 0.18.1 — **the same versions we pin** — so `pip` answered *"Requirement
+already satisfied"* and did nothing, and each stage's `import X; print(X.__version__)` check then
+imported `~/.local` and printed exactly the version it wanted to see.
+
+The empty venv surfaced one stage later, on the compute node, where `fir_export_offline` sets
+`PYTHONNOUSERSITE=1`: `ModuleNotFoundError: No module named 'transformers'`.
+
+⇒ **Setting that variable only on the compute node meant the login node and the job resolved
+packages differently — `FIR_SETUP` Law 1 exactly.** Three changes:
+
+1. `fir_env.sh` exports `PYTHONNOUSERSITE=1` **at source time**, so every stage, check and job
+   shares one `sys.path`. (No-op when `~/.local` is empty; it does **not** hide the module stack.)
+2. Every `01` stage now asserts its packages resolve **inside the venv directory** — a version is
+   not a location, and only the location is evidence.
+3. The env gate asserts the same for all seven pinned packages and prints where any stray one came
+   from.
+
+**A version check cannot tell "installed here" from "already present somewhere else."**
+Diagnose with `bash sbatch/fir/00d_probe_runtime.sh`, which prints the resolved path of every
+package with and without user-site.
+
+⭐ All three are exercised locally, in both directions, by
+`env/bin/python scripts/fir_shell_gates.py --selftest` — the shell layer is no longer the one part
+of this tree that can only be tested by a user running it on the cluster.
