@@ -232,8 +232,8 @@ planner refuses an unknown name.
 | grid | arms | shape | cells | state |
 |---|---|---|---|---|
 | `g1` | `fftm`, `fftstock` | 5 `lr` × 4 `scaling` × 4 `classifier_lr` | 160 | ✅ complete, 16.3 GPU-h |
-| **`g2`** *(default)* | `fftm`, `fftstock` | 7 `lr` × 5 `scaling` × 2 `classifier_lr` | 140 | ✅ 137/140 (3 lost to a bad node) |
-| **`w1`** | `wave1`, `wave2` | 6 `P/P_ref` × 4 `scaling` × 2 `classifier_lr` | 96 | ⏳ not yet run |
+| **`g2`** *(default)* | `fftm`, `fftstock` | 7 `lr` × 5 `scaling` × 2 `classifier_lr` | 140 | ✅ **complete**, 140/140 |
+| **`w1`** | `wave1`, `wave2` | 6 `P/P_ref` × 4 `scaling` × 2 `classifier_lr` | 96 | ⏳ canary green, **94 left** |
 
 All of them: **MRPC**, `q_o`, **1 seed (42)**, **5 epochs** (575 steps/cell), one Slurm array, one
 cell per task. Print any of them with `FIR_HP_GRID=<g> env/bin/python scripts/fir_hp_plan.py --show`.
@@ -281,11 +281,14 @@ gemma-2b on an H100 has never been measured — the preflight's 8-step cells are
 The canary runs **one cell per arm** (not the first two lines, which are both the same arm), central
 on every axis, then `--status` prints min/median/max seconds. Size `--time` from the **max**.
 
-⛔⛔ **A measurement from another arm is not a measurement.** `g1`/`g2` measured 335–502 s/cell for
-FourierFT. That does **not** carry to `w1`: `[R.307, measured]` WaveFT's train latency is
-4.11–4.33 ms/module against FourierFT-merged's 0.622 ms (~6.7×), and `[P.5–P.11]` put the adapter at
-10–13% of training wall-clock ⇒ **expect a WaveFT cell near 1.7× a FourierFT one** (~600–900 s), which
-leaves a 30-minute wall with roughly half the headroom it had. Canary first, then size it.
+⛔⛔ **A measurement from another arm is not a measurement — and neither is an extrapolation.**
+`[measured 2026-08-27]` the `w1` canary ran **443 s** (`wave1`) and **447 s** (`wave2`) against
+FourierFT's **364 s** median: **1.22×**, inside `g2`'s own 335–502 s range, so `--time 00:30:00`
+stands with a 4.0× margin. ⛔ That falsifies the prediction this section used to carry — 1.7× /
+600–900 s, from `[R.307]`'s 6.7× per-module latency ratio and `[P.5–P.11]`'s 10–13% adapter share.
+⭐ **A per-module latency ratio measured on one backbone does not give a per-cell wall-clock on
+another**: the adapter share it multiplies is itself backbone-dependent, and gemma-2b's frozen 2.5 B
+parameters dominate the step far more than roberta-base's 125 M do. **Canary first, every time.**
 
 ⭐ **`--dry-run`** prints the grid, runs the instrument selftests and computes the exact array spec
 **without submitting anything**. It is what lets `scripts/fir_shell_gates.py` exercise the canary
