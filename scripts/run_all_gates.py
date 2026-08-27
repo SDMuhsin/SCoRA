@@ -42,7 +42,7 @@ GATES = [
     ("scripts/fir_preflight_arms.py",  "[fir] receipts: every arm attached, budgets agree ACROSS arms"),
     ("src/verify_head_trainable.py",   "[fir] the classification head is TRAINABLE on a DECODER, all 9 wrappers"),
     ("scripts/fir_shell_gates.py",     "[fir] the SHELL layer: venv-location controls, no bare python, both directions"),
-    ("scripts/fir_hp_plan.py",         "[fir] the MRPC hp grid: 160 cells, both FourierFT arms, one stage"),
+    ("scripts/fir_hp_plan.py",         "[fir] the MRPC hp grids g1/g2 (lr) + w1 (WaveFT, P coordinate), all checked"),
     ("scripts/fir_hp_run_cell.py",     "[fir] one sweep cell + its OWN attachment receipt (a lone cell has no cross-arm check)"),
     ("scripts/fir_hp_read.py",         "[fir] the grid reader: F1 not accuracy, coverage before ranking, edge report"),
     ("scripts/r237_confirm_gen.py",   "5-seed confirmation block generator"),

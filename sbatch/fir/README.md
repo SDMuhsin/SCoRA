@@ -214,15 +214,62 @@ of this tree that can only be tested by a user running it on the cluster.
 ## 7. Stage 04 — the MRPC hyperparameter sweep
 
 ```bash
+export FIR_HP_GRID=w1                         # ⭐ WHICH GRID. default g2. see 7.1
+bash sbatch/fir/04_hp_sweep.sh --dry-run      # what would be submitted, submits nothing
 bash sbatch/fir/04_hp_sweep.sh --canary 2     # ⭐ ALWAYS FIRST — measures a cell
 bash sbatch/fir/04_hp_sweep.sh --status       # coverage + MEASURED seconds/cell
 bash sbatch/fir/04_hp_sweep.sh --time HH:MM:SS [--concurrent N]   # the rest
 env/bin/python scripts/fir_hp_read.py --run-root "$FIR_RUN_ROOT/hpsweep"
 ```
 
-**160 cells** = 2 arms (`fftm`, `fftstock`) × 5 `learning_rate` × 4 `scaling` × 4 `classifier_lr`,
-on **MRPC**, `q_o`, **1 seed (42)**, **5 epochs** (575 steps/cell). One Slurm array, one cell per
-task. Grid: `scripts/fir_hp_plan.py --show`.
+### 7.1 Which grid
+
+⭐ **One sweep root holds every grid**, deliberately: a cell id is a pure function of its knobs, so a
+cell shared by two grids reuses its CSV and its `done` marker and costs nothing on a re-run. Select
+with **`FIR_HP_GRID`**; the submitter pins it into the array job, `--status` prints it, and the
+planner refuses an unknown name.
+
+| grid | arms | shape | cells | state |
+|---|---|---|---|---|
+| `g1` | `fftm`, `fftstock` | 5 `lr` × 4 `scaling` × 4 `classifier_lr` | 160 | ✅ complete, 16.3 GPU-h |
+| **`g2`** *(default)* | `fftm`, `fftstock` | 7 `lr` × 5 `scaling` × 2 `classifier_lr` | 140 | ✅ 137/140 (3 lost to a bad node) |
+| **`w1`** | `wave1`, `wave2` | 6 `P/P_ref` × 4 `scaling` × 2 `classifier_lr` | 96 | ⏳ not yet run |
+
+All of them: **MRPC**, `q_o`, **1 seed (42)**, **5 epochs** (575 steps/cell), one Slurm array, one
+cell per task. Print any of them with `FIR_HP_GRID=<g> env/bin/python scripts/fir_hp_plan.py --show`.
+
+### 7.2 ⭐ `w1` sweeps a DIFFERENT COORDINATE — read this before reading its table
+
+`g1`/`g2` sweep the raw `learning_rate`. **`w1` sweeps `P = lr · atom`, the effective step on ΔW, and
+DERIVES `lr = P / atom(scaling)`.** That is the coordinate every prior WaveFT search in this repo was
+built in, and the only one whose numbers survive a change of model width
+(`llmdocs/baseline_hp_search_results.md` §0(1)). `atom(s) = s/√(2mn)` for FourierFT and WaveFT alike
+and is **independent of `μ`** `[R.267]`, which is why one plane serves both arms and their rows are
+directly comparable — asserted in the selftest, not assumed.
+
+The ladder is written as a multiple of **`P_ref` = 0.0828641**, the step `[R.305]` selected on
+roberta-base/RTE for **both** `μ`. Two rungs are anchors: **1×** is that RoBERTa point carried across
+the width change (at `scaling` 75 it reproduces the port table's `lr*` = 3.2 exactly), and **6×** is
+the *prediction* — `[g1+g2, measured]` FourierFT's gemma optimum sits at 6.000× its own RoBERTa-tuned
+`P`. 6× is rung 4 of 6, so the prediction can fail visibly.
+
+⛔ **Why the ladder runs to 38× and the scaling axis to 4800.** On RTE, `[R.271]`/`[R.280]` left
+**both** WaveFT arms at the **top of both ladders** — reported as lower bounds, and the bracketing
+extension was never run. This grid is sized so that cannot happen again: ≥5× of margin above the
+prediction, and 64× of scaling. WaveFT also **cannot** be capped from above by init damage the way
+FourierFT was (`--haar_init_std 0.0` ⇒ ΔW ≡ 0 at init at *every* scaling), so `g2`'s sc-8000 collapse
+has no analogue here and the upper reach is cheap insurance rather than known-dead cells.
+
+**Not swept, each for a reason that is not cost:** `--haar_mu` (fixed a priori at 1 and 2 — the two
+values *are* the two arms; `train_glue.py:484` says do not sweep) · `--haar_init_std 0.0` (the
+published method's own init) · `--haar_k 256` (budget parity is the premise) · `--haar_scaling`
+(⛔ ABLATION ONLY — it *overrides* the atom-matching rule; the swept knob is
+`--haar_fourierft_scaling`) · epochs (`[g1, measured]` 0 of the top 30 cells peaked at the last one).
+
+⚠ **`classifier_lr` is carried over from `g1`, not re-derived.** `[g1, measured]` the axis is flat
+across 40× except that 2e-2 is harmful. The head is the same 4,096-param `score` layer for every arm,
+so that measurement is arm-independent — but its *interaction* with WaveFT is not, which is why two
+values are still swept rather than one.
 
 **It assumes cells will fail.** Cells are independent; `done/<id>` is written only after exit 0 and
 holds the elapsed seconds; a failure writes `fail/<id>` with the exit code and log tail. **Re-running
@@ -231,8 +278,20 @@ resume never re-queues a finished cell (which would still allocate an H100 to sa
 
 ⛔ **Do not skip the canary.** `--time` is a hard kill on fir, and the per-cell wall-clock for
 gemma-2b on an H100 has never been measured — the preflight's 8-step cells are startup-dominated.
-The canary runs **one cell per arm** (not the first two lines, which are both `fftm`), then
-`--status` prints min/median/max seconds. Size `--time` from the **max**.
+The canary runs **one cell per arm** (not the first two lines, which are both the same arm), central
+on every axis, then `--status` prints min/median/max seconds. Size `--time` from the **max**.
+
+⛔⛔ **A measurement from another arm is not a measurement.** `g1`/`g2` measured 335–502 s/cell for
+FourierFT. That does **not** carry to `w1`: `[R.307, measured]` WaveFT's train latency is
+4.11–4.33 ms/module against FourierFT-merged's 0.622 ms (~6.7×), and `[P.5–P.11]` put the adapter at
+10–13% of training wall-clock ⇒ **expect a WaveFT cell near 1.7× a FourierFT one** (~600–900 s), which
+leaves a 30-minute wall with roughly half the headroom it had. Canary first, then size it.
+
+⭐ **`--dry-run`** prints the grid, runs the instrument selftests and computes the exact array spec
+**without submitting anything**. It is what lets `scripts/fir_shell_gates.py` exercise the canary
+picker and the resume spec on the dev box — the part of this file that used to be checkable only by
+submitting a job. ⛔ It **skips** the login-node environment gate, so a green dry run says the plan is
+right, never that the cluster is.
 
 ⭐ Each cell verifies **its own** receipts: a lone sweep cell has no cross-arm comparison, so
 `fir_hp_run_cell.py` derives the module count from `trainable − head` and refuses to write a `done`

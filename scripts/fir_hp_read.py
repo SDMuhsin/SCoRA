@@ -18,7 +18,7 @@ Usage:
     env/bin/python scripts/fir_hp_read.py --run-root <dir> [--arm fftm] [--top 15]
     env/bin/python scripts/fir_hp_read.py --selftest
 """
-import argparse, csv, glob, math, os, sys
+import re, argparse, csv, glob, math, os, sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
@@ -88,8 +88,9 @@ def report(run_root, arms=None, top=15):
     want, got, done, failed, missing = coverage(run_root, arms)
     floor = R.collapse_value(H.TASK)
     lines = []
-    lines.append(f"MRPC hyperparameter grid  |  digest {H.digest()}  |  "
-                 f"{H.TASK} / {H.TARGETS} / {H.EPOCHS} epochs / seed {H.SEED}")
+    lines.append(f"MRPC hyperparameter grid {H.GRID_NAME}  |  digest {H.digest()}  |  "
+                 f"{H.TASK} / {H.TARGETS} / {H.EPOCHS} epochs / seed {H.SEED}"
+                 + (f"  |  arms {', '.join(arms or H.ARMS)}"))
     lines.append(f"  coverage: {len(done)}/{len(want)} cells have a result   "
                  f"failed: {len(failed)}   missing: {len(missing)}")
     if missing:
@@ -134,11 +135,17 @@ def report(run_root, arms=None, top=15):
     lines.append("")
     lines.append(f"  top {min(top, len(rank))} of {len(scored)}  "
                  f"⚠ ONE SEED: read this as a REGION, not an order")
-    lines.append(f"    {'cell':58s} {metric:>8s} {'acc':>7s}  best_ep")
+    pcol = "  P/P_ref" if H.COORD == "p" else ""
+    lines.append(f"    {'cell':58s} {metric:>8s} {'acc':>7s}  best_ep{pcol}")
     for c in rank[:top]:
         a = got[c]["accuracy"]
         astr = "    n/a" if math.isnan(a) else f"{a:7.4f}"
-        lines.append(f"    {c:58s} {got[c]['val']:8.4f} {astr}  {got[c]['best_epoch']:.0f}")
+        # ⭐ on a P grid the cell id carries the DERIVED lr; the swept coordinate is
+        #   P, so print it or the table cannot be read in the coordinate it was
+        #   searched in.
+        pstr = f"  {H.parse_cell_id(c)['p_mult']:>7g}" if H.COORD == "p" else ""
+        lines.append(f"    {c:58s} {got[c]['val']:8.4f} {astr}  "
+                     f"{got[c]['best_epoch']:.0f}{pstr}")
     # per-arm best, because the two arms are separate baselines
     for arm in (arms or H.ARMS):
         sub = [c for c in rank if f"-{arm}-" in c]
@@ -153,9 +160,11 @@ def report(run_root, arms=None, top=15):
     #   edge" is true by construction there and carries no information. Flagging it
     #   anyway would fire on EVERY run of a 2-value axis and train the reader to skim
     #   past the one warning that matters. Say it is untestable instead.
-    for name, val, axis in (("lr", bc["lr"], H.LRS),
-                            ("scaling", bc["scaling"], H.SCALINGS),
-                            ("classifier_lr", bc["classifier_lr"], H.CLF_LRS)):
+    # ⛔ THE AXES COME FROM THE GRID, NOT FROM THIS FILE. w1 sweeps P = lr*atom and
+    #   DERIVES lr, so lr takes one value per (P, scaling) pair -- 24 of them -- and
+    #   an edge test on it would be meaningless. H.axes() is the single declaration.
+    for name, key, axis in H.axes():
+        val = bc[key]
         if len(set(axis)) < 3:
             untestable.append(f"{name} ({len(set(axis))} values)")
         elif val in (min(axis), max(axis)):
@@ -239,9 +248,8 @@ def selftest():
         def _mid(axis):
             vs = sorted(set(axis))
             return vs[len(vs) // 2] if len(vs) >= 3 else vs[0]
-        interior = next(c for c in cs if c["lr"] == _mid(H.LRS)
-                        and c["scaling"] == _mid(H.SCALINGS)
-                        and c["classifier_lr"] == _mid(H.CLF_LRS))
+        want = {k: _mid(v) for _n, k, v in H.axes()}
+        interior = next(c for c in cs if all(c[k] == v for k, v in want.items()))
         write(H.cell_id(interior), 0.999)
         L = report(d)
         ck(any("INTERIOR on every testable axis" in l for l in L),
@@ -260,6 +268,43 @@ def selftest():
     return 1 if bad else 0
 
 
+
+def _selftest_every_grid():
+    """⭐ RUN THE CHECKS FOR EVERY GRID, NOT JUST THE SELECTED ONE.
+
+    ⛔ Module globals are bound to FIR_HP_GRID at IMPORT, so one process can only
+      ever check one grid -- and `run_all_gates.py` sets no env var, so for two
+      grids the suite was green while a *different* grid's checks had never run in
+      it. That is this repo's Law 1 in miniature: a check must exercise what the
+      job will actually run. Re-exec once per grid and aggregate.
+    """
+    import subprocess
+    if os.environ.get("FIR_HP_GRID"):
+        print(f"  ⚠ FIR_HP_GRID={os.environ['FIR_HP_GRID']} is set; checking ALL grids anyway.")
+    tot_p = tot_f = 0
+    for g in sorted(H.GRIDS):
+        print(f"--- grid {g} " + "-" * 50)
+        env = dict(os.environ, FIR_HP_GRID=g, FIR_HP_ONE_GRID="1")
+        r = subprocess.run([sys.executable, os.path.abspath(__file__), "--selftest"],
+                           capture_output=True, text=True, env=env,
+                           cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        sys.stdout.write(r.stdout)
+        sys.stderr.write(r.stderr)
+        m = None
+        for m in re.finditer(r"selftest:\s*(\d+) passed, (\d+) failed", r.stdout):
+            pass
+        if m is None:
+            print(f"  ⛔ grid {g} produced no selftest line (rc={r.returncode})")
+            tot_f += 1
+            continue
+        tot_p += int(m.group(1)); tot_f += int(m.group(2))
+        if r.returncode != 0 and int(m.group(2)) == 0:
+            tot_f += 1     # ⛔ fail closed: a crash after a green line is still a failure
+    print("=" * 62)
+    print(f"selftest: {tot_p} passed, {tot_f} failed  (all {len(H.GRIDS)} grids)")
+    return 1 if tot_f else 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run-root")
@@ -268,6 +313,13 @@ def main():
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
     if a.selftest:
+        # ⛔ EVERY GRID, ALWAYS -- deliberately IGNORING FIR_HP_GRID. The first
+        #   version skipped the fan-out when that var was set, so an operator who
+        #   had exported a grid for a submit got a suite that silently covered ONE
+        #   grid instead of three, with a smaller green total and no warning. A
+        #   check must not cover LESS because of an unrelated environment variable.
+        if not os.environ.get("FIR_HP_ONE_GRID"):
+            sys.exit(_selftest_every_grid())
         sys.exit(selftest())
     if not a.run_root:
         raise SystemExit("FAIL CLOSED: --run-root is required")

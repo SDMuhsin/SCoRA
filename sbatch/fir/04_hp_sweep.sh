@@ -5,6 +5,9 @@
 #   bash sbatch/fir/04_hp_sweep.sh --canary 2      # ⭐ ALWAYS DO THIS FIRST
 #   bash sbatch/fir/04_hp_sweep.sh --time 01:30:00 # then the rest, sized from it
 #   bash sbatch/fir/04_hp_sweep.sh --status        # what is done / failed / left
+#   bash sbatch/fir/04_hp_sweep.sh --dry-run       # print the array spec, submit nothing
+#
+#   FIR_HP_GRID=w1 bash sbatch/fir/04_hp_sweep.sh --canary 2    # ⭐ the WaveFT grid
 #
 # ONE Slurm ARRAY, one cell per task, 160 cells (2 arms x 5 lr x 4 scaling x
 # 4 classifier_lr), MRPC, 1 seed, 5 epochs.  Grid: scripts/fir_hp_plan.py.
@@ -42,6 +45,7 @@ P_TIME="${P_TIME:-02:00:00}"        # generous for the canary; SIZE IT after
 P_CONCURRENT="${P_CONCURRENT:-8}"   # array throttle (%N)
 P_CANARY=0
 STATUS=false
+DRY=false
 LOCAL_ONE=""
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -49,6 +53,7 @@ while [ $# -gt 0 ]; do
         --concurrent) P_CONCURRENT="$2"; shift 2 ;;
         --canary) P_CANARY="$2"; shift 2 ;;
         --status) STATUS=true; shift ;;
+        --dry-run) DRY=true; shift ;;   # compute the array spec and STOP. see below
         --run-one) LOCAL_ONE="$2"; shift 2 ;;   # internal: the array task body
         *) echo "unknown option: $1"; exit 1 ;;
     esac
@@ -185,8 +190,19 @@ fi
 # SUBMIT
 # ===========================================================================
 fir_print_provenance
+# ⭐ --dry-run: everything the submit path computes -- the grid, the selftests, the
+#   array spec -- WITHOUT sbatch. It exists so scripts/fir_shell_gates.py can
+#   exercise the canary picker and the resume spec on the DEV BOX, which is the one
+#   part of this file that used to be checkable only by submitting a job on fir.
+# ⛔ IT IS NOT A SUBMIT-READINESS CHECK: it SKIPS the login-node environment gate,
+#   because that gate demands the fir venv and would fail everywhere else. A green
+#   dry run says the PLAN is right, never that the CLUSTER is.
+if $DRY; then
+    echo "--- ⚠ DRY RUN: the login-node environment gate is SKIPPED ---"
+else
 echo "--- login-node gate ---"
 fir_assert_env cpu 02 || { echo "environment not sane — refusing to submit"; exit 1; }
+fi
 for g in fir_arms fir_plan fir_hp_plan; do
     env/bin/python "scripts/$g.py" --selftest >/dev/null || { echo "FAIL: $g selftest"; exit 1; }
 done
@@ -208,28 +224,16 @@ if [ "$P_CANARY" -gt 0 ]; then
     #   all fftm, so a naive head -2 would never exercise the stock-PEFT path --
     #   and that is the arm whose build differs (modules_to_save, no module-count
     #   log). A canary that cannot see one of the two paths is not a canary.
-    IDX=$(env/bin/python - <<'PY'
-import sys; sys.path.insert(0, "scripts")
+    # ⛔ THE PICKER LIVES IN THE PLANNER (H.canary_indices), not here. Two earlier
+    #   versions of it were hardcoded against a grid -- first literal knob values,
+    #   then `max(SCALINGS)` -- and both broke or degraded the day a new grid
+    #   landed. The shell asks; it does not decide.
+    IDX=$(env/bin/python -c "
+import sys; sys.path.insert(0, 'scripts')
 import fir_hp_plan as H
-# ⛔ DERIVED FROM THE GRID, NEVER HARDCODED. The first version named lr 0.5 /
-#   scaling 142 literally; when the grid was replaced those values no longer
-#   existed and the picker would have died on ValueError at submit time. Pick a
-#   central, representative cell per ARM -- one per code path, since the first
-#   half of the list is all one arm and `head -2` would never exercise the other.
-ids = [H.cell_id(c) for c in H.cells()]
-lr = sorted(H.LRS)[len(H.LRS) // 2]                 # median lr
-sc = max(H.SCALINGS)                                 # the end the optimum ran toward
-clr = sorted(H.CLF_LRS)[len(H.CLF_LRS) // 2]
-pick = []
-for arm in H.ARMS:
-    want = (f"{H.TASK}-{arm}-{H.TARGETS}-lr{H._fmt(lr)}-sc{H._fmt(sc)}"
-            f"-clr{H._fmt(clr)}-seed{H.SEED}")
-    pick.append(ids.index(want))
-print(",".join(str(i) for i in pick))
-PY
-)
+print(','.join(str(i) for i in H.canary_indices()))") || exit 1
     ARRAY_SPEC="$IDX"
-    echo "  CANARY: array=$ARRAY_SPEC  (one cell per arm, at the grid's median lr / max scaling)"
+    echo "  CANARY: array=$ARRAY_SPEC  (one cell per arm, CENTRAL on every axis)"
 else
     # ⛔ RESUME MUST NOT RE-QUEUE FINISHED CELLS. The task body skips a done cell in
     #   seconds -- but only AFTER Slurm has allocated it a whole H100. On a 160-cell
@@ -265,6 +269,12 @@ fi
 echo "  time/cell  : $P_TIME   account $FIR_ACCOUNT_GPU   gres $FIR_GPU_FULL   mem $FIR_GPU_MEM"
 echo
 
+if $DRY; then
+    echo "DRY RUN: would submit array=$ARRAY_SPEC  (grid $GRID_NAME, time $P_TIME)"
+    echo "         nothing was submitted."
+    exit 0
+fi
+
 jid=$(sbatch --parsable <<SB
 #!/bin/bash
 #SBATCH --job-name=lrs_hp_mrpc
@@ -294,5 +304,10 @@ echo
 if [ "$P_CANARY" -gt 0 ]; then
     echo "⛔ NEXT: when these two finish, run --status. It prints the MEASURED"
     echo "   per-cell seconds. Size --time from the MAX plus headroom, then submit"
-    echo "   the full array. Do NOT submit 160 cells against an unmeasured wall."
+    echo "   the full array. Do NOT submit the grid against an unmeasured wall."
+    echo "   ⛔ A MEASUREMENT FROM ANOTHER ARM IS NOT A MEASUREMENT. [R.307] puts"
+    echo "      WaveFT train latency at 4.11-4.33 ms/module against FourierFT-"
+    echo "      merged 0.622 ms -- ~6.7x -- and [P.5-P.11] put the adapter at"
+    echo "      10-13%% of training wall-clock, so a WaveFT cell should land near"
+    echo "      1.7x a FourierFT one. g2 502 s max does NOT carry over."
 fi
