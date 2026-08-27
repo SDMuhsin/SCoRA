@@ -231,6 +231,15 @@ def t_provenance():
         check(f"{f} prints its provenance", n == want, f"{n} call(s), want {want}")
 
 
+def _real_logs():
+    """A snapshot of the REAL collection directory, so a test can prove it left it
+    alone. It holds scp'd cluster data; nothing here may write to or delete it."""
+    d = os.path.join(ROOT, "logs", "hpsweep")
+    if not os.path.isdir(d):
+        return None
+    return sorted(os.listdir(d))
+
+
 def t_sweep_status_sees_a_killed_cell():
     """04's --status must distinguish "killed" from "never started".
 
@@ -240,6 +249,7 @@ def t_sweep_status_sees_a_killed_cell():
       likely outcome. Both directions are exercised: the section must appear when
       a start marker has no outcome, and must NOT appear once it does."""
     tmp = tempfile.mkdtemp()
+    real_before = _real_logs()
     try:
         root = os.path.join(tmp, "runs", "hpsweep")
         for d in ("csv", "logs", "done", "fail", "started"):
@@ -248,7 +258,14 @@ def t_sweep_status_sees_a_killed_cell():
                 env={"FIR_SCRATCH_ROOT": tmp, "FIR_LOGGING": "1",
                      "FIR_COLLECT_DIR": os.path.join(tmp, "collected")})
         cid = open(os.path.join(root, "cells.txt")).read().split("\n")[0]
-        check("--status runs on an empty sweep root", "cells: 160" in r0.stdout,
+        # ⚠ ASK THE PLANNER, don't hardcode 160: the grid is selectable and the count
+        #   changed the day a second grid landed. A test that pins a number the code
+        #   is allowed to change fails for the wrong reason.
+        n_cells = subprocess.run(
+            [VENV_PY if os.path.exists(VENV_PY) else sys.executable, "-c",
+             "import sys;sys.path.insert(0,'scripts');import fir_hp_plan as H;print(len(H.cells()))"],
+            capture_output=True, text=True, cwd=ROOT).stdout.strip()
+        check("--status runs on an empty sweep root", f"cells: {n_cells}" in r0.stdout,
               r0.stdout + r0.stderr)
         check("CONTROL: nothing is reported as killed before anything starts",
               "STARTED AND NEVER FINISHED" not in r0.stdout, r0.stdout)
@@ -270,10 +287,12 @@ def t_sweep_status_sees_a_killed_cell():
         # ⛔ the collection went to the FIXTURE, not to ./logs/hpsweep -- assert it,
         #   because the first version of this test deleted a user's scp'd canary logs
         #   from the real directory as "cleanup".
+        #   ⚠ COMPARE BEFORE/AFTER rather than demanding the real path be ABSENT: it
+        #     legitimately holds scp'd sweep data, and an assertion that only holds on
+        #     an empty machine is a test that fails when the project is being used.
         check("--status collects into the fixture, never into ./logs/hpsweep",
-              os.path.isdir(os.path.join(tmp, "collected"))
-              and not os.path.exists(os.path.join(ROOT, "logs", "hpsweep")),
-              "the real collection directory was touched by a test")
+              os.path.isdir(os.path.join(tmp, "collected")) and _real_logs() == real_before,
+              "the real collection directory was modified by a test")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

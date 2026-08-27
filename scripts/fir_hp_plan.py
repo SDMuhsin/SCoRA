@@ -38,7 +38,10 @@ import fir_arms as FA                                                  # noqa: E
 import fir_plan as FP                                                  # noqa: E402
 
 # ---------------------------------------------------------------------------
-# THE GRID.  One place, committed, digested.
+# THE GRIDS.  One place, committed, digested.  `g1` is kept because 160 measured
+# cells refer to it; `g2` is the live one.  Select with FIR_HP_GRID (default g2)
+# so the planner, the runner and the reader cannot disagree about which grid is
+# in play -- three tools reading one env var, not a flag threaded through a shell.
 # ---------------------------------------------------------------------------
 TASK = "mrpc"
 TARGETS = "q_o"
@@ -46,18 +49,58 @@ EPOCHS = 5
 SEED = 42
 ARMS = ["fftm", "fftstock"]
 
-# lr: log-spaced ~3.2x apart, 80x total range, straddling BOTH reference points
-#     (RoBERTa's tuned 0.5 and the derived lr* 0.4697 sit between 0.15 and 1.5).
-LRS = [0.05, 0.15, 0.5, 1.5, 4.0]
-# scaling: RoBERTa's tuned 50 and the derived scale* 141.94 are both ON the grid,
-#     with a flanker either side.  ⚠ scaling moves the effective step (P = lr*atom,
-#     atom is proportional to scaling) AND the init perturbation, which is why it
-#     is swept jointly with lr rather than folded into a single product.
-SCALINGS = [25, 50, 142, 400]
-# classifier_lr: brackets the carried 5e-3 on both sides.  The head is 4,096 params
-#     here against RoBERTa's 592,130, so the carried value is out of the regime it
-#     was selected in -- [R.115 4] says re-derive, and this is the re-derivation.
-CLF_LRS = [5e-4, 2e-3, 5e-3, 2e-2]
+# ⭐ g1 -- RUN AND COMPLETE 2026-08-26. 160/160 cells, 0 failed, 16.3 GPU-h.
+#   [measured] best F1 0.8945 at lr 1.5 / scaling 400 / clf_lr 5e-4 (fftm), but
+#   ⛔ SCALING WAS AT THE GRID EDGE and strictly monotone across it:
+#        sc  25 -> best F1 0.8352 / acc 0.7598      (RoBERTa's tuned 50: 0.8459)
+#        sc  50 -> 0.8459 / 0.7794
+#        sc 142 -> 0.8767 / 0.8186                  (the DERIVED scale* 141.94)
+#        sc 400 -> 0.8945 / 0.8456
+#   so the optimum lies OUTSIDE g1 and its best cell is not quotable as an optimum.
+G1 = {
+    "lrs": [0.05, 0.15, 0.5, 1.5, 4.0],
+    "scalings": [25, 50, 142, 400],
+    "clf_lrs": [5e-4, 2e-3, 5e-3, 2e-2],
+}
+
+# ⭐⭐ g2 -- THE DECISIVE GRID. Designed to need no successor [user, 2026-08-27:
+#   "we can't keep having this back and forth and multiple stages"].
+#
+#   lr: FINER (ratio ~2.5, was ~3.2) and EXTENDED AT THE TOP to 15 -- 300x range.
+#     ⚠ The bottom endpoint stays at 0.05 rather than going lower: g1 measured it
+#       as the worst row (4 cells at the collapse floor). Extending downward would
+#       buy known-dead cells.
+#   scaling: EXTENDED 20x BEYOND g1's edge. This is where the edge actually was.
+#     ⛔ AND THE TWO AXES ARE NOT INTERCHANGEABLE, which is why the extension is
+#       NOT folded into the product lr*scaling: [measured, g1] at a MATCHED product
+#       of 200, (lr 0.5, sc 400) scores 0.8823 while (lr 4, sc 50) scores 0.8354.
+#       Large scaling at modest lr beats the reverse. AdamW's decoupled decay
+#       shrinks the spectrum by lr*wd per step, so a large lr is TAXED in a way a
+#       large scaling is not -- this repo's [R.0 5d] weight-decay trap, again.
+#   classifier_lr: TRIMMED to the two that matter, which pays for the width above.
+#     [measured, g1] 2e-2 is harmful (8 of the 9 at-floor cells use it); 2e-3 and
+#     5e-3 differ by less than the seed noise; the axis is otherwise flat
+#     (best F1 0.8823..0.8945 across all four values).
+#   epochs stay at 5: [measured, g1] 0 of the top 30 cells peak at the LAST epoch
+#     (18 at epoch 4, 11 at epoch 3), so the schedule is not the binding constraint.
+G2 = {
+    "lrs": [0.05, 0.15, 0.4, 1.0, 2.5, 6.0, 15.0],
+    "scalings": [142, 400, 1100, 3000, 8000],
+    "clf_lrs": [5e-4, 5e-3],
+}
+
+GRIDS = {"g1": G1, "g2": G2}
+GRID_NAME = os.environ.get("FIR_HP_GRID", "g2")
+if GRID_NAME not in GRIDS:
+    raise SystemExit(f"FAIL CLOSED: FIR_HP_GRID={GRID_NAME!r} is not one of {sorted(GRIDS)}")
+_G = GRIDS[GRID_NAME]
+LRS, SCALINGS, CLF_LRS = _G["lrs"], _G["scalings"], _G["clf_lrs"]
+
+# ⭐ g1 and g2 OVERLAP by construction (lr 0.05/0.15 x sc 142/400 x both clf_lrs x
+#   2 arms = 16 cells). A cell id is a pure function of its knobs, so those cells
+#   keep their g1 ids, their g1 CSVs and their g1 `done` markers -- the sweep
+#   script skips them and they cost nothing. That is why the ids carry the VALUES
+#   and not a grid name.
 
 
 def _fmt(x):
@@ -65,6 +108,20 @@ def _fmt(x):
     not become two different cell ids for one cell."""
     s = f"{float(x):g}"
     return s.replace(".", "p").replace("-", "m").replace("+", "")
+
+
+def _cells_of(grid, arms=None):
+    """Enumerate a grid dict directly -- used by the selftest to compare g1 with g2
+    without mutating module globals (which would make the test order-dependent)."""
+    out = []
+    for arm in (arms or ARMS):
+        for lr in grid["lrs"]:
+            for sc in grid["scalings"]:
+                for clr in grid["clf_lrs"]:
+                    out.append({"arm": arm, "task": TASK, "targets": TARGETS,
+                                "seed": SEED, "epochs": EPOCHS,
+                                "lr": lr, "scaling": sc, "classifier_lr": clr})
+    return out
 
 
 def cells(arms=None):
@@ -157,8 +214,25 @@ def selftest():
         (ok if c else bad).append(l)
 
     cs = cells()
-    ck(len(cs) == len(ARMS) * 5 * 4 * 4, f"grid is {len(ARMS)}x5x4x4 = {len(cs)} cells")
-    ck(len(cs) == 160, "160 cells total (80 per arm, as decided)")
+    n_expect = len(ARMS) * len(LRS) * len(SCALINGS) * len(CLF_LRS)
+    ck(len(cs) == n_expect,
+       f"grid {GRID_NAME} is {len(ARMS)}x{len(LRS)}x{len(SCALINGS)}x{len(CLF_LRS)} = {len(cs)} cells")
+    ck({"g1": 160, "g2": 140}[GRID_NAME] == len(cs), f"{GRID_NAME} has its declared cell count")
+    # ⛔ THE GRIDS MUST NOT SILENTLY BECOME THE SAME GRID, and g2 exists only because
+    #   g1's optimum sat on its scaling edge -- so assert the extension is real.
+    ck(max(G2["scalings"]) >= 10 * max(G1["scalings"]),
+       f"g2 extends scaling >=10x past g1's edge ({max(G1['scalings'])} -> {max(G2['scalings'])})")
+    ck(max(G2["lrs"]) > max(G1["lrs"]) and len(G2["lrs"]) > len(G1["lrs"]),
+       "g2's lr axis is both WIDER at the top and FINER than g1's")
+    ck(min(G2["lrs"]) == min(G1["lrs"]),
+       "g2 keeps g1's bottom lr endpoint (measured worst; going lower buys dead cells)")
+    ck(set(G2["clf_lrs"]) < set(G1["clf_lrs"]),
+       "g2's classifier_lr values are a strict SUBSET of g1's (all already measured)")
+    # the overlap is what makes the re-run cheap: those cells keep their g1 ids
+    _g1 = {cell_id(c) for c in _cells_of(G1)}
+    _g2 = {cell_id(c) for c in _cells_of(G2)}
+    ck(len(_g1 & _g2) == 2 * 2 * 2 * len(ARMS),
+       f"g1 and g2 share exactly {len(_g1 & _g2)} cells, which resume for free")
     ids = [cell_id(c) for c in cs]
     ck(len(set(ids)) == len(ids), "every cell id is unique")
     ck(cells() == cells(), "cell order is deterministic (array index is stable)")
@@ -169,15 +243,22 @@ def selftest():
     except SystemExit:
         ck(True, "CONTROL: an unknown cell id is refused")
 
-    # --- the reference points are ON the grid, or the search cannot confirm them
-    ck(0.5 in LRS, "RoBERTa's tuned lr 0.5 is on the grid")
-    ck(50 in SCALINGS, "RoBERTa's tuned scaling 50 is on the grid")
+    # --- the reference points must be reachable, or the search cannot speak to them
     ck(5e-3 in CLF_LRS, "the carried classifier_lr 5e-3 is on the grid")
     PT = FP.port()
     dl = PT["targets"][TARGETS]["arms"]["fftm"]["derived_lr"]
     ds = PT["targets"][TARGETS]["arms"]["fftm"]["derived_scale"]
-    ck(min(LRS) < dl < max(LRS), f"the derived lr* {dl:.4g} is INSIDE the swept range")
-    ck(min(SCALINGS) < ds < max(SCALINGS), f"the derived scale* {ds:.4g} is INSIDE it")
+    ck(min(LRS) < dl < max(LRS), f"the derived lr* {dl:.4g} is INSIDE the swept lr range")
+    if GRID_NAME == "g1":
+        ck(0.5 in LRS and 50 in SCALINGS, "g1 carries RoBERTa's tuned point exactly")
+        ck(min(SCALINGS) < ds < max(SCALINGS), f"the derived scale* {ds:.4g} is INSIDE g1")
+    else:
+        # g2 deliberately starts AT the derived scale and climbs: everything below it
+        # is measured and worse, so spending cells there again would buy nothing.
+        ck(abs(min(SCALINGS) - round(ds)) <= 1,
+           f"g2 starts at the derived scale* ({ds:.4g}) and extends upward only")
+        ck(min(LRS) < 1.5 < max(LRS), "g1's best lr (1.5) is BRACKETED by g2's finer axis")
+        ck(400 in SCALINGS, "g1's best scaling (400) is retained as an anchor")
 
     # --- the command really carries the swept values, for BOTH arms
     for arm in ARMS:
@@ -244,6 +325,7 @@ def main():
         return
     if a.show:
         cs = cells(arms)
+        print(f"GRID {GRID_NAME}  (set FIR_HP_GRID to switch; g1 is the completed 160-cell grid)")
         print(f"grid digest {digest()}  |  {len(cs)} cells  |  task {TASK}  "
               f"targets {TARGETS}  epochs {EPOCHS}  seed {SEED}")
         print(f"  arms          : {', '.join(arms or ARMS)}")
