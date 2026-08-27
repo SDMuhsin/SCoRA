@@ -162,14 +162,73 @@ W1 = {
     "clf_lrs": [5e-4, 5e-3],
 }
 
-GRIDS = {"g1": G1, "g2": G2, "w1": W1}
+# ---------------------------------------------------------------------------
+# ⭐⭐ w2 -- THE BUDGET-EQUALISATION GRID.  [user, 2026-08-27: "increase budget so
+#   they're equal"]
+# ---------------------------------------------------------------------------
+# ⛔ THE PROBLEM IT FIXES, STATED AS A NUMBER.  [measured] FourierFT was searched
+#   over 142 DISTINCT cells per arm on this cell (g1's 80 + g2's 70, 8 shared);
+#   WaveFT over 48.  A 2.96x search advantage, and it runs in FourierFT's favour.
+#   `[Dodge et al., EMNLP 2019 §6]` is explicit that the direction matters: "if a
+#   model with a small budget outperforms a model with a large budget, increasing
+#   the small budget will not change this conclusion.  However, if a model with a
+#   large budget outperforms a model with a small budget, the difference might be
+#   due to the model or the budget (or both)."  Ours is the SECOND case, so the
+#   0.8904-vs-0.8873 gap cannot be attributed at all until the budgets match.
+#
+# ⚠ AND EQUAL COUNTS ARE STILL NOT SUFFICIENT -- the same section says "fixing the
+#   same number of hyperparameter trials for both models does not imply a fair
+#   comparison", because the spaces differ and past human effort is unmeasurable.
+#   w1's bounds were themselves chosen USING g1/g2's results, which is borrowed
+#   effort in WaveFT's favour and cannot be netted off.  This grid removes the one
+#   asymmetry that IS countable; it does not make the comparison clean.
+#
+# ⭐ WHERE THE CELLS GO, AND WHY NOT SOMEWHERE EASIER.  The honest way to spend an
+#   equalising budget is the way the other family's was spent, not wherever it
+#   most helps.  FourierFT's 142 = a broad plane x FOUR classifier_lr values (g1)
+#   + a finer, wider plane x two (g2).  WaveFT's 48 has only ever had TWO
+#   classifier_lr values, so part of the gap is a knob axis it never received.
+#   w2 therefore restores g1's full four-value classifier_lr axis and puts it on a
+#   plane that INTERLEAVES w1's, doubling the resolution of both swept axes:
+#     P/P_ref  w1 {0.5, 1, 2.5, 6, 15, 38} + w2 {0.3, 0.7, 1.6, 4, 10, 24}
+#              => a union ladder of ratio ~1.55 spanning 0.3 - 38 (127x)
+#     scaling  w1 {75, 300, 1200, 4800}    + w2 {150, 600, 2400, 9600}
+#              => a union ladder of EXACTLY ratio 2 spanning 75 - 9600 (128x)
+#   ⛔ The two P axes are DISJOINT by construction, so every w2 cell is new and the
+#     budget really does rise by 96/arm rather than resuming w1 markers for free.
+#   ⚠ I am not pretending this buys a better optimum. At one seed, cells 1.55x
+#     apart in P differ by less than the seed noise `[R.273]`, so most of what a
+#     denser search buys is SELECTION INFLATION -- which is exactly the thing
+#     FourierFT's extra 94 cells bought it, and exactly what equalising removes.
+#
+# 6 x 4 x 4 = 96 new cells per arm => 144/arm total, against FourierFT's 142.
+# ⚠ It overshoots by 2. That is the CONSERVATIVE direction for the standing
+#   result: if FourierFT still leads while now holding the SMALLER budget, Dodge's
+#   asymmetry applies and the conclusion is safe; the reverse would have been
+#   unattributable. A selftest asserts the wave family ends >= the fft family.
+W2 = {
+    "arms": WAVE_ARMS, "coord": "p",
+    "p_mults": [0.3, 0.7, 1.6, 4.0, 10.0, 24.0],
+    "scalings": [150, 600, 2400, 9600],
+    "clf_lrs": [5e-4, 2e-3, 5e-3, 2e-2],          # g1's axis, restored in full
+}
+
+# ⭐ A READING VIEW, NOT A RUN TARGET. `wave` is the UNION of w1 and w2 -- the whole
+#   144-cell-per-arm WaveFT search, which is the thing a budget-equalised claim is
+#   about. ⛔ It is a union of two disjoint factorial BLOCKS, not one factorial, so
+#   the reader tests edges per block and says so; a bare min/max over the union
+#   axes would claim a bracketing the design does not have.
+WAVE_ALL = {"arms": WAVE_ARMS, "coord": "p", "union": ["w1", "w2"]}
+
+GRIDS = {"g1": G1, "g2": G2, "w1": W1, "w2": W2, "wave": WAVE_ALL}
 GRID_NAME = os.environ.get("FIR_HP_GRID", "g2")
 if GRID_NAME not in GRIDS:
     raise SystemExit(f"FAIL CLOSED: FIR_HP_GRID={GRID_NAME!r} is not one of {sorted(GRIDS)}")
 _G = GRIDS[GRID_NAME]
 ARMS = _G["arms"]
 COORD = _G["coord"]
-SCALINGS, CLF_LRS = _G["scalings"], _G["clf_lrs"]
+IS_UNION = "union" in _G
+SCALINGS, CLF_LRS = _G.get("scalings", []), _G.get("clf_lrs", [])
 LRS = _G.get("lrs", [])            # [] on a P-parameterised grid: lr is DERIVED there
 P_MULTS = _G.get("p_mults", [])    # [] on an lr-parameterised grid
 
@@ -205,7 +264,7 @@ def _pt(PT=None):
     return _PT_CACHE["pt"]
 
 
-def atom_per_scale(targets=TARGETS, arm=None, PT=None):
+def atom_per_scale(targets=TARGETS, arm=None, PT=None, arms=None):
     """atom / scale at the TARGET width, i.e. 1/sqrt(2mn).
 
     ⭐ FourierFT and WaveFT share atom = s/sqrt(2mn) [R.267], and for WaveFT it is
@@ -213,7 +272,7 @@ def atom_per_scale(targets=TARGETS, arm=None, PT=None):
       rows are directly comparable.  Asserted across arms, not assumed."""
     PT = _pt(PT)
     prof = PT["targets"][targets]["arms"]
-    arms = [arm] if arm else list(ARMS)
+    arms = [arm] if arm else list(arms or ARMS)
     vals = []
     for a in arms:
         pr = prof[a]
@@ -227,7 +286,7 @@ def atom_per_scale(targets=TARGETS, arm=None, PT=None):
     return vals[0]
 
 
-def p_ref(arm=None, PT=None):
+def p_ref(arm=None, PT=None, arms=None):
     """The REFERENCE effective step: the P that [R.305] selected on roberta-base/RTE.
 
     ⭐ Read as lr*atom from the REFERENCE half of the port table, so it is the same
@@ -236,7 +295,11 @@ def p_ref(arm=None, PT=None):
       if that ever stopped being true the two arms would need two grids."""
     PT = _pt(PT)
     ref = PT["reference"]["__ref__"]["arms"]
-    arms = [arm] if arm else list(ARMS)
+    # ⛔ ARMS MUST BE PASSED WHEN ENUMERATING A GRID THAT IS NOT THE SELECTED ONE.
+    #   P_ref is a FAMILY quantity -- 0.0828641 for WaveFT, 0.0230178 for FourierFT.
+    #   Falling back to the module ARMS would silently derive w1/w2's learning rates
+    #   from FourierFT's reference step whenever FIR_HP_GRID happened to be g2.
+    arms = [arm] if arm else list(arms or ARMS)
     vals = [ref[a]["lr"] * ref[a]["atom_median"] for a in arms]
     if max(vals) - min(vals) > 1e-12 * max(vals):
         raise SystemExit(f"FAIL CLOSED: arms {arms} have DIFFERENT reference P {vals} -- "
@@ -244,25 +307,41 @@ def p_ref(arm=None, PT=None):
     return vals[0]
 
 
-def lr_for(p_mult, scaling, PT=None):
+def lr_for(p_mult, scaling, PT=None, arms=None):
     """lr = P / atom(scaling), the whole point of the coordinate."""
-    return p_mult * p_ref(PT=PT) / (scaling * atom_per_scale(PT=PT))
+    return (p_mult * p_ref(PT=PT, arms=arms)
+            / (scaling * atom_per_scale(PT=PT, arms=arms)))
+
+
+def axes_of(grid):
+    """A GRID DICT's testable axes.  ⛔ Takes the dict, not the globals: a union
+    view has to ask its members, and the equalisation gate has to enumerate every
+    grid while a different one is selected."""
+    if "union" in grid:
+        raise SystemExit("FAIL CLOSED: a union view has no single axis set -- "
+                         "ask its member grids (member_grids())")
+    first = (("P/P_ref", "p_mult", grid["p_mults"]) if grid["coord"] == "p"
+             else ("lr", "lr", grid["lrs"]))
+    return [first, ("scaling", "scaling", grid["scalings"]),
+            ("classifier_lr", "classifier_lr", grid["clf_lrs"])]
+
+
+def member_grids():
+    """[(name, grid dict)] -- itself for a plain grid, its members for a union."""
+    if IS_UNION:
+        return [(n, GRIDS[n]) for n in _G["union"]]
+    return [(GRID_NAME, _G)]
 
 
 def axes():
-    """The grid's TESTABLE axes as (label, cell key, values).
+    """The SELECTED grid's testable axes as (label, cell key, values).
 
     ⛔ The reader's edge report used to name lr/scaling/classifier_lr literally.
       On a P-parameterised grid `lr` is not an axis at all -- it takes 24 distinct
       values, one per (P, scaling) pair -- so an edge test on it would be
       meaningless in exactly the way this repo's checks keep failing.  The grid
       declares its own axes; the reader asks."""
-    if COORD == "p":
-        first = ("P/P_ref", "p_mult", P_MULTS)
-    else:
-        first = ("lr", "lr", LRS)
-    return [first, ("scaling", "scaling", SCALINGS),
-            ("classifier_lr", "classifier_lr", CLF_LRS)]
+    return axes_of(_G)
 
 
 def canary_indices(ids=None):
@@ -273,6 +352,9 @@ def canary_indices(ids=None):
       replaced.  ⚠ And CENTRAL on every axis: the version after that took the MAX
       scaling, so on a grid whose top scaling collapses the model the canary would
       be a dead cell -- fine for wall-clock, useless as a smoke test."""
+    if IS_UNION:
+        raise SystemExit("FAIL CLOSED: 'wave' is a READING VIEW, not a run target -- "
+                         "canary and submit against w1 or w2")
     ids = ids or [cell_id(c) for c in cells()]
     def mid(v):
         return sorted(set(v))[(len(set(v)) - 1) // 2]
@@ -295,6 +377,18 @@ def _cells_of(grid, arms=None, PT=None):
     ⭐ The OUTER loop is the first axis in both coordinate systems, so the cell
       ORDER (and therefore every Slurm array index) is built the same way whether
       lr is swept or derived."""
+    if "union" in grid:
+        # ⛔ DEDUPE BY CELL ID, DETERMINISTICALLY. Members are disjoint by design
+        #   (asserted in the selftest), but a union that silently double-counted a
+        #   shared cell would inflate the very budget number this view exists to
+        #   report.
+        out, seen = [], set()
+        for name in grid["union"]:
+            for c in _cells_of(GRIDS[name], arms, PT=PT):
+                i = cell_id(c)
+                if i not in seen:
+                    seen.add(i); out.append(c)
+        return out
     out = []
     first = grid.get("p_mults") if grid["coord"] == "p" else grid["lrs"]
     for arm in (arms or grid["arms"]):
@@ -306,7 +400,7 @@ def _cells_of(grid, arms=None, PT=None):
                          "scaling": sc, "classifier_lr": clr}
                     if grid["coord"] == "p":
                         c["p_mult"] = v
-                        c["lr"] = lr_for(v, sc, PT=PT)
+                        c["lr"] = lr_for(v, sc, PT=PT, arms=grid["arms"])
                     else:
                         c["lr"] = v
                     out.append(c)
@@ -389,6 +483,26 @@ def steps_per_cell():
 
 
 # ---------------------------------------------------------------------------
+
+def budget_per_arm():
+    """{arm: number of DISTINCT cells that arm has been / will be searched over,
+    across EVERY grid this planner knows}.
+
+    ⭐ THE FAIRNESS CLAIM, MADE COMPUTABLE. "Both families got the same tuning
+      effort" is the kind of sentence that rots silently the moment a grid is
+      added or trimmed. It is checked here instead of asserted in prose.
+    ⛔ Union VIEWS are skipped: they re-enumerate their members, so counting them
+      would double nothing but would make the number depend on how many views
+      happen to exist."""
+    out = {}
+    for name, g in GRIDS.items():
+        if "union" in g:
+            continue
+        for c in _cells_of(g):
+            out.setdefault(c["arm"], set()).add(cell_id(c))
+    return {a: len(v) for a, v in out.items()}
+
+
 def selftest():
     ok, bad = [], []
 
@@ -397,15 +511,31 @@ def selftest():
 
     cs = cells()
     _first = P_MULTS if COORD == "p" else LRS
-    n_expect = len(ARMS) * len(_first) * len(SCALINGS) * len(CLF_LRS)
-    ck(len(cs) == n_expect,
-       f"grid {GRID_NAME} is {len(ARMS)}x{len(_first)}x{len(SCALINGS)}x{len(CLF_LRS)} = {len(cs)} cells")
-    ck({"g1": 160, "g2": 140, "w1": 96}[GRID_NAME] == len(cs),
+    if IS_UNION:
+        n_expect = sum(len(_cells_of(g)) for _n, g in member_grids())
+        ck(len(cs) == n_expect,
+           f"union {GRID_NAME} is the sum of its blocks = {len(cs)} cells")
+    else:
+        n_expect = len(ARMS) * len(_first) * len(SCALINGS) * len(CLF_LRS)
+        ck(len(cs) == n_expect,
+           f"grid {GRID_NAME} is {len(ARMS)}x{len(_first)}x{len(SCALINGS)}"
+           f"x{len(CLF_LRS)} = {len(cs)} cells")
+    ck({"g1": 160, "g2": 140, "w1": 96, "w2": 192, "wave": 288}[GRID_NAME] == len(cs),
        f"{GRID_NAME} has its declared cell count")
-    ck(len(axes()) == 3 and all(len(a[2]) > 0 for a in axes()),
-       f"{GRID_NAME} declares 3 non-empty axes: {[a[0] for a in axes()]}")
-    ck(all(a[1] in cs[0] for a in axes()),
-       "every declared axis key exists on a cell (the reader indexes cells by it)")
+    if not IS_UNION:
+        ck(len(axes()) == 3 and all(len(a[2]) > 0 for a in axes()),
+           f"{GRID_NAME} declares 3 non-empty axes: {[a[0] for a in axes()]}")
+        ck(all(a[1] in cs[0] for a in axes()),
+           "every declared axis key exists on a cell (the reader indexes cells by it)")
+    else:
+        # ⛔ A UNION IS A READING VIEW. Prove it cannot be mistaken for a run target,
+        #   in both directions: it refuses a canary, and its members do not.
+        try:
+            canary_indices(); ck(False, "CONTROL: a union refuses to pick a canary")
+        except SystemExit:
+            ck(True, "CONTROL: a union refuses to pick a canary (it is not a run target)")
+        ck(all(len(_cells_of(g)) > 0 for _n, g in member_grids()),
+           "...and every member block is itself enumerable")
     # ⛔ THE GRIDS MUST NOT SILENTLY BECOME THE SAME GRID, and g2 exists only because
     #   g1's optimum sat on its scaling edge -- so assert the extension is real.
     ck(max(G2["scalings"]) >= 10 * max(G1["scalings"]),
@@ -423,11 +553,51 @@ def selftest():
        f"g1 and g2 share exactly {len(_g1 & _g2)} cells, which resume for free")
     ids = [cell_id(c) for c in cs]
     ck(len(set(ids)) == len(ids), "every cell id is unique")
+
+    # ------------------------------------------------------------------
+    # ⭐⭐ THE BUDGET-EQUALISATION GATE. Runs under EVERY grid, because it is a
+    #   statement about the whole planner, not about the one that is selected.
+    #   `[Dodge et al., EMNLP 2019 §6]`: an unequal search budget makes a
+    #   large-budget win unattributable. This asserts the asymmetry is gone.
+    # ------------------------------------------------------------------
+    B = budget_per_arm()
+    fft = [B[a] for a in FFT_ARMS]
+    wav = [B[a] for a in WAVE_ARMS]
+    ck(len(set(fft)) == 1 and len(set(wav)) == 1,
+       f"each family's arms are searched equally ({FFT_ARMS}={fft}, {WAVE_ARMS}={wav})")
+    ck(min(wav) >= max(fft),
+       f"⭐ WaveFT's budget {min(wav)}/arm is >= FourierFT's {max(fft)}/arm "
+       f"-- the countable asymmetry is removed (and overshooting is the "
+       f"CONSERVATIVE direction for the standing result)")
+    ck(min(wav) <= max(fft) * 1.1,
+       f"...and it does not OVERSHOOT materially ({min(wav)} vs {max(fft)}, "
+       f"{min(wav)/max(fft):.3f}x) -- a budget advantage is the same defect mirrored")
+    # ⛔ w2 must be all-new cells, or the budget does not actually rise.
+    _w1 = {cell_id(c) for c in _cells_of(W1)}
+    _w2 = {cell_id(c) for c in _cells_of(W2)}
+    ck(not (_w1 & _w2),
+       f"w1 and w2 are DISJOINT -- all {len(_w2)} w2 cells are new budget, none resume")
+    ck(not (set(W1["p_mults"]) & set(W2["p_mults"])),
+       "...enforced on the P axis itself, not just on whole cells")
+    ck(set(W1["clf_lrs"]) < set(W2["clf_lrs"]) == set(G1["clf_lrs"]),
+       "w2 restores g1's FULL four-value classifier_lr axis, which w1 never had")
+    _u = sorted({c["scaling"] for c in _cells_of(WAVE_ALL)})
+    _r = {round(_u[i+1] / _u[i], 6) for i in range(len(_u) - 1)}
+    ck(_r == {2.0}, f"the union scaling ladder is uniform ratio 2 ({_u})")
+    ck(len(_cells_of(WAVE_ALL)) == len(_w1) + len(_w2),
+       "the union view enumerates every member cell exactly once")
+    try:
+        axes_of(WAVE_ALL); ck(False, "CONTROL: a union refuses a single axis set")
+    except SystemExit:
+        ck(True, "CONTROL: a union refuses a single axis set (it is two blocks)")
     # --- the canary: one cell per arm, CENTRAL on every axis, derived from the grid
-    ci = canary_indices(ids)
-    ck(len(ci) == len(ARMS) and len(set(ci)) == len(ci),
+    #   (⛔ a union view has none, by design -- that control fires above)
+    ci = [] if IS_UNION else canary_indices(ids)
+    if IS_UNION:
+        ck(True, "the union view has no canary (checked above); skipping canary asserts")
+    ck(IS_UNION or (len(ci) == len(ARMS) and len(set(ci)) == len(ci)),
        f"the canary is {len(ARMS)} distinct cells, one per arm")
-    ck([parse_cell_id(ids[i])["arm"] for i in ci] == list(ARMS),
+    ck(IS_UNION or [parse_cell_id(ids[i])["arm"] for i in ci] == list(ARMS),
        "...one per ARM, in arm order (the stock-PEFT / second code path is covered)")
     for i in ci:
         cc = parse_cell_id(ids[i])
@@ -445,7 +615,8 @@ def selftest():
         ck(True, "CONTROL: an unknown cell id is refused")
 
     # --- the reference points must be reachable, or the search cannot speak to them
-    ck(5e-3 in CLF_LRS, "the carried classifier_lr 5e-3 is on the grid")
+    ck(5e-3 in (CLF_LRS or {c["classifier_lr"] for c in cs}),
+       "the carried classifier_lr 5e-3 is on the grid")
     PT = FP.port()
     if COORD == "lr":
         dl = PT["targets"][TARGETS]["arms"]["fftm"]["derived_lr"]
@@ -475,11 +646,17 @@ def selftest():
         ck(abs(tgt["wave1"]["atom_median"] / tgt["wave1"]["scale"]
                - tgt["wave2"]["atom_median"] / tgt["wave2"]["scale"]) < 1e-15,
            "the two arms share atom/scale at the target width (atom is mu-INDEPENDENT)")
-        ck(1.0 in P_MULTS, "P/P_ref = 1 (RoBERTa's own tuned step) is ON the ladder")
-        ck(6.0 in P_MULTS,
+        # ⛔ THE ANCHORS ARE A PROPERTY OF THE WHOLE WaveFT SEARCH, NOT OF ONE BLOCK.
+        #   w2 is an INTERLEAVE and deliberately shares no value with w1, so asserting
+        #   "P=1 is on the ladder" against w2 alone fails for the very reason w2 is
+        #   correct. Check the union, whichever wave grid is selected.
+        UP = sorted({c["p_mult"] for c in _cells_of(WAVE_ALL)})
+        US = sorted({c["scaling"] for c in _cells_of(WAVE_ALL)})
+        ck(1.0 in UP, "P/P_ref = 1 (RoBERTa's own tuned step) is ON the WaveFT ladder")
+        ck(6.0 in UP,
            "P/P_ref = 6 (FourierFT's MEASURED gemma inflation) is ON the ladder")
-        ck(min(P_MULTS) < 6.0 < max(P_MULTS),
-           "...and it is INTERIOR, so the prediction can be falsified by this grid")
+        ck(min(UP) < 6.0 < max(UP),
+           "...and it is INTERIOR, so the prediction can be falsified by this search")
         # ⭐ the coordinate itself is checked against the port's own derived lr*:
         #   at the reference scale, P/P_ref = 1 MUST reproduce derived_lr exactly.
         for a in ARMS:
@@ -487,19 +664,19 @@ def selftest():
             ck(abs(lr_for(1.0, sc) - tgt[a]["derived_lr"]) < 1e-9,
                f"{a}: P/P_ref=1 at scale {sc:g} reproduces the port's lr* "
                f"{tgt[a]['derived_lr']:.6g}")
-        ck(int(ref["wave1"]["scale"]) in SCALINGS,
-           "wave1's own RoBERTa-tuned scaling (75) is on the scaling axis")
-        ck(min(SCALINGS) < ref["wave2"]["scale"] < max(SCALINGS),
-           "wave2's RoBERTa-tuned scaling (150) is BRACKETED by the axis")
+        ck(int(ref["wave1"]["scale"]) in US,
+           "wave1's own RoBERTa-tuned scaling (75) is on the scaling ladder")
+        ck(int(ref["wave2"]["scale"]) in US,
+           "wave2's own RoBERTa-tuned scaling (150) is too (w2 added it)")
         # ⛔ THE FAILURE THIS GRID EXISTS TO NOT REPEAT: [R.271]/[R.280] left BOTH
         #   WaveFT arms at the TOP of BOTH RTE ladders, as lower bounds. Require
         #   real margin above the prediction, not one token rung.
-        ck(max(P_MULTS) / 6.0 >= 5.0,
-           f"the P ladder runs >=5x PAST the prediction (to {max(P_MULTS):g}x) -- "
+        ck(max(UP) / 6.0 >= 5.0,
+           f"the P ladder runs >=5x PAST the prediction (to {max(UP):g}x) -- "
            f"[R.271] ran off the top of its ladder and was never bracketed")
-        ck(max(SCALINGS) / max(ref[a]["scale"] for a in ARMS) >= 30,
-           "the scaling axis runs >=30x past the RoBERTa-tuned scale")
-        ck(min(P_MULTS) < 1.0, "there is a rung BELOW RoBERTa's step (the floor anchor)")
+        ck(max(US) / max(ref[a]["scale"] for a in ARMS) >= 30,
+           "the scaling ladder runs >=30x past the RoBERTa-tuned scale")
+        ck(min(UP) < 1.0, "there is a rung BELOW RoBERTa's step (the floor anchor)")
         # ⛔ a P grid must not silently become an lr grid
         ck(all("p_mult" in c for c in cs), "every w1 cell carries its P multiplier")
         ck(len({c["lr"] for c in cs}) > len(P_MULTS),
@@ -633,6 +810,23 @@ def main():
         print(f"grid digest {digest()}  |  {len(cs)} cells  |  task {TASK}  "
               f"targets {TARGETS}  epochs {EPOCHS}  seed {SEED}")
         print(f"  arms          : {', '.join(arms or ARMS)}")
+        if IS_UNION:
+            print(f"  ⚠ UNION VIEW of {', '.join(_G['union'])} -- a reading view, NOT a run "
+                  f"target. Two disjoint factorial BLOCKS, not one factorial.")
+            for n, g in member_grids():
+                print(f"    {n}: " + "  ".join(f"{lab}={v}" for lab, _k, v in axes_of(g))
+                      + f"   ({len(_cells_of(g))} cells)")
+            for lab, key, _ in axes_of(GRIDS[_G["union"][0]]):
+                u = sorted({c[key] for c in cs})
+                r = [u[i+1]/u[i] for i in range(len(u)-1)]
+                print(f"  union {lab:14s}: {u}"
+                      + (f"   ratio {min(r):.2f}-{max(r):.2f}, span {u[-1]/u[0]:.0f}x" if r else ""))
+            per = len(cs) // max(1, len(arms or ARMS))
+            print(f"  ⭐ budget: {len(cs)} cells = {per} per arm")
+            print(f"  steps per cell: {steps_per_cell()}  "
+                  f"(mrpc train 3,668 / batch {FP.BATCH} x {EPOCHS} epochs)")
+            print(f"  warmup        : {FP.warmup_for(TASK, EPOCHS)} steps (RTE's ratio, MRPC's steps)")
+            return
         if COORD == "p":
             # ⭐ Print the DERIVED lr for every cell of the plane. The swept knob is
             #   P; lr is what actually reaches the command line, and a reader who

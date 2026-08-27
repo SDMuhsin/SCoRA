@@ -160,10 +160,29 @@ def report(run_root, arms=None, top=15):
     #   edge" is true by construction there and carries no information. Flagging it
     #   anyway would fire on EVERY run of a 2-value axis and train the reader to skim
     #   past the one warning that matters. Say it is untestable instead.
-    # ⛔ THE AXES COME FROM THE GRID, NOT FROM THIS FILE. w1 sweeps P = lr*atom and
-    #   DERIVES lr, so lr takes one value per (P, scaling) pair -- 24 of them -- and
-    #   an edge test on it would be meaningless. H.axes() is the single declaration.
-    for name, key, axis in H.axes():
+    # ⛔ THE AXES COME FROM THE GRID, NOT FROM THIS FILE. w1/w2 sweep P = lr*atom and
+    #   DERIVE lr, so lr takes one value per (P, scaling) pair and an edge test on it
+    #   would be meaningless. H.axes() is the single declaration.
+    # ⛔⛔ AND A UNION VIEW IS NOT ONE FACTORIAL. `wave` is w1 and w2, two DISJOINT
+    #   blocks; the union axes have combinations no cell covers, so a min/max test
+    #   over them would assert a bracketing the design does not have. The edge test
+    #   runs against the block the winner actually came from, and says which.
+    if H.IS_UNION:
+        blocks = [(n, g) for n, g in H.member_grids()
+                  if best in {H.cell_id(c) for c in H._cells_of(g)}]
+        if len(blocks) != 1:
+            lines.append(f"  ⛔ the best cell maps to {len(blocks)} blocks -- the union "
+                         f"members are not disjoint; the edge test is not defined")
+            return lines
+        bname, bgrid = blocks[0]
+        the_axes = H.axes_of(bgrid)
+        lines.append(f"  ⚠ UNION of {', '.join(n for n, _ in H.member_grids())} "
+                     f"({len(want)} cells, {len(want)//len(H.ARMS)} per arm). The best cell "
+                     f"is in block **{bname}**; edges are tested against THAT block, "
+                     f"because the union is two disjoint factorials, not one.")
+    else:
+        the_axes = H.axes()
+    for name, key, axis in the_axes:
         val = bc[key]
         if len(set(axis)) < 3:
             untestable.append(f"{name} ({len(set(axis))} values)")
@@ -248,13 +267,15 @@ def selftest():
         def _mid(axis):
             vs = sorted(set(axis))
             return vs[len(vs) // 2] if len(vs) >= 3 else vs[0]
-        want = {k: _mid(v) for _n, k, v in H.axes()}
+        _ax = H.axes_of(H.member_grids()[0][1]) if H.IS_UNION else H.axes()
+        want = {k: _mid(v) for _n, k, v in _ax}
         interior = next(c for c in cs if all(c[k] == v for k, v in want.items()))
         write(H.cell_id(interior), 0.999)
         L = report(d)
         ck(any("INTERIOR on every testable axis" in l for l in L),
            "CONTROL: an interior optimum is NOT flagged (the check can pass)")
-        if len(set(H.CLF_LRS)) < 3:
+        _clf = H.CLF_LRS or [v for _n, k, v in _ax if k == "classifier_lr"][0]
+        if len(set(_clf)) < 3:
             ck(any("no interior to test on" in l for l in L),
                "a <3-value axis is declared untestable, not silently flagged as an edge")
     finally:
