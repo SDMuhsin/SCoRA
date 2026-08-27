@@ -267,6 +267,19 @@ def t_sweep_status_sees_a_killed_cell():
             capture_output=True, text=True, cwd=ROOT).stdout.strip()
         check("--status runs on an empty sweep root", f"cells: {n_cells}" in r0.stdout,
               r0.stdout + r0.stderr)
+        # ⛔ ONE ROOT HOLDS EVERY GRID'S CELLS. A done marker for a cell that is NOT in
+        #   the current grid must not be counted: the bare count printed
+        #   "done: 160 / 140" -- more than 100% -- the first time a second grid was
+        #   submitted. Plant a foreign marker and prove it lands in the side-note.
+        open(os.path.join(root, "done", "mrpc-fftm-q_o-lrNOTAGRIDCELL-seed42"), "w").write("9")
+        rF = sh('bash sbatch/fir/04_hp_sweep.sh --status',
+                env={"FIR_SCRATCH_ROOT": tmp, "FIR_LOGGING": "1",
+                     "FIR_COLLECT_DIR": os.path.join(tmp, "collected")})
+        check("a done marker from ANOTHER grid is not counted as progress",
+              f"cells: {n_cells}   done: 0" in rF.stdout, rF.stdout)
+        check("...but it IS reported, not hidden",
+              "from other grids in this root" in rF.stdout, rF.stdout)
+        os.remove(os.path.join(root, "done", "mrpc-fftm-q_o-lrNOTAGRIDCELL-seed42"))
         check("CONTROL: nothing is reported as killed before anything starts",
               "STARTED AND NEVER FINISHED" not in r0.stdout, r0.stdout)
 
