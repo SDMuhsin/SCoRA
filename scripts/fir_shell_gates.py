@@ -310,10 +310,67 @@ def t_sweep_status_sees_a_killed_cell():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+
+def _grids():
+    r = subprocess.run([VENV_PY if os.path.exists(VENV_PY) else sys.executable, "-c",
+                        "import sys;sys.path.insert(0,'scripts');import fir_hp_plan as H;"
+                        "print(' '.join(sorted(H.GRIDS)))"],
+                       capture_output=True, text=True, cwd=ROOT)
+    return r.stdout.split()
+
+
+def t_sweep_submit_plan_is_computable_for_every_grid():
+    """⭐ THE SUBMIT PATH, EXERCISED LOCALLY, ON EVERY GRID.
+
+    ⛔ Until --dry-run existed, everything between "parse the flags" and "call
+      sbatch" -- the canary picker and the resume spec -- could only be tested by
+      submitting a job on fir. Both had already broken that way: the picker
+      hardcoded knob values that stopped existing when the grid changed, and the
+      resume spec re-queued finished cells, each allocating an H100 to skip.
+      ⇒ every grid this repo can select is planned here, on this box.
+
+    Both directions: a canary must name exactly ONE cell per arm, and a resume must
+    submit only the cells with no done marker -- proven by planting one."""
+    for g in _grids():
+        tmp = tempfile.mkdtemp()
+        try:
+            env = {"FIR_SCRATCH_ROOT": tmp, "FIR_LOGGING": "1", "FIR_HP_GRID": g,
+                   "FIR_COLLECT_DIR": os.path.join(tmp, "collected")}
+            n_arms = subprocess.run(
+                [VENV_PY if os.path.exists(VENV_PY) else sys.executable, "-c",
+                 "import sys;sys.path.insert(0,'scripts');import fir_hp_plan as H;"
+                 "print(len(H.ARMS))"], capture_output=True, text=True, cwd=ROOT).stdout.strip()
+            rc = sh(f'bash sbatch/fir/04_hp_sweep.sh --dry-run --canary 2', env=env)
+            spec = [l for l in rc.stdout.splitlines() if l.startswith("DRY RUN: would submit")]
+            check(f"[{g}] the canary plan is computable off-cluster",
+                  bool(spec) and rc.returncode == 0, rc.stdout + rc.stderr)
+            idx = spec[0].split("array=")[1].split()[0] if spec else ""
+            check(f"[{g}] the canary is exactly one cell per arm ({n_arms})",
+                  len([x for x in idx.split(",") if x]) == int(n_arms), idx)
+            check(f"[{g}] ...and it names the grid it planned",
+                  f"grid {g}," in spec[0] if spec else False, spec)
+
+            # ⛔ RESUME: plant a done marker for cell 0 and prove it is NOT submitted.
+            root = os.path.join(tmp, "runs", "hpsweep")
+            cid = open(os.path.join(root, "cells.txt")).read().split("\n")[0]
+            open(os.path.join(root, "done", cid), "w").write("100")
+            rr = sh('bash sbatch/fir/04_hp_sweep.sh --dry-run', env=env)
+            spec2 = [l for l in rr.stdout.splitlines() if l.startswith("DRY RUN: would submit")]
+            got = spec2[0].split("array=")[1].split("%")[0] if spec2 else ""
+            check(f"[{g}] a finished cell is NOT re-queued (index 0 dropped)",
+                  bool(spec2) and not got.startswith("0-") and not got.startswith("0,"),
+                  rr.stdout + rr.stderr)
+            check(f"[{g}] CONTROL: the rest of the grid still IS queued",
+                  got.startswith("1-"), got)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     for t in (t_syntax, t_nousersite_exported, t_assert_in_venv, t_stage_callsites,
               t_no_bare_python, t_env_gate_location_check, t_provenance,
-              t_sweep_status_sees_a_killed_cell):
+              t_sweep_status_sees_a_killed_cell,
+              t_sweep_submit_plan_is_computable_for_every_grid):
         t()
     print(f"selftest: {_P[0]} passed, {_P[1]} failed")
     return 1 if _P[1] else 0

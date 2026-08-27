@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.join(ROOT, "scripts"))
 import fir_hp_plan as H                                                # noqa: E402
 import fir_preflight_arms as PA                                        # noqa: E402
 
-# the per-module budget every FourierFT arm trains (n_frequency / k = 256)
+# the per-module budget every arm in a sweep grid trains (n_frequency / k = 256)
 K = 256
 
 
@@ -31,6 +31,18 @@ def verify_receipts(text, cell):
     same way stage D derives it -- (trainable - head) / K -- and the head is
     gemma's `score`, 4,096.  Both numbers are MEASURED on this backbone
     (preflight_56905037/56922969) and asserted, not assumed."""
+    # ⛔ THE BUDGET MODEL IS PER-ARM, AND (trainable - head)/256 IS ONLY RIGHT FOR
+    #   ARMS WITH MULTIPLIER 1. LoCA trains 256 coefficients AND a 2x256 location
+    #   tensor per module (x3, [measured] 31,744 on gemma) -- it is not in any grid
+    #   today, but "not today" is not a check. Fail closed rather than divide by the
+    #   wrong budget and report a plausible module count.
+    if not cell or not cell.get("arm"):
+        return False, "no cell given -- the budget model is PER-ARM and cannot be guessed"
+    mult = PA.LOCATION_MULTIPLIER.get(cell["arm"], 1)
+    if mult != 1:
+        return False, (f"{cell['arm']} trains {mult}x the coefficient budget "
+                       f"(it also trains LOCATIONS); this cell-local derivation "
+                       f"assumes multiplier 1 -- teach it the arm before sweeping it")
     r = PA.parse_receipts(text)
     tr = r.get("trainable")
     if not tr:
@@ -94,12 +106,27 @@ def selftest():
 
     real = ("INFO - __main__ - SLR target modules: ['q_proj', 'o_proj']\n"
             "trainable params: 13,312 || all params: 2,506,185,728 || trainable%: 0.0005\n")
-    good, note = verify_receipts(real, None)
+    W1 = {"arm": "wave1"}                     # multiplier 1, like every grid arm
+    good, note = verify_receipts(real, W1)
     ck(good, f"the REAL preflight receipt passes ({note})")
 
     # stock PEFT prints no module count -- it must still pass, by derivation
     ck(verify_receipts("trainable params: 13,312 || all params: 2,506,189,824 || x\n",
-                       None)[0], "fftstock's count-free receipt passes by derivation")
+                       {"arm": "fftstock"})[0],
+       "fftstock's count-free receipt passes by derivation")
+    # ⭐ WaveFT: mu costs ZERO parameters, so mu=1 and mu=2 train the SAME 9,216 and
+    #   the same derivation holds for both -- asserted, because it is the premise of
+    #   letting the wave arms through this check at all.
+    for a in ("wave1", "wave2"):
+        ck(verify_receipts(real, {"arm": a})[0], f"{a}: the same 13,312 receipt passes "
+                                                 f"(mu costs no parameters)")
+    # ⛔ CONTROL: an arm with a LOCATION budget must be REFUSED, not divided wrongly
+    okl, notel = verify_receipts("trainable params: 31,744 || all params: 2,506,204,160 || x\n",
+                                 {"arm": "loca"})
+    ck(not okl and "LOCATIONS" in notel,
+       "CONTROL: a multiplier-3 arm (loca) is REFUSED by the cell-local derivation")
+    ck(not verify_receipts(real, None)[0],
+       "CONTROL: no cell at all is refused (the budget model is per-arm)")
 
     for label, text in (
         ("the adapter attaching to NOTHING (head trains alone)",
@@ -112,7 +139,11 @@ def selftest():
         ("a logged count that contradicts the derived one",
          "SLR: adapted 18 modules\ntrainable params: 13,312 || all params: 2,5 || x\n"),
     ):
-        ck(not verify_receipts(text, None)[0], f"CONTROL: FIRES on {label}")
+        # ⛔ PASS A REAL CELL. These controls used `None`, and the moment the
+        #   per-arm budget guard landed, `None` was refused for the WRONG reason --
+        #   every one of them would have passed vacuously while testing nothing.
+        okc, notec = verify_receipts(text, W1)
+        ck(not okc and "no cell given" not in notec, f"CONTROL: FIRES on {label}")
 
     ck(H.parse_cell_id(H.cell_id(H.cells()[0])) is not None, "a cell id round-trips")
 
