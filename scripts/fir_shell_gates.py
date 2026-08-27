@@ -336,6 +336,24 @@ def t_sweep_submit_plan_is_computable_for_every_grid():
         try:
             env = {"FIR_SCRATCH_ROOT": tmp, "FIR_LOGGING": "1", "FIR_HP_GRID": g,
                    "FIR_COLLECT_DIR": os.path.join(tmp, "collected")}
+            is_union = subprocess.run(
+                [VENV_PY if os.path.exists(VENV_PY) else sys.executable, "-c",
+                 "import sys;sys.path.insert(0,'scripts');import fir_hp_plan as H;"
+                 "print(int(H.IS_UNION))"], capture_output=True, text=True,
+                cwd=ROOT, env=dict(os.environ, FIR_HP_GRID=g)).stdout.strip() == "1"
+            if is_union:
+                # ⛔ A UNION IS A READING VIEW, AND THE SUBMIT PATH MUST REFUSE IT.
+                #   Both directions matter: the plain grids above prove the path
+                #   WORKS, this proves it FAILS CLOSED on a view that has no canary
+                #   and no single axis set. A submit that quietly picked a member
+                #   would run 288 cells nobody asked for.
+                rc = sh('bash sbatch/fir/04_hp_sweep.sh --dry-run --canary 2', env=env)
+                out = rc.stdout + rc.stderr
+                check(f"[{g}] CONTROL: a union view REFUSES to plan a submit",
+                      rc.returncode != 0 and "READING VIEW" in out, out)
+                check(f"[{g}] ...and nothing is submitted",
+                      "would submit" not in out, out)
+                continue
             n_arms = subprocess.run(
                 [VENV_PY if os.path.exists(VENV_PY) else sys.executable, "-c",
                  "import sys;sys.path.insert(0,'scripts');import fir_hp_plan as H;"

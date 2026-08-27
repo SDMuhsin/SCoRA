@@ -233,10 +233,55 @@ planner refuses an unknown name.
 |---|---|---|---|---|
 | `g1` | `fftm`, `fftstock` | 5 `lr` × 4 `scaling` × 4 `classifier_lr` | 160 | ✅ complete, 16.3 GPU-h |
 | **`g2`** *(default)* | `fftm`, `fftstock` | 7 `lr` × 5 `scaling` × 2 `classifier_lr` | 140 | ✅ **complete**, 140/140 |
-| **`w1`** | `wave1`, `wave2` | 6 `P/P_ref` × 4 `scaling` × 2 `classifier_lr` | 96 | ⏳ canary green, **94 left** |
+| **`w1`** | `wave1`, `wave2` | 6 `P/P_ref` × 4 `scaling` × 2 `classifier_lr` | 96 | ✅ **complete**, 96/96 |
+| **`w2`** | `wave1`, `wave2` | 6 `P/P_ref` × 4 `scaling` × 4 `classifier_lr` | 192 | ⏳ **not yet run** — the budget equaliser |
+| `wave` | — | ⚠ **reading view only**: the union `w1 ∪ w2` | 288 | refuses to submit |
 
 All of them: **MRPC**, `q_o`, **1 seed (42)**, **5 epochs** (575 steps/cell), one Slurm array, one
 cell per task. Print any of them with `FIR_HP_GRID=<g> env/bin/python scripts/fir_hp_plan.py --show`.
+
+### 7.1b ⭐⭐ `w2` — the budget equaliser. Read this before quoting any WaveFT-vs-FourierFT number.
+
+`[measured]` FourierFT was searched over **142 distinct cells per arm** on this cell (`g1`'s 80 +
+`g2`'s 70, 8 shared); `w1` gave WaveFT **48**. A **2.96× search advantage, in FourierFT's favour.**
+`[Dodge et al., EMNLP 2019 §6]` is explicit that the *direction* decides what can be claimed:
+
+> "if a model with a small budget outperforms a model with a large budget, increasing the small
+> budget will not change this conclusion. However, if a model with a large budget outperforms a model
+> with a small budget, the difference might be due to the model or the budget (or both)."
+
+Ours was the second case, so the 0.8904-vs-0.8873 gap was **unattributable**. `w2` adds **96 cells per
+arm ⇒ 144/arm**, against FourierFT's 142.
+
+⚠ **Equal counts are still not sufficient**, and the same section says so: *"fixing the same number of
+hyperparameter trials for both models does not imply a fair comparison"* — the spaces differ, and
+`w1`'s bounds were themselves chosen *using* `g1`/`g2`'s results, which is borrowed effort in
+WaveFT's favour that cannot be netted off. `w2` removes the asymmetry that is **countable**.
+
+**Where the cells go, and why not somewhere easier.** They are spent the way FourierFT's were, not
+where they would most help: `g1` gave FourierFT a broad plane × **four** `classifier_lr` values, and
+`w1` has only ever had two — so `w2` restores `g1`'s full four-value axis, on a plane that
+**interleaves** `w1`'s:
+
+```
+P/P_ref   w1 {0.5, 1, 2.5, 6, 15, 38} + w2 {0.3, 0.7, 1.6, 4, 10, 24}  -> ratio ~1.55, span 127x
+scaling   w1 {75, 300, 1200, 4800}    + w2 {150, 600, 2400, 9600}      -> ratio EXACTLY 2, span 128x
+clf_lr    w1 {5e-4, 5e-3}             + w2 {5e-4, 2e-3, 5e-3, 2e-2}    (= g1's axis, restored)
+```
+
+⛔ The two `P` axes are **disjoint by construction**, so every `w2` cell is new budget and none
+resume a `w1` marker for free. A selftest asserts the disjointness, the uniform ratio-2 union ladder,
+and — the point of the whole exercise — that **the wave family ends with ≥ the fft family's cells per
+arm** (`budget_per_arm()`). ⚠ It overshoots by 2 cells (144 vs 142); that is the **conservative**
+direction, since a FourierFT win while holding the *smaller* budget is the attributable case above.
+
+⚠ **I am not claiming this buys a better optimum.** At one seed, cells 1.55× apart in `P` differ by
+less than the seed noise `[R.273]`, so most of what a denser search buys is **selection inflation** —
+which is precisely what FourierFT's extra 94 cells bought it, and precisely what equalising removes.
+
+⭐ **`FIR_HP_GRID=wave` is a READING VIEW** for the combined 288-cell search. It is a union of two
+disjoint factorial **blocks**, not one factorial, so the reader tests edges against whichever block
+the winning cell came from and says which; and it **refuses to submit or pick a canary**.
 
 ### 7.2 ⭐ `w1` sweeps a DIFFERENT COORDINATE — read this before reading its table
 
