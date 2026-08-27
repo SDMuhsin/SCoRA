@@ -107,14 +107,23 @@ fi
 # ===========================================================================
 env/bin/python scripts/fir_hp_plan.py --list > "$SWEEP_ROOT/cells.txt" || exit 1
 TOTAL=$(wc -l < "$SWEEP_ROOT/cells.txt")
-NDONE=$(find "$SWEEP_ROOT/done" -type f 2>/dev/null | wc -l)
-NFAIL=$(find "$SWEEP_ROOT/fail" -type f 2>/dev/null | wc -l)
+# ⛔ COUNT ONLY THE MARKERS THAT BELONG TO *THIS* GRID. One sweep root holds every
+#   grid's cells (deliberately -- shared cells resume for free), so a bare count of
+#   done/ reported `done: 160 / 140` the first time g2 was submitted: more than
+#   100% complete, before a single g2 cell had run. The ARRAY SPEC was right all
+#   along -- it filters by cell id -- but a status line that cannot be true is a
+#   status line nobody can use.
+NDONE_ALL=$(find "$SWEEP_ROOT/done" -type f 2>/dev/null | wc -l)
+NDONE=$(ls "$SWEEP_ROOT/done" 2>/dev/null | grep -Fxf "$SWEEP_ROOT/cells.txt" 2>/dev/null | wc -l)
+NFAIL=$(ls "$SWEEP_ROOT/fail" 2>/dev/null | grep -Fxf "$SWEEP_ROOT/cells.txt" 2>/dev/null | wc -l)
+NOTHER=$((NDONE_ALL - NDONE))
 if $STATUS; then
     fir_print_provenance
     echo "grid: $GRID_NAME    sweep root: $SWEEP_ROOT"
     echo "cells: $TOTAL   done: $NDONE   failed: $NFAIL   remaining: $((TOTAL - NDONE))"
+    [ "$NOTHER" -gt 0 ] && echo "  (+$NOTHER done markers from other grids in this root -- not counted above)"
     if [ "$NDONE" -gt 0 ]; then
-        echo "--- measured per-cell wall-clock (seconds) ---"
+        echo "--- measured per-cell wall-clock (seconds, EVERY grid in this root) ---"
         cat "$SWEEP_ROOT"/done/* 2>/dev/null | sort -n | awk '
             {a[NR]=$1; s+=$1}
             END {printf "  n=%d  min=%d  median=%d  max=%d  mean=%.0f\n",
@@ -188,6 +197,7 @@ env/bin/python scripts/fir_hp_plan.py --show
 echo
 echo "  sweep root : $SWEEP_ROOT"
 echo "  done       : $NDONE / $TOTAL   (failed so far: $NFAIL)"
+[ "$NOTHER" -gt 0 ] && echo "               +$NOTHER cells done under ANOTHER grid in this root"
 
 # ⭐ THE ARRAY INDEXES cells.txt, and cells.txt is REGENERATED from the planner
 #   every submit. The planner's order is deterministic and selftested, so an index
