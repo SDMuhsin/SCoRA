@@ -148,18 +148,27 @@ def report(run_root, arms=None, top=15):
     #   that is a finding about the SEARCH, not about the method.
     best = rank[0]
     bc = H.parse_cell_id(best)
-    edges = []
-    if bc["lr"] in (min(H.LRS), max(H.LRS)):
-        edges.append(f"lr={bc['lr']:g} is at the grid EDGE")
-    if bc["scaling"] in (min(H.SCALINGS), max(H.SCALINGS)):
-        edges.append(f"scaling={bc['scaling']:g} is at the grid EDGE")
-    if bc["classifier_lr"] in (min(H.CLF_LRS), max(H.CLF_LRS)):
-        edges.append(f"classifier_lr={bc['classifier_lr']:g} is at the grid EDGE")
+    edges, untestable = [], []
+    # ⛔ AN AXIS WITH FEWER THAN 3 VALUES HAS NO INTERIOR, so "the optimum is at the
+    #   edge" is true by construction there and carries no information. Flagging it
+    #   anyway would fire on EVERY run of a 2-value axis and train the reader to skim
+    #   past the one warning that matters. Say it is untestable instead.
+    for name, val, axis in (("lr", bc["lr"], H.LRS),
+                            ("scaling", bc["scaling"], H.SCALINGS),
+                            ("classifier_lr", bc["classifier_lr"], H.CLF_LRS)):
+        if len(set(axis)) < 3:
+            untestable.append(f"{name} ({len(set(axis))} values)")
+        elif val in (min(axis), max(axis)):
+            edges.append(f"{name}={val:g} is at the grid EDGE")
     if edges:
         lines.append("  ⛔ " + "; ".join(edges) +
                      " -- the optimum may lie OUTSIDE this grid. Widen before quoting it.")
     else:
-        lines.append("  ✅ the best cell is INTERIOR on every axis (the grid brackets it)")
+        lines.append("  ✅ the best cell is INTERIOR on every testable axis "
+                     "(the grid brackets it)")
+    if untestable:
+        lines.append(f"  ⚠ no interior to test on: {', '.join(untestable)} -- an axis with "
+                     f"<3 values cannot be bracketed, by construction.")
     return lines
 
 
@@ -190,7 +199,8 @@ def selftest():
         write(H.cell_id(cs[1]), 0.85)
         L = report(d)
         ck(any("INCOMPLETE" in l for l in L), "a partial grid is labelled INCOMPLETE")
-        ck(any("coverage: 2/160" in l for l in L), "coverage is counted and printed first")
+        ck(any(f"coverage: 2/{len(cs)}" in l for l in L),
+           "coverage is counted and printed first")   # ⚠ from the planner, not a literal
         ck(any(H.cell_id(cs[1]) in l for l in L), "the finished cells are still ranked")
         ck(any("ONE SEED" in l for l in L), "the one-seed caveat is printed with the table")
 
@@ -223,12 +233,22 @@ def selftest():
         # EDGE control: a winner on the boundary must be called out...
         write(H.cell_id(cs[0]), 0.99)                      # cs[0] is lr min, sc min, clr min
         ck(any("grid EDGE" in l for l in report(d)), "CONTROL: an edge optimum is flagged")
-        # ...and an interior winner must NOT be
-        interior = next(c for c in cs if c["lr"] == 0.5 and c["scaling"] == 142
-                        and c["classifier_lr"] == 5e-3)
+        # ...and an interior winner must NOT be. ⚠ Interior is computed FROM THE GRID
+        #   (a hardcoded point stopped existing the day the grid was replaced), and
+        #   only axes with >=3 values have an interior at all.
+        def _mid(axis):
+            vs = sorted(set(axis))
+            return vs[len(vs) // 2] if len(vs) >= 3 else vs[0]
+        interior = next(c for c in cs if c["lr"] == _mid(H.LRS)
+                        and c["scaling"] == _mid(H.SCALINGS)
+                        and c["classifier_lr"] == _mid(H.CLF_LRS))
         write(H.cell_id(interior), 0.999)
-        ck(any("INTERIOR on every axis" in l for l in report(d)),
+        L = report(d)
+        ck(any("INTERIOR on every testable axis" in l for l in L),
            "CONTROL: an interior optimum is NOT flagged (the check can pass)")
+        if len(set(H.CLF_LRS)) < 3:
+            ck(any("no interior to test on" in l for l in L),
+               "a <3-value axis is declared untestable, not silently flagged as an edge")
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
