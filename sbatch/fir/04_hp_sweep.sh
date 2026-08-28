@@ -1,6 +1,10 @@
 #!/bin/bash
 # ============================================================================
-# 04_hp_sweep.sh — the MRPC hyperparameter search for FourierFT on gemma-2b.
+# 04_hp_sweep.sh — the MRPC hyperparameter search on gemma-2b.  ONE script, MANY
+# grids: FIR_HP_GRID selects which.  ⛔ It is NOT forked per arm on purpose — this
+# is the one file in the tree with a local self-test (scripts/fir_shell_gates.py),
+# and five copies of it would be five copies of the resume, wall-kill-marker,
+# receipt and dry-run machinery, four of them untested.
 # ============================================================================
 #   bash sbatch/fir/04_hp_sweep.sh --canary 2      # ⭐ ALWAYS DO THIS FIRST
 #   bash sbatch/fir/04_hp_sweep.sh --time 01:30:00 # then the rest, sized from it
@@ -9,8 +13,14 @@
 #
 #   FIR_HP_GRID=w1 bash sbatch/fir/04_hp_sweep.sh --canary 2    # ⭐ the WaveFT grid
 #
-# ONE Slurm ARRAY, one cell per task, 160 cells (2 arms x 5 lr x 4 scaling x
-# 4 classifier_lr), MRPC, 1 seed, 5 epochs.  Grid: scripts/fir_hp_plan.py.
+# GRIDS (scripts/fir_hp_plan.py owns every ladder and its justification):
+#   g1 g2      FourierFT  — DONE, 142 cells/arm
+#   w1 w2      WaveFT     — DONE, 144 cells/arm     (`wave` = a READING VIEW of both)
+#   loca       LoCA       144   qwha  QWHA   144    lyra  LYRA  192
+#   scora      SCoRA      36    scora2 SCoRA-2 140  (ours — deliberately the smallest)
+#   wref       WaveFT at its own PUBLISHED point — 4 REF cells, no canary (no centre)
+#
+# ONE Slurm ARRAY, one cell per task.  MRPC, q_proj+o_proj, 1 seed (42), 5 epochs.
 #
 # ⛔⛔ IT IS BUILT ON THE ASSUMPTION THAT CELLS WILL FAIL.  [user, 2026-08-26:
 #    "don't make the same mistake of assuming all jobs will succeed"]
@@ -302,12 +312,17 @@ echo "watch:   squeue -j $jid"
 echo "status:  bash sbatch/fir/04_hp_sweep.sh --status"
 echo
 if [ "$P_CANARY" -gt 0 ]; then
-    echo "⛔ NEXT: when these two finish, run --status. It prints the MEASURED"
+    echo "⛔ NEXT: when the canary finishes, run --status. It prints the MEASURED"
     echo "   per-cell seconds. Size --time from the MAX plus headroom, then submit"
     echo "   the full array. Do NOT submit the grid against an unmeasured wall."
-    echo "   ⛔ A MEASUREMENT FROM ANOTHER ARM IS NOT A MEASUREMENT. [R.307] puts"
-    echo "      WaveFT train latency at 4.11-4.33 ms/module against FourierFT-"
-    echo "      merged 0.622 ms -- ~6.7x -- and [P.5-P.11] put the adapter at"
-    echo "      10-13%% of training wall-clock, so a WaveFT cell should land near"
-    echo "      1.7x a FourierFT one. g2 502 s max does NOT carry over."
+    echo "   ⛔ A MEASUREMENT FROM ANOTHER ARM IS NOT A MEASUREMENT — and neither is"
+    echo "      a PREDICTION from one. I predicted a WaveFT cell at ~1.7x a"
+    echo "      FourierFT one, extrapolating [R.307]'s 6.7x per-module latency"
+    echo "      ratio; [measured, 96 cells] it is 1.03x. ⭐ A per-module latency"
+    echo "      ratio measured on ANOTHER backbone does not give a per-cell"
+    echo "      wall-clock on this one — the adapter SHARE it multiplies is"
+    echo "      backbone-dependent. loca and qwha are structurally heavier and"
+    echo "      UNMEASURED here; size each grid from its OWN canary."
+    echo "   ⚠ And a 2-cell canary sizes a WALL, it does not estimate a"
+    echo "      DISTRIBUTION: the WaveFT canary said 1.22x, 96 cells said 1.03x."
 fi
