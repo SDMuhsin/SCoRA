@@ -180,6 +180,21 @@ def report(run_root, arms=None, top=15):
                      f"({len(want)} cells, {len(want)//len(H.ARMS)} per arm). The best cell "
                      f"is in block **{bname}**; edges are tested against THAT block, "
                      f"because the union is two disjoint factorials, not one.")
+    elif H._G.get("published_point"):
+        # ⛔ A REF BLOCK HAS NO INTERIOR AND NO EDGES. "The optimum is at the edge"
+        #   is not false here, it is MEANINGLESS: there is one point, chosen by the
+        #   arm's authors, and the only question this block answers is what it
+        #   scores. Reporting an edge warning would train the reader to skim past
+        #   the warning that matters, exactly as the <3-values case does.
+        c0 = H.cells()[0]
+        lines.append(f"  ⚠ REF BLOCK -- these cells sit at WaveFT's OWN PUBLISHED point "
+                     f"(lambda {H.PUBLISHED_WAVEFT['atom']:g}, lr "
+                     f"{H.PUBLISHED_WAVEFT['lr']:g}; P/P_ref {c0['p_mult']:.4g}), which is "
+                     f"OUTSIDE the w1/w2 ladders [R.258]. There is nothing to bracket: "
+                     f"read these as 'what the published configuration scores here', "
+                     f"NOT as a search result, and never rank them against swept cells "
+                     f"as if they were one.")
+        return lines
     else:
         the_axes = H.axes()
     for name, key, axis in the_axes:
@@ -240,6 +255,27 @@ def selftest():
         L = report(d)
         ck(any("collapse floor" in l for l in L), "the metric-aware floor is reported")
         ck(any("did not learn" in l for l in L), "CONTROL: a floor-value cell is flagged")
+
+        # ⛔ A REF BLOCK IS 4 CELLS AND HAS NO AXES, so the edge machinery below
+        #   does not apply to it -- and neither does cs[4]. Check what IS true of
+        #   it: that it says loudly what it is, and that it does NOT emit an edge
+        #   verdict it has no basis for.
+        if H._G.get("published_point"):
+            L = report(d)
+            ck(any("REF BLOCK" in l for l in L),
+               "a REF block announces itself as one, not as a search")
+            ck(any("PUBLISHED point" in l for l in L),
+               "...and names the published point it sits at")
+            ck(not any("grid EDGE" in l or "INTERIOR on every" in l for l in L),
+               "CONTROL: it emits NO edge/interior verdict -- there is no ladder to "
+               "be at the edge of, and a meaningless warning is worse than none")
+            for l in ok:
+                print(f"  ✅ {l}")
+            for l in bad:
+                print(f"  ⛔ {l}")
+            print(f"selftest: {len(ok)} passed, {len(bad)} failed")
+            shutil.rmtree(d, ignore_errors=True)
+            return 1 if bad else 0
 
         # ⛔ A DIVERGED CELL (NaN metric) IS A RESULT, NOT A MISSING CELL
         with open(os.path.join(d, "csv", H.cell_id(cs[4]) + ".csv"), "w", newline="") as fh:

@@ -32,17 +32,19 @@ def verify_receipts(text, cell):
     gemma's `score`, 4,096.  Both numbers are MEASURED on this backbone
     (preflight_56905037/56922969) and asserted, not assumed."""
     # ⛔ THE BUDGET MODEL IS PER-ARM, AND (trainable - head)/256 IS ONLY RIGHT FOR
-    #   ARMS WITH MULTIPLIER 1. LoCA trains 256 coefficients AND a 2x256 location
-    #   tensor per module (x3, [measured] 31,744 on gemma) -- it is not in any grid
-    #   today, but "not today" is not a check. Fail closed rather than divide by the
-    #   wrong budget and report a plausible module count.
+    #   ARMS WITH MULTIPLIER 1. LoCA trains 256 coefficients AND a 2x256 LOCATION
+    #   tensor per module -- 3x, [measured] 31,744 trainable on gemma. Until the
+    #   `loca` grid landed this function REFUSED any such arm; it now divides by the
+    #   arm's own budget, from the SAME table stage D uses (fir_preflight_arms
+    #   owns LOCATION_MULTIPLIER -- one site, not two that agree today).
+    # ⚠ THE GUARD IS STILL CLOSED, in the direction that matters: an arm this table
+    #   does not know defaults to 1, and a wrong divisor cannot produce 36 modules
+    #   AND a whole number -- [measured] loca at multiplier 1 gives 108, which the
+    #   n_mod check below rejects. A CONTROL in the selftest fires on exactly that.
     if not cell or not cell.get("arm"):
         return False, "no cell given -- the budget model is PER-ARM and cannot be guessed"
     mult = PA.LOCATION_MULTIPLIER.get(cell["arm"], 1)
-    if mult != 1:
-        return False, (f"{cell['arm']} trains {mult}x the coefficient budget "
-                       f"(it also trains LOCATIONS); this cell-local derivation "
-                       f"assumes multiplier 1 -- teach it the arm before sweeping it")
+    budget = K * mult
     r = PA.parse_receipts(text)
     tr = r.get("trainable")
     if not tr:
@@ -52,17 +54,23 @@ def verify_receipts(text, cell):
     if adapter <= 0:
         return False, (f"trainable {tr:,} <= head {head:,} -- the ADAPTER ATTACHED TO "
                        f"NOTHING and only the classifier trained")
-    if adapter % K:
-        return False, (f"adapter params {adapter:,} is not a multiple of k={K} -- "
+    if adapter % budget:
+        return False, (f"adapter params {adapter:,} is not a multiple of "
+                       f"{budget:,} (k={K} x {mult} for {cell['arm']}) -- "
                        f"the budget model is wrong for this cell")
-    n_mod = adapter // K
+    n_mod = adapter // budget
     if r.get("modules") and r["modules"] != n_mod:
         return False, (f"logged module count {r['modules']} != derived {n_mod} "
                        f"from trainable {tr:,}")
     if n_mod != 36:
         return False, (f"attached to {n_mod} modules, not the 36 every preflight arm "
                        f"reported -- this cell did not adapt the same model")
-    return True, f"{n_mod} modules, adapter {adapter:,} + head {head:,} = {tr:,} trainable"
+    note = f"{n_mod} modules, adapter {adapter:,} + head {head:,} = {tr:,} trainable"
+    if mult != 1:
+        note += (f"  [{cell['arm']}: {K} coefficients + {(mult-1)*K} location params "
+                 f"per module -- ⚠ NOT at parameter parity, and any table that "
+                 f"places it beside the others must say so]")
+    return True, note
 
 
 def run(cell_id, run_root, python=None, timeout=None):
@@ -120,11 +128,23 @@ def selftest():
     for a in ("wave1", "wave2"):
         ck(verify_receipts(real, {"arm": a})[0], f"{a}: the same 13,312 receipt passes "
                                                  f"(mu costs no parameters)")
-    # ⛔ CONTROL: an arm with a LOCATION budget must be REFUSED, not divided wrongly
-    okl, notel = verify_receipts("trainable params: 31,744 || all params: 2,506,204,160 || x\n",
-                                 {"arm": "loca"})
-    ck(not okl and "LOCATIONS" in notel,
-       "CONTROL: a multiplier-3 arm (loca) is REFUSED by the cell-local derivation")
+    # ⭐ LoCA: [measured, gemma] 31,744 = 4,096 head + 36 x 256 x 3. It must PASS,
+    #   and the note must SAY it is not at parameter parity -- [R.310] flags exactly
+    #   this as the thing a joint table has to disclose.
+    loca_receipt = "trainable params: 31,744 || all params: 2,506,204,160 || x\n"
+    okl, notel = verify_receipts(loca_receipt, {"arm": "loca"})
+    ck(okl and "36 modules" in notel and "parity" in notel,
+       f"loca's measured 31,744 receipt passes at multiplier 3 ({notel[:60]}...)")
+    # ⛔ CONTROL THAT THE MULTIPLIER IS LOAD-BEARING: the SAME receipt read at
+    #   multiplier 1 must be REFUSED. Without this, teaching the guard the arm would
+    #   look identical to disabling it.
+    ck(not verify_receipts(loca_receipt, {"arm": "wave1"})[0],
+       "CONTROL: loca's receipt is REFUSED when read at multiplier 1 (108 modules, "
+       "not 36) -- the location budget is doing real work here")
+    ck(not verify_receipts("trainable params: 13,312 || all params: 2 || x\n",
+                           {"arm": "loca"})[0],
+       "CONTROL: a NON-loca receipt is refused when read at multiplier 3 "
+       "(the guard fires in both directions)")
     ck(not verify_receipts(real, None)[0],
        "CONTROL: no cell at all is refused (the budget model is per-arm)")
 

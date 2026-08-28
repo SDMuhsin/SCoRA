@@ -214,12 +214,14 @@ of this tree that can only be tested by a user running it on the cluster.
 ## 7. Stage 04 — the MRPC hyperparameter sweep
 
 ```bash
-export FIR_HP_GRID=w1                         # ⭐ WHICH GRID. default g2. see 7.1
-bash sbatch/fir/04_hp_sweep.sh --dry-run      # what would be submitted, submits nothing
-bash sbatch/fir/04_hp_sweep.sh --canary 2     # ⭐ ALWAYS FIRST — measures a cell
-bash sbatch/fir/04_hp_sweep.sh --status       # coverage + MEASURED seconds/cell
-bash sbatch/fir/04_hp_sweep.sh --time HH:MM:SS [--concurrent N]   # the rest
-env/bin/python scripts/fir_hp_read.py --run-root "$FIR_RUN_ROOT/hpsweep"
+# ⛔ PREFIX FIR_HP_GRID PER COMMAND. Do NOT `export` it: it decides WHICH
+#    EXPERIMENT RUNS, and an exported value silently steers a later command.
+G=loca                                                            # ⭐ see 7.1
+FIR_HP_GRID=$G bash sbatch/fir/04_hp_sweep.sh --dry-run     # plan only, submits nothing
+FIR_HP_GRID=$G bash sbatch/fir/04_hp_sweep.sh --canary 2    # ⭐ ALWAYS FIRST — measures a cell
+FIR_HP_GRID=$G bash sbatch/fir/04_hp_sweep.sh --status      # coverage + MEASURED seconds/cell
+FIR_HP_GRID=$G bash sbatch/fir/04_hp_sweep.sh --time HH:MM:SS [--concurrent N]   # the rest
+FIR_HP_GRID=$G env/bin/python scripts/fir_hp_read.py --run-root "$FIR_RUN_ROOT/hpsweep"
 ```
 
 ### 7.1 Which grid
@@ -234,8 +236,86 @@ planner refuses an unknown name.
 | `g1` | `fftm`, `fftstock` | 5 `lr` × 4 `scaling` × 4 `classifier_lr` | 160 | ✅ complete, 16.3 GPU-h |
 | **`g2`** *(default)* | `fftm`, `fftstock` | 7 `lr` × 5 `scaling` × 2 `classifier_lr` | 140 | ✅ **complete**, 140/140 |
 | **`w1`** | `wave1`, `wave2` | 6 `P/P_ref` × 4 `scaling` × 2 `classifier_lr` | 96 | ✅ **complete**, 96/96 |
-| **`w2`** | `wave1`, `wave2` | 6 `P/P_ref` × 4 `scaling` × 4 `classifier_lr` | 192 | ⏳ **not yet run** — the budget equaliser |
+| **`w2`** | `wave1`, `wave2` | 6 `P/P_ref` × 4 `scaling` × 4 `classifier_lr` | 192 | ✅ **complete** — the budget equaliser |
 | `wave` | — | ⚠ **reading view only**: the union `w1 ∪ w2` | 288 | refuses to submit |
+| **`loca`** | `loca` | 6 `P/P_ref` × 6 `alpha` × 4 `classifier_lr` | 144 | ⏳ **not started** |
+| **`qwha`** | `qwha` | 6 `P/P_ref` × 6 `scaling` × 4 `classifier_lr` | 144 | ⏳ **not started** |
+| **`lyra`** | `lyra` | 6 `P/P_ref` × 4 `gamma` × 2 `classifier_lr` × **4 `freq_exponent`** | 192 | ⏳ **not started** |
+| **`scora`** | `scora` | 9 `P/P_ref` × 4 `classifier_lr` — ⭐ **no scale axis, by design** | 36 | ⏳ **not started** |
+| **`scora2`** | `scora2` | 7 `P/P_ref` × 5 `scaling` × 4 `classifier_lr` | 140 | ⏳ **not started** |
+| **`wref`** | `wave1`, `wave2` | ⚠ **REF block**: WaveFT's own PUBLISHED point × 2 `classifier_lr` | 4 | ⏳ optional, pending the user |
+
+⛔ **`wref` has no canary and refuses one** — a canary is "one CENTRAL cell per arm" and a REF block
+has no centre. Submit it whole; it is 4 cells.
+
+### 7.1a ⭐⭐ THE BUDGET LEDGER — the fairness claim, as a number the suite checks
+
+`[Dodge et al., "Show Your Work", EMNLP 2019 §6]`: a budget mismatch only invalidates a comparison in
+**one direction** — a *large*-budget win over a *small*-budget arm may be the model or the budget,
+while a *small*-budget win survives any increase. So the rule this repo now holds itself to is not
+"all equal"; it is **directional**, and `fir_hp_plan.budget_per_arm()` + its selftest enforce it under
+every grid:
+
+| arm | cells/arm | axes | why |
+|---|---|---|---|
+| `fftm` / `fftstock` | **142** | 3 | the comparator every claim is made against |
+| `wave1` / `wave2` | **146** | 3 | 144 searched + 2 REF (`wref`); +2.8% — declared, not netted off |
+| `loca` | 144 | 3 | +1.4% |
+| `qwha` | 144 | 3 | +1.4% |
+| `lyra` | **192** | **4** | ⭐ the only arm with a genuine 4th method knob — see 7.1d |
+| `scora` (ours) | **36** | 2 | ⭐ one magnitude axis BY DESIGN — see 7.1e |
+| `scora2` (ours) | **140** | 3 | ⛔ capped BELOW the comparator's 142, deliberately |
+
+The gate asserts: **max(ours) ≤ comparator ≤ min(baseline)**, and that nothing exceeds the comparator
+by >1.1× **unless it sweeps strictly more axes** — an exemption keyed on the axis count, not on an
+arm's name, so it evaporates the day the axis does. ⚠ `[R.259]`: equal cell counts across arms with
+different knob counts is *still* not equal effort; for a low-knob arm report **per-axis resolution**.
+
+### 7.1b ⛔ WHAT THE EQUAL COUNTS DO NOT BUY, said before anyone quotes them
+
+Dodge §6 also says *"fixing the same number of hyperparameter trials for both models does not imply a
+fair comparison"* — the spaces differ, and past human effort is unmeasurable. **Live here:** every
+new ladder's *width* was chosen by reading the 570 FourierFT + WaveFT cells already measured on this
+exact cell (`P/P_ref` 0.3–10 is the live window; scale ≈1–16× the arm's own tuned scale; beyond that
+the marginals fill with collapse-floor cells). That is **borrowed effort spent in the new arms'
+favour** and it cannot be netted off against anything. Say it; do not present these bounds as a
+priori. ⚠ And a denser search at n=1 mostly buys **selection inflation**, not a better optimum.
+
+### 7.1c ⭐⭐ THE ADMISSIBILITY RULE — the user's stated criterion, made machine-checked
+
+`[user, 2026-08-28]` *"the optimal paper-reported values should fall in range."* `[R.258]` is why it
+is a gate and not an eyeball: it found WaveFT's published point outside the swept box in **both** axes
+at once, in **opposite** directions — the one configuration a human glance at two ladders will miss.
+`fir_hp_plan.PUBLISHED` holds every arm's published point in one place and the selftest asserts
+interiority in the coordinates the grid actually sweeps.
+
+| arm | published | where it lands |
+|---|---|---|
+| `loca` | α = 1, lr 5e-4…1e-2 (primary 5e-3) | ✅ interior. **The ladder reaches DOWN to `P/P_ref` 0.025 for this reason alone** — the published range is 0.033–0.667× `P_ref`, *below* the measured live window. At α=1 the `P`=0.3 rung **is** lr 0.0045, i.e. the published point is very nearly run. |
+| `lyra` | γ = 1, lr 2e-2, exponent **3.0** | ✅ interior on all three, incl. the exponent (ours is 2.0) |
+| `qwha` | ⛔ **none exists** — the paper tunes on a *quantised LLaMA* | n/a; ladders anchored on the port's own scale\* 147.31 |
+| `wave1` / `wave2` | λ = 25, lr 1e-4 | ⚠ **NOT** on `w1`/`w2` — 33× below the live window's floor. Run as the `wref` REF block instead, and the gate asserts that block actually contains the arm. |
+| `scora` / `scora2` | ours — nothing published | n/a |
+
+### 7.1d ⭐ Why LYRA gets the LARGEST budget (192)
+
+It has a third method knob, `--spectral_freq_exponent`, and `[R.233 §3]` shows it has **never been
+swept at the warmed protocol** — `[P.26]`'s sweep was unwarmed and `[R.160]` bars comparing the two,
+so whether the banked 2.0 is LYRA's own optimum is **unknown**, and the *published* value is 3.0.
+Benchmarking a baseline at a value its authors did not use is what `PROCESS §5 test 5` bars.
+⭐ Over-searching a **baseline** is the conservative direction for our own claim. ⚠ The price: LYRA's
+`classifier_lr` axis is `g2`'s two survivors, not `g1`'s four — `[g1, measured]` that axis is flat
+across 40× except that 2e-2 is harmful, and the head is the same 4,096-param `score` layer for every
+arm, so it is the cheapest axis in the design to spend.
+
+### 7.1e ⭐ Why SCoRA gets 36 cells, and why that is not under-tuning
+
+`scora` has **one** magnitude knob by definition — its scale is derived a priori from `--slr_s`, and
+setting it by hand is exactly what makes the arm `scora2`. So report **per-axis resolution**: 9 rungs
+at ratio **2** over 256× is the **finest `P` axis of any arm here** (the others are 2.5 and 3.5), and
+the selftest asserts that. ⭐ And the direction is the safe one: ours holds the *smallest* budget of
+the nine, so a SCoRA **win** is attributable under Dodge §6 and a SCoRA **loss** is the one outcome
+this design cannot rule out — the correct way round for a method's own authors to be wrong.
 
 All of them: **MRPC**, `q_o`, **1 seed (42)**, **5 epochs** (575 steps/cell), one Slurm array, one
 cell per task. Print any of them with `FIR_HP_GRID=<g> env/bin/python scripts/fir_hp_plan.py --show`.

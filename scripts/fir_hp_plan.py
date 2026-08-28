@@ -213,6 +213,254 @@ W2 = {
     "clf_lrs": [5e-4, 2e-3, 5e-3, 2e-2],          # g1's axis, restored in full
 }
 
+# ---------------------------------------------------------------------------
+# ⭐⭐ THE FIVE REMAINING ARMS.  [user, 2026-08-28: "set up the hyperparameter
+#   search ranges for the remaining frequency-domain LoRA methods ... the deciding
+#   criteria should be that the optimal paper-reported values should fall in range
+#   and that the search will be defensible in a camera-ready paper."]
+# ---------------------------------------------------------------------------
+# ⛔ THE ADMISSIBILITY RULE, WHICH IS THE USER'S STATED CRITERION AND `[R.258]`'s:
+#   an arm's PUBLISHED operating point must be INSIDE the swept ladders, or the
+#   search can only find the best point in a box the author never used.  Every
+#   ladder below is sized by that rule FIRST and by cost second.  The published
+#   points, from `[N.1 §0.1]` and re-checked against `src/train_glue.py`'s own
+#   argparse help (which cites the papers):
+#
+#     LoCA   alpha = 1.0, coefficient lr 5e-4..1e-2 per task (primary 5e-3),
+#            location lr 1e-4                    [train_glue.py:502,505]
+#     LYRA   gamma = 1, lr 2e-2, freq_exponent 3.0            [R.258 §1]
+#     QWHA   ⛔ NO published RoBERTa/GLUE point exists -- the paper tunes on a
+#            QUANTISED LLaMA                     [train_glue.py:494; R.236 §3.5]
+#     SCoRA  ours; there is nothing published to be inside of.
+#
+# ⭐ WHERE THE LADDER WIDTHS COME FROM -- and this is BORROWED EFFORT, declared.
+#   `[Dodge et al., EMNLP 2019 §6]` says the bounds a searcher chooses carry
+#   unmeasurable prior human effort.  Ours are not guesses: they are read off the
+#   282 FourierFT and 288 WaveFT cells ALREADY MEASURED on this exact cell
+#   (mrpc / q_o / gemma-2b / 5 epochs / seed 42).  Marginals over those grids:
+#
+#     P/P_ref     0.3   0.7   1.0   1.6   2.5   4     6    10    15    24    38
+#     wave best  .8652 .8881 .8873 .8904 .8873 .8896 .8808 .8881 .8711 .8662 .8503
+#     wave floor  0/32  0/32  0/16  0/32  0/16  6/32  2/16  8/32  6/16 11/32  5/16
+#
+#     scaling      75   150   300   600  1200  2400  4800  9600
+#     wave floor 0/24  0/48  0/24  0/48  3/24 11/48 10/24 14/48
+#
+#   ⇒ [measured] the LIVE window on this backbone is P/P_ref ~ 0.3..10 (FourierFT's
+#     own optimum sits at 6, WaveFT's at 1.6) and scale ~ 1..16x the arm's own
+#     RoBERTa-tuned scale.  Every ladder below spans AT LEAST that window with a
+#     rung of margin on each side, and is widened further wherever a published
+#     point falls outside it (LoCA reaches DOWN to 0.025x for exactly that reason).
+#   ⚠ This is prior effort spent in the new arms' favour and it CANNOT be netted
+#     off against anything.  Say it in the paper; do not present these bounds as
+#     a priori.
+#
+# ⛔ WHAT IS NOT SWEPT, each for a reason that is not cost:
+#   * `--loca_location_lr`      published 1e-4; BOTH [R.305] OFAT probes of it lost.
+#   * `--loca_learn_location_iter` UNSET = the paper's own 10%-of-steps rule -- ⭐ the
+#       one setting here that AUTO-ADAPTS to a new task; [R.305]'s fixed-468 probe
+#       lost 0.0253.  Pinning it would be porting a RoBERTa/RTE step count.
+#   * `--qwha_init_weights 0`   the authors' default (and FourierFT's init).
+#   * `--spectral_p/q 16`       THE BUDGET (p*q = 256/module).  Sweeping it would
+#       break budget parity, which is the premise of the whole comparison [R.233:
+#       "LYRA names a family, not a budget" -- p=q=128 is a 64x arm].
+#   * `--spectral_d_initial 0.07`, `--spectral_freq_mode geometric`  the banked arm.
+#   * `--slr_rank 1`, `--slr_s 128`, `--slr_init zero`   r*(s+t) = 256 = the budget.
+#   * `k` = 256 everywhere, 5 epochs, MRPC, q_o, seed 42 -- as for g1/g2/w1/w2.
+
+# ⭐ THE THREE LADDER SHAPES, named so the selftest can assert they are shared.
+#   A "standard" P ladder: ratio 2.5, 6 rungs, geometric about P/P_ref = 1, i.e.
+#   0.16 .. 15.6 (98x).  It brackets the measured 0.3..10 window with a rung of
+#   margin at each end and puts RoBERTa's own carried step ON the ladder.
+P_LADDER_25 = [0.16, 0.4, 1.0, 2.5, 6.25, 15.625]
+
+# ---------------------------------------------------------------------------
+# LoCA.  ⛔ THE ONE ARM WHOSE PUBLISHED POINT FORCES A WIDER, COARSER LADDER.
+# ---------------------------------------------------------------------------
+# atom == alpha exactly [measured, port table: atom_median 0.2500002 at alpha 0.25],
+# and it is WIDTH-INDEPENDENT, so the published (alpha 1, lr 5e-4..1e-2) is a
+# published P of 5e-4..1e-2 = 0.033x..0.667x of P_ref (0.015).  That is BELOW the
+# 0.3x floor of the measured window, so the ladder must reach down to it -- and it
+# must still reach the 6x-10x top where FourierFT's own gemma optimum sits.
+# ⇒ 480x of span in 6 rungs ⇒ ratio ~3.5.
+# ⚠ SAY THIS PLAINLY RATHER THAN HIDING IT: LoCA's P axis is the COARSEST of the
+#   five (3.5 vs 2.5), and the resolution was spent to buy the width its own
+#   published range demands.  [R.259]: report per-axis resolution, not cell count.
+# ⭐ At alpha = 1 (the published alpha) the P/P_ref = 0.3 rung IS lr 0.0045 -- the
+#   published lr 5e-3 to within 10%.  The published cell is not merely bracketed,
+#   it is very nearly RUN.  Asserted in the selftest.
+# alpha ladder: ratio 2, 0.125..4 = 0.5x..16x the RoBERTa-tuned 0.25, which is the
+#   measured live scale window; published 1.0 and tuned 0.25 are both INTERIOR.
+#   ⭐ LoCA inits to dW == 0 [measured, rel_median 0.0], so -- like WaveFT and
+#     unlike FourierFT/QWHA -- there is no init-damage ceiling on alpha; the only
+#     asymmetry along a matched-P row is AdamW's decay tax [R.211], which is
+#     monotone-and-saturating and wants RANGE, not resolution.
+L1 = {
+    "arms": ["loca"], "coord": "p",
+    "p_mults": [0.025, 0.08, 0.3, 1.0, 3.5, 12.0],
+    "scalings": [0.125, 0.25, 0.5, 1.0, 2.0, 4.0],
+    "clf_lrs": [5e-4, 2e-3, 5e-3, 2e-2],
+    "scale_label": "loca_scale (alpha)",
+}
+
+# ---------------------------------------------------------------------------
+# QWHA.  No published point exists, so the ladders are anchored on the PORT.
+# ---------------------------------------------------------------------------
+# atom = s/sqrt(mn) (NOT sqrt(2mn) -- QWHA's layer divides by sqrt(out_features)),
+# so the scale ladder is DERIVED from the port's own scale* = 147.31 rather than
+# typed.  The RoBERTa-tuned 53.033 lands at 0.36x, interior between the 0.25x and
+# 0.5x rungs.
+# ⛔ QWHA IS AN INIT-PERTURBING ARM (`--qwha_init_weights 0` = randn spectrum,
+#   [measured] rel_median 0.00892 at s=53.033), so unlike LoCA/WaveFT it CAN be
+#   capped from above by init damage before optimisation gets a say.  [g2, measured]
+#   FourierFT's own rel/collapse curve on this backbone: rel 0.048 was its optimum,
+#   rel 0.13 still produced its 4th-best cell (3/28 at floor), rel 0.36 was half
+#   dead (11/28).  The 8x top rung sits at rel 0.198 -- degrading but demonstrably
+#   still alive at FourierFT's calibration, which is what an upper BRACKET has to
+#   be.  Going further would buy known-dead cells, as g2's sc-8000 row did.
+Q1 = {
+    "arms": ["qwha"], "coord": "p",
+    "p_mults": list(P_LADDER_25),
+    "scale_mults": [0.25, 0.5, 1.0, 2.0, 4.0, 8.0], "scale_base": "derived",
+    "clf_lrs": [5e-4, 2e-3, 5e-3, 2e-2],
+}
+
+# ---------------------------------------------------------------------------
+# ⭐ LYRA.  THE ONLY ARM WITH A THIRD METHOD KNOB -- and it gets the BIGGEST budget.
+# ---------------------------------------------------------------------------
+# atom == gamma (`--spectral_scaling`), width-independent, so published (gamma 1,
+# lr 2e-2) is a published P of 0.02 = 1.667x P_ref -- comfortably interior to the
+# standard ladder.  gamma's ladder is ratio 4 over 64x so that OUR tuned 0.1 and
+# the PUBLISHED 1.0 -- 10x apart -- are both interior.
+#
+# ⭐⭐ `--spectral_freq_exponent` IS SWEPT HERE, AND IT HAS NEVER BEEN SWEPT AT THE
+#   WARMED PROTOCOL IN THIS REPO.  [R.233 §3]: [P.26] swept it UNWARMED and got
+#   0.6787..0.6968 across {1,2,3,4,5} on RTE, but [R.160] bars comparing warmed and
+#   unwarmed runs, so "is the banked exponent 2.0 LYRA's own optimum" is UNKNOWN --
+#   and the PUBLISHED value is 3.0, not 2.0.  A baseline benchmarked at a value its
+#   own authors did not use is exactly what `PROCESS §5 test 5` bars.  {1,2,3,5}
+#   puts both 2.0 and the published 3.0 strictly interior.
+#
+# ⇒ 6 x 4 x 4 x 2 = 192 cells, the LARGEST budget of any arm here (FourierFT 142,
+#   WaveFT 146).  ⭐ THAT ASYMMETRY IS DELIBERATE AND IT IS THE CONSERVATIVE
+#   DIRECTION: LYRA is a BASELINE, so over-searching it can only make our own claim
+#   harder, and `[Dodge §6]`'s asymmetry means a loss under a LARGER budget is
+#   attributable while a loss under a smaller one is not.  [R.305 §LYRA] already
+#   flagged it as "the most structural knobs ... the most room to be under-tuned by
+#   a fixed-budget search".
+# ⚠ THE PRICE, STATED: to afford the 4th axis, LYRA's classifier_lr axis is g2's
+#   TWO survivors, not g1's four.  [g1, measured] that axis is flat across 40x
+#   (best F1 0.8823..0.8945 over all four values) except that 2e-2 is harmful (8 of
+#   its 9 at-floor cells), and the head is the SAME 4,096-param `score` layer for
+#   every arm -- so this is the cheapest axis in the design to spend, and LYRA still
+#   ends with 33% MORE cells than any other arm.
+Y1 = {
+    "arms": ["lyra"], "coord": "p",
+    "p_mults": list(P_LADDER_25),
+    "scalings": [0.05, 0.2, 0.8, 3.2],
+    "clf_lrs": [5e-4, 5e-3],
+    "extra": {"key": "freq_exponent", "flag": "--spectral_freq_exponent",
+              "label": "spectral_freq_exponent", "id": "ex", "values": [1.0, 2.0, 3.0, 5.0]},
+    "scale_label": "spectral_scaling (gamma)",
+}
+
+# ---------------------------------------------------------------------------
+# ⭐⭐ SCoRA (ours) -- ONE magnitude axis, ON PURPOSE, and 36 cells is not
+#   under-tuning.
+# ---------------------------------------------------------------------------
+# `scora`'s scale is DERIVED a priori from --slr_s (fir_arms: "DO NOT ADD ONE");
+# setting it by hand is precisely what makes the arm `scora2`.  So this grid has NO
+# scale axis, and lr = P / atom directly.
+# ⭐ REPORT PER-AXIS RESOLUTION, NOT CELL COUNT [R.259]: 9 rungs at ratio 2 over
+#   256x is the FINEST P axis of any arm in this comparison (the others are 2.5 and
+#   3.5).  [R.305] made exactly this argument ("SCoRA -- one axis, on purpose").
+# ⭐ AND THE DIRECTION IS THE SAFE ONE.  36 < 140 means OUR arm holds the SMALLEST
+#   budget of the nine.  `[Dodge §6]`: "if a model with a small budget outperforms a
+#   model with a large budget, increasing the small budget will not change this
+#   conclusion."  A SCoRA win is therefore attributable; a SCoRA loss is the one
+#   thing this design cannot rule out, and that is the correct way round for a
+#   method's authors to be wrong.
+S1 = {
+    "arms": ["scora"], "coord": "p", "no_scale": True,
+    "p_mults": [0.0625, 0.125, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0],
+    "clf_lrs": [5e-4, 2e-3, 5e-3, 2e-2],
+}
+
+# ---------------------------------------------------------------------------
+# SCoRA-2 (ours) -- the swept-scaling row.  ⛔ 140 cells, CAPPED BELOW FourierFT's.
+# ---------------------------------------------------------------------------
+# ⛔ 7 x 5 x 4 = 140, deliberately NOT 6 x 6 x 4 = 144.  144 would put OUR arm 1.4%
+#   ABOVE the FourierFT comparator's 142, and a budget advantage to the arm making
+#   the claim is the same defect as w1's deficit, mirrored.  A selftest asserts
+#   max(ours) <= min(comparator).
+# The scaling ladder is DERIVED as multiples of [R.306]'s own swept optimum
+# (0.00610352), ratio 2 over 16x, that value interior.
+S2 = {
+    "arms": ["scora2"], "coord": "p",
+    "p_mults": [0.064, 0.16, 0.4, 1.0, 2.5, 6.25, 15.625],
+    "scale_mults": [0.25, 0.5, 1.0, 2.0, 4.0], "scale_base": "ref",
+    "clf_lrs": [5e-4, 2e-3, 5e-3, 2e-2],
+}
+
+# ---------------------------------------------------------------------------
+# ⚠⚠ wref -- WaveFT AT ITS OWN PUBLISHED POINT.  4 cells.  THE ADMISSIBILITY GAP
+#   IN A SEARCH WE HAVE ALREADY RUN, closed the same way [R.305] closed it on
+#   roberta-base: 2 explicit REF cells per arm, not a widened grid.
+# ---------------------------------------------------------------------------
+# `[R.258]` (its core finding stands): WaveFT's published point (lambda = 25,
+# lr = 1e-4) is outside w1/w2 in BOTH directions -- 1500x in lr, 91x in atom, 16.6x
+# in the product -- and they are OPPOSITE directions, which is why it survives the
+# eye test.  Every OTHER arm in this comparison now has its published point inside
+# its ladders; WaveFT would be the only one that does not.
+# ⭐ WHY REF CELLS AND NOT A WIDER LADDER: the published point is 33x below the
+#   bottom of the measured live window, so a ladder reaching it would spend ~1/3 of
+#   WaveFT's budget on cells the measured marginals say are dead. The criterion is
+#   "the published point was RUN", and 4 cells buy exactly that.
+# ⛔ BOTH NUMBERS ARE DERIVED, NOT TYPED INTO A LADDER: lambda multiplies an
+#   orthonormal IDWT (`[R.258 §2]`, and that section's stated assumption about the
+#   authors' normalisation is INHERITED here), so the published atom IS 25 and the
+#   scaling that reproduces it at this width is 25/aps.
+# ⚠ These 2 cells/arm COUNT toward WaveFT's budget in budget_per_arm(), taking it
+#   to 146 vs FourierFT's 142.  Counting a fixed published point as search budget
+#   OVERSTATES WaveFT's advantage, which is the fail-closed direction.
+PUBLISHED_WAVEFT = {"atom": 25.0, "lr": 1e-4}     # [N.1 §0.1, arXiv 2505.12532 §5.1]
+
+# ---------------------------------------------------------------------------
+# ⛔⛔ EVERY ARM'S PUBLISHED OPERATING POINT, IN ONE PLACE, AS A GATE.
+# ---------------------------------------------------------------------------
+# `[user, 2026-08-28]`: "the optimal paper-reported values should fall in range".
+# `[R.258]` is the reason it has to be MACHINE-CHECKED rather than eyeballed: it
+# found WaveFT's published point outside the swept box in BOTH axes at once, in
+# OPPOSITE directions -- which is exactly the configuration that survives a human
+# glance at two ladders. So the criterion lives here, as data, and the selftest
+# asserts it for whichever arms the selected grid carries.
+#
+#   "P"        the published EFFECTIVE STEP lr*atom, in the same absolute units as
+#              p_ref().  A range where the authors report a per-task range.
+#   "axes"     published values on the grid's OWN other axes, by cell key.
+#   "ref_grid" ⚠ set ONLY where the published point is too far outside the live
+#              window to sweep, and is instead RUN as explicit REF cells.  A named
+#              escape hatch, checked to actually contain the arm -- not a waiver.
+#
+# ⛔ QWHA has NO entry, and that is a FACT about QWHA, not an omission: its paper
+#    tunes on a QUANTISED LLaMA and publishes no RoBERTa/GLUE point
+#    [train_glue.py:494; R.236 §3.5]. Its ladders are anchored on the port instead.
+PUBLISHED = {
+    # LoCA: alpha = 1, coefficient lr 5e-4..1e-2 per task  [train_glue.py:502,505;
+    # R.258 §1 quotes the primary point as lr 5e-3].  atom == alpha, so P == lr.
+    "loca": {"P": [("lr range", 5e-4, 1e-2)], "axes": {"scaling": 1.0}},
+    # LYRA: gamma = 1, lr 2e-2, freq_exponent 3.0  [R.258 §1].  atom == gamma.
+    "lyra": {"P": [("lr 2e-2 at gamma 1", 2e-2, 2e-2)],
+             "axes": {"scaling": 1.0, "freq_exponent": 3.0}},
+    # WaveFT: lambda = 25, lr 1e-4 -- P = 2.5e-3, which is 33x BELOW the bottom of
+    # the measured live window.  ⚠ NOT on w1/w2's ladders and deliberately not put
+    # there; the `wref` block runs the point itself.  [R.258]
+    "wave1": {"P": [("lambda 25 x lr 1e-4", 2.5e-3, 2.5e-3)], "ref_grid": "wref"},
+    "wave2": {"P": [("lambda 25 x lr 1e-4", 2.5e-3, 2.5e-3)], "ref_grid": "wref"},
+}
+WREF = {"arms": WAVE_ARMS, "coord": "p", "published_point": "waveft",
+        "clf_lrs": [5e-4, 5e-3]}
+
 # ⭐ A READING VIEW, NOT A RUN TARGET. `wave` is the UNION of w1 and w2 -- the whole
 #   144-cell-per-arm WaveFT search, which is the thing a budget-equalised claim is
 #   about. ⛔ It is a union of two disjoint factorial BLOCKS, not one factorial, so
@@ -220,7 +468,13 @@ W2 = {
 #   axes would claim a bracketing the design does not have.
 WAVE_ALL = {"arms": WAVE_ARMS, "coord": "p", "union": ["w1", "w2"]}
 
-GRIDS = {"g1": G1, "g2": G2, "w1": W1, "w2": W2, "wave": WAVE_ALL}
+GRIDS = {"g1": G1, "g2": G2, "w1": W1, "w2": W2, "wave": WAVE_ALL,
+         "loca": L1, "qwha": Q1, "lyra": Y1, "scora": S1, "scora2": S2, "wref": WREF}
+# ⛔ THE ARMS WHOSE RESULT WE ARE CLAIMING. The budget gate is DIRECTIONAL -- an
+#   arm we own must never hold a LARGER search budget than the comparator -- so it
+#   needs to know which arms are ours. `[R.306]`: both SCoRA rows always ship
+#   together, so both are here.
+OUR_ARMS = list(FA.SCORA_ROWS)
 GRID_NAME = os.environ.get("FIR_HP_GRID", "g2")
 if GRID_NAME not in GRIDS:
     raise SystemExit(f"FAIL CLOSED: FIR_HP_GRID={GRID_NAME!r} is not one of {sorted(GRIDS)}")
@@ -228,7 +482,19 @@ _G = GRIDS[GRID_NAME]
 ARMS = _G["arms"]
 COORD = _G["coord"]
 IS_UNION = "union" in _G
-SCALINGS, CLF_LRS = _G.get("scalings", []), _G.get("clf_lrs", [])
+# ⛔ NO_SCALE IS A GRID KIND, NOT A MISSING KEY. `scora` derives its scale from
+#   --slr_s a priori (fir_arms: "DO NOT ADD ONE"), so its grid has no scale AXIS --
+#   which is a different thing from a grid that forgot to declare one. Everything
+#   downstream (cell ids, axes(), cell_cmd, the canary picker, the reader's edge
+#   test) branches on this flag rather than on `len(scalings) == 0`.
+NO_SCALE = bool(_G.get("no_scale"))
+EXTRA = _G.get("extra")            # None except LYRA's freq_exponent (a 4th axis)
+# ⛔ THE 4th-AXIS KEYS ARE MODULE-LEVEL, NOT READ OFF THE SELECTED GRID. cell_id()
+#   and cell_cmd() must mean the same thing for a cell no matter which grid happens
+#   to be selected -- budget_per_arm() enumerates every grid at once, and an id that
+#   depended on FIR_HP_GRID would make the fairness count depend on an env var.
+EXTRA_KEYS = {"freq_exponent": "--spectral_freq_exponent"}
+CLF_LRS = _G.get("clf_lrs", [])
 LRS = _G.get("lrs", [])            # [] on a P-parameterised grid: lr is DERIVED there
 P_MULTS = _G.get("p_mults", [])    # [] on an lr-parameterised grid
 
@@ -262,6 +528,55 @@ def _pt(PT=None):
     if "pt" not in _PT_CACHE:
         _PT_CACHE["pt"] = FP.port()
     return _PT_CACHE["pt"]
+
+
+def _anchor_scale(prof):
+    """The scale at which the port table's own `derived_lr` was computed.
+
+    ⛔ It is `derived_scale` when the arm perturbs the weights at init (the
+      scale-matching rule had something to say) and `scale` when it does not
+      (loca / wave / scora2 init to dW == 0, so derived_scale is None BY
+      DERIVATION -- fir_plan.py:127).  Asking for the wrong one silently checks the
+      P coordinate against a point the port never claimed."""
+    return prof["derived_scale"] if prof.get("derived_scale") is not None else prof["scale"]
+
+
+def resolve_scalings(grid, PT=None):
+    """A grid dict's scale ladder, with the DERIVED kinds expanded.
+
+    ⭐ Three kinds, and the last two exist so no anchor is ever TYPED:
+        `scalings`     an explicit ladder.  Used where the published value is an
+                       absolute constant that must literally be on the ladder
+                       (LoCA's alpha, LYRA's gamma).
+        `scale_mults` + `scale_base='derived'`   multiples of the PORT's scale*
+                       (QWHA: its anchor is a width-corrected quantity).
+        `scale_mults` + `scale_base='ref'`       multiples of the arm's own
+                       RoBERTa-tuned scale (SCoRA-2: its anchor is [R.306]'s
+                       swept optimum, which no port rule moves).
+    """
+    if grid.get("no_scale") or grid.get("union") or grid.get("published_point"):
+        # ⛔ NONE of these has a scale LADDER, and each for a different reason: no
+        #   scale axis at all; two blocks with two ladders; one fixed published
+        #   point. Returning [] is right for all three -- inventing one is not.
+        return []
+    if "scalings" in grid:
+        return list(grid["scalings"])
+    mults, base = grid["scale_mults"], grid["scale_base"]
+    PT = _pt(PT)
+    arm = grid["arms"][0]
+    prof = PT["targets"][TARGETS]["arms"][arm]
+    if base == "derived":
+        anchor = prof["derived_scale"]
+        if anchor is None:
+            raise SystemExit(f"FAIL CLOSED: {arm} has no derived_scale (it inits to "
+                             f"dW == 0), so scale_base='derived' has no anchor")
+    elif base == "ref":
+        anchor = prof["scale"]
+        if anchor is None:
+            raise SystemExit(f"FAIL CLOSED: {arm} has no scale at all -- use no_scale")
+    else:
+        raise SystemExit(f"FAIL CLOSED: unknown scale_base {base!r}")
+    return [anchor * m for m in mults]
 
 
 def atom_per_scale(targets=TARGETS, arm=None, PT=None, arms=None):
@@ -307,10 +622,42 @@ def p_ref(arm=None, PT=None, arms=None):
     return vals[0]
 
 
-def lr_for(p_mult, scaling, PT=None, arms=None):
-    """lr = P / atom(scaling), the whole point of the coordinate."""
-    return (p_mult * p_ref(PT=PT, arms=arms)
-            / (scaling * atom_per_scale(PT=PT, arms=arms)))
+def atom_fixed(PT=None, arms=None, targets=TARGETS):
+    """The arm's atom at the TARGET width when it has NO scale knob.
+
+    ⚠ `scora`'s atom is STOCHASTIC (rel sd 5.79% [R.174]) because its factor is
+      drawn randn, so this median is a CENTRE, not a constant, and the derived lr
+      carries the same 5.8% band.  That is a property of the arm, not of the grid;
+      the alternative (`--slr_init_norm unit`) would be a different arm."""
+    PT = _pt(PT)
+    prof = PT["targets"][targets]["arms"]
+    arms = list(arms or ARMS)
+    vals = [prof[a]["atom_median"] for a in arms]
+    if max(vals) - min(vals) > 1e-12 * max(vals):
+        raise SystemExit(f"FAIL CLOSED: arms {arms} do not share an atom ({vals})")
+    return vals[0]
+
+
+def lr_for(p_mult, scaling, PT=None, arms=None, no_scale=False):
+    """lr = P / atom, the whole point of the coordinate.
+
+    ⛔ `no_scale` is NOT "scaling == 1". On a scale-less arm the atom is a fixed
+      measured quantity, not `scaling * atom_per_scale`; atom_per_scale() itself
+      FAILS CLOSED for such an arm, and it should."""
+    P = p_mult * p_ref(PT=PT, arms=arms)
+    if no_scale:
+        return P / atom_fixed(PT=PT, arms=arms)
+    return P / (scaling * atom_per_scale(PT=PT, arms=arms))
+
+
+def scalings():
+    """The SELECTED grid's scale ladder.
+
+    ⛔ A FUNCTION, NOT AN IMPORT-TIME GLOBAL. Resolving a `scale_mults` ladder reads
+      the port table; binding it at import would make merely IMPORTING this planner
+      fail on a box without `port_<model>.json`, for every grid, including the four
+      that do not need it."""
+    return resolve_scalings(_G)
 
 
 def axes_of(grid):
@@ -320,10 +667,28 @@ def axes_of(grid):
     if "union" in grid:
         raise SystemExit("FAIL CLOSED: a union view has no single axis set -- "
                          "ask its member grids (member_grids())")
+    if grid.get("published_point"):
+        # ⛔ A REF BLOCK HAS NO AXES AT ALL, and that is the point of it: it sits at
+        #   ONE published point. Handing back a degenerate axis set would let the
+        #   reader's edge test run and report "the optimum is at the edge" on a
+        #   block whose whole design is that it has no interior.
+        raise SystemExit("FAIL CLOSED: a REF block sweeps nothing -- it is one "
+                         "published operating point, not a ladder")
     first = (("P/P_ref", "p_mult", grid["p_mults"]) if grid["coord"] == "p"
              else ("lr", "lr", grid["lrs"]))
-    return [first, ("scaling", "scaling", grid["scalings"]),
-            ("classifier_lr", "classifier_lr", grid["clf_lrs"])]
+    out = [first]
+    # ⛔ A SCALE-LESS GRID DECLARES TWO AXES, and the reader must be told two rather
+    #   than be handed an empty third. `scora` has one magnitude knob BY DESIGN.
+    if not grid.get("no_scale"):
+        out.append((grid.get("scale_label", "scaling"), "scaling", resolve_scalings(grid)))
+    out.append(("classifier_lr", "classifier_lr", grid["clf_lrs"]))
+    # ⭐ THE FOURTH AXIS EXISTS FOR EXACTLY ONE ARM. It is declared by the grid, so
+    #   the reader's edge test, the canary picker and the budget gate all see it
+    #   without any of them knowing the word "lyra".
+    if grid.get("extra"):
+        e = grid["extra"]
+        out.append((e["label"], e["key"], e["values"]))
+    return out
 
 
 def member_grids():
@@ -355,15 +720,25 @@ def canary_indices(ids=None):
     if IS_UNION:
         raise SystemExit("FAIL CLOSED: 'wave' is a READING VIEW, not a run target -- "
                          "canary and submit against w1 or w2")
+    if _G.get("published_point"):
+        # ⛔ A CANARY IS "ONE CENTRAL CELL PER ARM" AND A REF BLOCK HAS NO CENTRE.
+        #   It is 4 cells at one fixed point; submit it whole. Refusing is not a
+        #   limitation -- picking cell 0 and calling it a canary would be a lie
+        #   about what was smoke-tested.
+        raise SystemExit("FAIL CLOSED: a REF block has no central cell (it is ONE "
+                         "published point). Submit it whole -- it is 4 cells.")
     ids = ids or [cell_id(c) for c in cells()]
     def mid(v):
         return sorted(set(v))[(len(set(v)) - 1) // 2]
+    # ⛔ CENTRAL ON EVERY AXIS THE GRID DECLARES -- including a scale axis that is
+    #   absent (scora) and a fourth one that exists for a single arm (lyra). The
+    #   earlier version named `scaling` and three axes literally, so a grid with a
+    #   different shape would either crash at submit time or silently pick a corner.
+    ax = axes_of(_G)
     out = []
     for arm in ARMS:
         want = [c for c in cells([arm])
-                if c["scaling"] == mid(SCALINGS) and c["classifier_lr"] == mid(CLF_LRS)
-                and (c["p_mult"] if COORD == "p" else c["lr"])
-                    == mid(P_MULTS if COORD == "p" else LRS)]
+                if all(c[key] == mid(vals) for _lab, key, vals in ax)]
         if len(want) != 1:
             raise SystemExit(f"FAIL CLOSED: {len(want)} central cells for {arm}, expected 1")
         out.append(ids.index(cell_id(want[0])))
@@ -389,21 +764,57 @@ def _cells_of(grid, arms=None, PT=None):
                 if i not in seen:
                     seen.add(i); out.append(c)
         return out
+    if grid.get("published_point"):
+        return _published_cells(grid, arms, PT=PT)
     out = []
     first = grid.get("p_mults") if grid["coord"] == "p" else grid["lrs"]
+    ns = bool(grid.get("no_scale"))
+    # ⭐ `[None]` for an absent scale axis and `[None]` for an absent 4th axis keep
+    #   the loop nest -- and therefore the CELL ORDER, which IS the Slurm array
+    #   index -- byte-identical for the four grids that have neither.
+    scs = [None] if ns else resolve_scalings(grid, PT=PT)
+    exs = grid["extra"]["values"] if grid.get("extra") else [None]
     for arm in (arms or grid["arms"]):
         for v in first:
-            for sc in grid["scalings"]:
+            for sc in scs:
                 for clr in grid["clf_lrs"]:
-                    c = {"arm": arm, "task": TASK, "targets": TARGETS,
-                         "seed": SEED, "epochs": EPOCHS,
-                         "scaling": sc, "classifier_lr": clr}
-                    if grid["coord"] == "p":
-                        c["p_mult"] = v
-                        c["lr"] = lr_for(v, sc, PT=PT, arms=grid["arms"])
-                    else:
-                        c["lr"] = v
-                    out.append(c)
+                    for ex in exs:
+                        c = {"arm": arm, "task": TASK, "targets": TARGETS,
+                             "seed": SEED, "epochs": EPOCHS,
+                             "scaling": sc, "classifier_lr": clr}
+                        if grid.get("extra"):
+                            c[grid["extra"]["key"]] = ex
+                        if grid["coord"] == "p":
+                            c["p_mult"] = v
+                            c["lr"] = lr_for(v, sc, PT=PT, arms=grid["arms"], no_scale=ns)
+                        else:
+                            c["lr"] = v
+                        out.append(c)
+    return out
+
+
+def _published_cells(grid, arms=None, PT=None):
+    """The REF cells: one FIXED published operating point, crossed with clf_lr.
+
+    ⛔ NOT A SEARCH. There is no ladder here and there must not be one -- the whole
+      point is that these cells sit where the AUTHORS put them, so that "the
+      published point was run" stops being a thing we have to argue about.
+      ⭐ Both numbers are DERIVED from the published constants at THIS width, never
+      typed as a scaling: the published lambda IS the atom, so the scaling that
+      reproduces it is lambda / (atom-per-unit-scale)."""
+    if grid["published_point"] != "waveft":
+        raise SystemExit(f"FAIL CLOSED: unknown published point {grid['published_point']!r}")
+    arms = list(arms or grid["arms"])
+    aps = atom_per_scale(PT=PT, arms=grid["arms"])
+    sc = PUBLISHED_WAVEFT["atom"] / aps
+    lr = PUBLISHED_WAVEFT["lr"]
+    p_mult = PUBLISHED_WAVEFT["atom"] * lr / p_ref(PT=PT, arms=grid["arms"])
+    out = []
+    for arm in arms:
+        for clr in grid["clf_lrs"]:
+            out.append({"arm": arm, "task": TASK, "targets": TARGETS, "seed": SEED,
+                        "epochs": EPOCHS, "scaling": sc, "classifier_lr": clr,
+                        "p_mult": p_mult, "lr": lr})
     return out
 
 
@@ -415,8 +826,18 @@ def cells(arms=None, PT=None):
 
 
 def cell_id(c):
+    """⛔⛔ APPEND-ONLY, AND THE SELFTEST PINS THE OLD GRIDS' DIGESTS.
+      572 CSVs, `done` markers and `fail` markers on fir are keyed by this string.
+      A cell with no scale DROPS the `-sc` component (its lr is unique per rung
+      anyway) and a cell with a 4th axis APPENDS `-ex`; neither can change an id
+      that any existing grid emits, because no existing grid sets either key."""
+    sc = "" if c.get("scaling") is None else f"-sc{_fmt(c['scaling'])}"
+    ex = ""
+    for k in sorted(EXTRA_KEYS):
+        if c.get(k) is not None:
+            ex += f"-ex{_fmt(c[k])}"
     return (f"{c['task']}-{c['arm']}-{c['targets']}"
-            f"-lr{_fmt(c['lr'])}-sc{_fmt(c['scaling'])}-clr{_fmt(c['classifier_lr'])}"
+            f"-lr{_fmt(c['lr'])}{sc}-clr{_fmt(c['classifier_lr'])}{ex}"
             f"-seed{c['seed']}")
 
 
@@ -462,9 +883,23 @@ def cell_cmd(c, model=None):
     cmd = _set_flag(cmd, "--learning_rate", c["lr"])
     cmd = _set_flag(cmd, "--classifier_lr", c["classifier_lr"])
     sf = FA.ARM_SCALE_FLAG[c["arm"]]
-    if not sf:
-        raise SystemExit(f"FAIL CLOSED: {c['arm']} has no scale flag to sweep")
-    cmd = _set_flag(cmd, sf, c["scaling"])
+    if c.get("scaling") is None:
+        # ⛔ AND IT MUST BE THE ARM THAT HAS NO SCALE, NOT THE GRID THAT FORGOT ONE.
+        #   If an arm WITH a scale flag reached here, the flag would silently keep
+        #   whatever value the port left on it -- a hidden, unswept constant inside
+        #   a grid that claims to sweep everything it moves.
+        if sf:
+            raise SystemExit(f"FAIL CLOSED: {c['arm']} HAS a scale flag ({sf}) but this "
+                             f"cell has no scaling -- a no_scale grid may only carry "
+                             f"arms whose scale is derived a priori")
+    else:
+        if not sf:
+            raise SystemExit(f"FAIL CLOSED: {c['arm']} has no scale flag to sweep")
+        cmd = _set_flag(cmd, sf, c["scaling"])
+    # ⭐ the 4th axis, for the one arm that has one
+    for k, flag in sorted(EXTRA_KEYS.items()):
+        if c.get(k) is not None:
+            cmd = _set_flag(cmd, flag, c[k])
     # the cell NAME must carry every swept knob: the results row is keyed on it.
     cmd[cmd.index("--name") + 1] = cell_id(c)
     return cmd
@@ -516,17 +951,39 @@ def selftest():
         ck(len(cs) == n_expect,
            f"union {GRID_NAME} is the sum of its blocks = {len(cs)} cells")
     else:
-        n_expect = len(ARMS) * len(_first) * len(SCALINGS) * len(CLF_LRS)
+        if _G.get("published_point"):
+            _shape = [len(ARMS), len(CLF_LRS)]
+        else:
+            _shape = [len(ARMS), len(_first)] + ([] if NO_SCALE else [len(scalings())]) \
+                     + [len(CLF_LRS)] + ([len(EXTRA["values"])] if EXTRA else [])
+        n_expect = 1
+        for _x in _shape:
+            n_expect *= _x
         ck(len(cs) == n_expect,
-           f"grid {GRID_NAME} is {len(ARMS)}x{len(_first)}x{len(SCALINGS)}"
-           f"x{len(CLF_LRS)} = {len(cs)} cells")
-    ck({"g1": 160, "g2": 140, "w1": 96, "w2": 192, "wave": 288}[GRID_NAME] == len(cs),
+           f"grid {GRID_NAME} is {'x'.join(str(x) for x in _shape)} = {len(cs)} cells")
+    # ⛔ THE COUNT IS PINNED PER GRID, NOT COMPUTED. It is the number the fairness
+    #   argument is made of; if a ladder is edited, this line must be edited too, in
+    #   the same commit, deliberately.
+    ck({"g1": 160, "g2": 140, "w1": 96, "w2": 192, "wave": 288,
+        "loca": 144, "qwha": 144, "lyra": 192, "scora": 36, "scora2": 140,
+        "wref": 4}[GRID_NAME] == len(cs),
        f"{GRID_NAME} has its declared cell count")
     if not IS_UNION:
-        ck(len(axes()) == 3 and all(len(a[2]) > 0 for a in axes()),
-           f"{GRID_NAME} declares 3 non-empty axes: {[a[0] for a in axes()]}")
-        ck(all(a[1] in cs[0] for a in axes()),
-           "every declared axis key exists on a cell (the reader indexes cells by it)")
+        _nax = 2 if NO_SCALE else 3
+        _nax += 1 if EXTRA else 0
+        if _G.get("published_point"):
+            # ⛔ AND PROVE IT REFUSES, in both directions: the REF block has no axes,
+            #   the searched grids do.
+            try:
+                axes(); ck(False, "CONTROL: a REF block refuses an axis set")
+            except SystemExit:
+                ck(True, "CONTROL: a REF block refuses an axis set (it sweeps nothing)")
+            _nax = None
+        if _nax is not None:
+            ck(len(axes()) == _nax and all(len(a[2]) > 0 for a in axes()),
+               f"{GRID_NAME} declares {_nax} non-empty axes: {[a[0] for a in axes()]}")
+            ck(all(a[1] in cs[0] for a in axes()),
+               "every declared axis key exists on a cell (the reader indexes cells by it)")
     else:
         # ⛔ A UNION IS A READING VIEW. Prove it cannot be mistaken for a run target,
         #   in both directions: it refuses a canary, and its members do not.
@@ -553,6 +1010,29 @@ def selftest():
        f"g1 and g2 share exactly {len(_g1 & _g2)} cells, which resume for free")
     ids = [cell_id(c) for c in cs]
     ck(len(set(ids)) == len(ids), "every cell id is unique")
+    # ------------------------------------------------------------------
+    # ⛔⛔ THE CELL ID IS A DATABASE KEY ON A CLUSTER WE CANNOT SSH TO.
+    #   572 CSVs, `done` markers and `fail` markers under
+    #   /scratch/.../runs/hpsweep are named by these strings. If cell_id() ever
+    #   changes shape, every one of them becomes unreachable -- the sweep would
+    #   silently re-run 28.8 + 30.2 GPU-hours of finished work and `--status` would
+    #   report 0 done. The four completed grids' digests are PINNED here, so a
+    #   change to the id format is a red suite on the dev box rather than a
+    #   discovery on fir. ⚠ These four lines may NEVER be updated to match new
+    #   output; if they fail, the ID FORMAT is the thing that is wrong.
+    # ------------------------------------------------------------------
+    FROZEN_DIGESTS = {"g1": "371130518338", "g2": "f3827b29e2f0",
+                      "w1": "772ed48d94fe", "w2": "fceff68cd24b",
+                      "wave": "095a832e45d8"}
+    for _g, _d in sorted(FROZEN_DIGESTS.items()):
+        # ⚠ computed EXACTLY as digest() does -- enumeration order, not sorted.
+        #   json.dumps(sort_keys=True) does not sort a LIST, so a sorted() here
+        #   would silently compute a different number from the one recorded.
+        ck(hashlib.sha1(json.dumps(
+            [cell_id(c) for c in _cells_of(GRIDS[_g])],
+            sort_keys=True).encode()).hexdigest()[:12] == _d,
+           f"⭐ {_g}'s cell ids are BYTE-IDENTICAL to the run that produced its "
+           f"CSVs on fir (digest {_d})")
 
     # ------------------------------------------------------------------
     # ⭐⭐ THE BUDGET-EQUALISATION GATE. Runs under EVERY grid, because it is a
@@ -572,6 +1052,63 @@ def selftest():
     ck(min(wav) <= max(fft) * 1.1,
        f"...and it does not OVERSHOOT materially ({min(wav)} vs {max(fft)}, "
        f"{min(wav)/max(fft):.3f}x) -- a budget advantage is the same defect mirrored")
+
+    # ------------------------------------------------------------------
+    # ⭐⭐ THE SAME GATE, GENERALISED TO ALL NINE ARMS, AND MADE DIRECTIONAL.
+    #   `[Dodge et al., EMNLP 2019 §6]`: a budget mismatch is only fatal in ONE
+    #   direction -- "if a model with a large budget outperforms a model with a
+    #   small budget, the difference might be due to the model or the budget (or
+    #   both)", whereas a small-budget win survives any increase. So the rule is not
+    #   "everything equal"; it is:
+    #      OURS may never hold MORE budget than the comparator, and
+    #      no BASELINE may hold LESS.
+    #   Both directions are unattributable failures if violated, and they are
+    #   opposite failures -- which is exactly why a single "budgets are equal"
+    #   sentence in a paper is not a check.
+    # ------------------------------------------------------------------
+    COMP = min(B[a] for a in FFT_ARMS)          # the comparator every claim is against
+    base = {a: n for a, n in B.items() if a not in OUR_ARMS}
+    ours = {a: n for a, n in B.items() if a in OUR_ARMS}
+    ck(max(ours.values()) <= COMP,
+       f"⭐ OURS holds no more budget than the comparator "
+       f"({ {a: n for a, n in sorted(ours.items())} } vs {COMP}) -- a small-budget "
+       f"win is attributable [Dodge §6]; a large-budget win is not")
+    ck(min(base.values()) >= COMP,
+       f"⭐ every BASELINE holds at least the comparator's {COMP} "
+       f"({ {a: n for a, n in sorted(base.items())} }) -- under-searching a baseline "
+       f"is the same defect pointed the other way")
+    # ⚠ AND AN OVERSHOOT NEEDS A REASON THAT IS NOT "we felt like it". The only
+    #   admissible one is a genuinely LARGER search space: [R.259] equal cell counts
+    #   across arms with DIFFERENT knob counts is not equal effort either. LYRA is
+    #   the one arm with a 4th method axis; the exemption is keyed on that fact, not
+    #   on its name, so it evaporates the day the axis does.
+    def _naxes(a):
+        return max((len(axes_of(g)) for _n, g in GRIDS.items()
+                    if not g.get("union") and not g.get("published_point")
+                    and a in g["arms"]), default=0)
+    comp_ax = _naxes(FFT_ARMS[0])
+    for a, n in sorted(B.items()):
+        ck(n <= COMP * 1.1 or _naxes(a) > comp_ax,
+           f"{a}: budget {n} is within 1.1x the comparator's {COMP}, OR it sweeps "
+           f"more axes than the comparator ({_naxes(a)} vs {comp_ax})")
+    ck(_naxes("lyra") == 4 and _naxes("scora") == 2,
+       "CONTROL: the axis count is REAL -- lyra sweeps 4 axes and scora sweeps 2, "
+       "so the exemption above can both fire and fail to fire")
+    # ⭐ [R.259] / [R.305 §"SCoRA 5 -- one axis, on purpose"]: for a low-knob arm the
+    #   defensible number is PER-AXIS RESOLUTION, not cell count. Assert scora's one
+    #   magnitude axis is the FINEST of the nine, so "36 cells" can be reported with
+    #   the sentence that makes it fair.
+    def _ratio(a):
+        ls = [sorted(g["p_mults"]) for _n, g in GRIDS.items()
+              if g.get("coord") == "p" and not g.get("union")
+              and not g.get("published_point") and a in g["arms"]]
+        rs = [l[i+1] / l[i] for l in ls for i in range(len(l) - 1)]
+        return max(rs) if rs else None
+    _sr = _ratio("scora")
+    ck(_sr is not None and all(_sr <= (_ratio(a) or 9e9) + 1e-9
+                               for a in B if _ratio(a) is not None),
+       f"⭐ scora's single P axis is the FINEST of every arm's (ratio {_sr:g}) -- "
+       f"the number that makes its 36 cells defensible is RESOLUTION, not count")
     # ⛔ w2 must be all-new cells, or the budget does not actually rise.
     _w1 = {cell_id(c) for c in _cells_of(W1)}
     _w2 = {cell_id(c) for c in _cells_of(W2)}
@@ -592,12 +1129,18 @@ def selftest():
         ck(True, "CONTROL: a union refuses a single axis set (it is two blocks)")
     # --- the canary: one cell per arm, CENTRAL on every axis, derived from the grid
     #   (⛔ a union view has none, by design -- that control fires above)
-    ci = [] if IS_UNION else canary_indices(ids)
+    _no_canary = IS_UNION or bool(_G.get("published_point"))
+    if _G.get("published_point"):
+        try:
+            canary_indices(); ck(False, "CONTROL: a REF block refuses to pick a canary")
+        except SystemExit:
+            ck(True, "CONTROL: a REF block refuses to pick a canary (it has no centre)")
+    ci = [] if _no_canary else canary_indices(ids)
     if IS_UNION:
         ck(True, "the union view has no canary (checked above); skipping canary asserts")
-    ck(IS_UNION or (len(ci) == len(ARMS) and len(set(ci)) == len(ci)),
+    ck(_no_canary or (len(ci) == len(ARMS) and len(set(ci)) == len(ci)),
        f"the canary is {len(ARMS)} distinct cells, one per arm")
-    ck(IS_UNION or [parse_cell_id(ids[i])["arm"] for i in ci] == list(ARMS),
+    ck(_no_canary or [parse_cell_id(ids[i])["arm"] for i in ci] == list(ARMS),
        "...one per ARM, in arm order (the stock-PEFT / second code path is covered)")
     for i in ci:
         cc = parse_cell_id(ids[i])
@@ -623,23 +1166,108 @@ def selftest():
         ds = PT["targets"][TARGETS]["arms"]["fftm"]["derived_scale"]
         ck(min(LRS) < dl < max(LRS), f"the derived lr* {dl:.4g} is INSIDE the swept lr range")
         if GRID_NAME == "g1":
-            ck(0.5 in LRS and 50 in SCALINGS, "g1 carries RoBERTa's tuned point exactly")
-            ck(min(SCALINGS) < ds < max(SCALINGS), f"the derived scale* {ds:.4g} is INSIDE g1")
+            ck(0.5 in LRS and 50 in scalings(), "g1 carries RoBERTa's tuned point exactly")
+            ck(min(scalings()) < ds < max(scalings()),
+               f"the derived scale* {ds:.4g} is INSIDE g1")
         else:
             # g2 deliberately starts AT the derived scale and climbs: everything below it
             # is measured and worse, so spending cells there again would buy nothing.
-            ck(abs(min(SCALINGS) - round(ds)) <= 1,
+            ck(abs(min(scalings()) - round(ds)) <= 1,
                f"g2 starts at the derived scale* ({ds:.4g}) and extends upward only")
             ck(min(LRS) < 1.5 < max(LRS), "g1's best lr (1.5) is BRACKETED by g2's finer axis")
-            ck(400 in SCALINGS, "g1's best scaling (400) is retained as an anchor")
+            ck(400 in scalings(), "g1's best scaling (400) is retained as an anchor")
     else:
         # ------------------------------------------------------------------
-        # w1: the P coordinate.  ⛔ EVERY ANCHOR IS DERIVED FROM THE PORT TABLE.
+        # THE P COORDINATE.  ⛔ EVERY ANCHOR IS DERIVED FROM THE PORT TABLE.
         #   A grid whose anchors are typed numbers is a grid that silently stops
         #   pointing at the thing it claims to point at.
         # ------------------------------------------------------------------
         ref = PT["reference"]["__ref__"]["arms"]
         tgt = PT["targets"][TARGETS]["arms"]
+
+        # --- checks EVERY P grid must pass, whatever its arm -----------------
+        ck(all("p_mult" in c for c in cs), "every cell carries its P multiplier")
+        # ⭐ THE COORDINATE ITSELF, CHECKED AGAINST THE PORT'S OWN derived_lr.
+        #   At the port's anchor scale, P/P_ref = 1 must reproduce lr* -- that is
+        #   what makes `P` the same quantity the port table talks about.
+        #   ⚠ RELATIVE, at 1e-5, and not absolute at 1e-9: for the zero-init arms
+        #     the reference and target atoms are two SEPARATE float32 measurements
+        #     of a quantity that is analytically identical (loca's atom IS alpha),
+        #     so they agree to ~1e-6 relative, not to machine epsilon.
+        for a in ARMS:
+            if _G.get("published_point"):
+                continue                       # a REF block does not sit at P=1
+            dl = tgt[a]["derived_lr"]
+            got = (lr_for(1.0, None, no_scale=True) if NO_SCALE
+                   else lr_for(1.0, _anchor_scale(tgt[a])))
+            ck(abs(got - dl) <= 1e-5 * abs(dl),
+               f"{a}: P/P_ref=1 reproduces the port's lr* {dl:.6g} (got {got:.6g})")
+        if not NO_SCALE and not _G.get("published_point"):
+            ck(len({c["lr"] for c in cs}) > len(P_MULTS),
+               "CONTROL: lr is DERIVED per (P, scaling), not a swept axis")
+        # ⭐ THE MEASURED LIVE WINDOW ON THIS BACKBONE, made a gate. [g1+g2+w1+w2,
+        #   measured, 570 cells on this exact cell] FourierFT's optimum sits at
+        #   P/P_ref 6 and WaveFT's at 1.6; below 0.3 and above ~10 the marginals
+        #   fill up with collapse-floor cells. Any ladder that does not bracket
+        #   0.3..10 either cannot see the optimum or is spending cells on dead ones.
+        if P_MULTS and not _G.get("published_point"):
+            # ⛔ THE UNION OF EVERY BLOCK THAT SEARCHES THIS ARM, not this block
+            #   alone. w2 INTERLEAVES w1 and shares no rung with it by design, so a
+            #   per-block test would fail for exactly the reason w2 is correct --
+            #   the same trap the WaveFT anchors block already documents.
+            UPa = sorted({c["p_mult"] for a in ARMS for _n, g in GRIDS.items()
+                          if not g.get("union") and not g.get("published_point")
+                          and a in g["arms"] for c in _cells_of(g, [a])})
+            ck(min(UPa) <= 0.3 and max(UPa) >= 10.0,
+               f"the P ladder searched for {'/'.join(ARMS)} brackets the MEASURED "
+               f"live window 0.3-10x ({min(UPa):g}..{max(UPa):g})")
+            ck(1.0 in UPa, "the carried roberta step P/P_ref = 1 is ON that ladder")
+
+        # --- the PUBLISHED operating point, per arm -------------------------
+        # ⛔⛔ THE USER'S STATED CRITERION FOR THIS WHOLE DESIGN, AND [R.258]'s:
+        #   "the optimal paper-reported values should fall in range". Asserted for
+        #   every arm that HAS a published point, in the coordinates the grid
+        #   actually sweeps -- because [R.258]'s WaveFT miss survived the eye test
+        #   precisely by being off in two axes in OPPOSITE directions.
+        for a in ARMS:
+            pub = PUBLISHED.get(a)
+            # ⛔ A UNION VIEW AND A REF BLOCK HAVE NO SINGLE LADDER to be interior
+            #   to; their members are checked under their own names.
+            if not pub or _G.get("published_point") or not P_MULTS:
+                continue
+            pr_a = p_ref(arms=[a])
+            rg = pub.get("ref_grid")
+            covered = bool(rg) and a in {c["arm"] for c in _cells_of(GRIDS[rg])}
+            if rg:
+                ck(covered,
+                   f"⚠ {a}: its published point is OUTSIDE these ladders and is "
+                   f"covered by the REF grid {rg!r} instead -- asserted to actually "
+                   f"contain {a}, because a named escape hatch that does not run is "
+                   f"worse than no escape hatch")
+            for lab, lo, hi in pub["P"]:
+                for v in (lo, hi):
+                    m = v / pr_a
+                    ck(covered or min(P_MULTS) < m < max(P_MULTS),
+                       f"⭐ {a}: published {lab} = P/P_ref {m:.4g} is INTERIOR to the "
+                       f"P ladder ({min(P_MULTS):g}..{max(P_MULTS):g})"
+                       + ("  [via REF cells]" if covered else ""))
+            for flag, v in ({} if covered else pub.get("axes", {})).items():
+                ax = {k: vals for _l, k, vals in axes()}
+                if flag not in ax:
+                    ck(False, f"{a}: published axis {flag!r} is not swept by this grid")
+                    continue
+                ck(min(ax[flag]) < v < max(ax[flag]),
+                   f"⭐ {a}: published {flag} = {v:g} is INTERIOR to its ladder "
+                   f"({min(ax[flag]):g}..{max(ax[flag]):g})")
+            # ⛔ AND A CONTROL THAT CAN FIRE: a value the authors did NOT use, one
+            #   decade outside, must be OUTSIDE -- otherwise "interior" is vacuous
+            #   because the ladder is wide enough to contain anything.
+            _lo = min(v for _l, lo, hi in pub["P"] for v in (lo, hi)) / pr_a
+            ck(covered or not (min(P_MULTS) < _lo / 100 < max(P_MULTS)),
+               f"CONTROL: {a}: a point 100x below the published one is OUTSIDE the "
+               f"ladder (so 'interior' is a real constraint)")
+
+    if COORD == "p" and set(ARMS) <= set(WAVE_ARMS) and not _G.get("published_point"):
         ck(abs(ref["wave1"]["lr"] * ref["wave1"]["atom_median"]
                - ref["wave2"]["lr"] * ref["wave2"]["atom_median"]) < 1e-12,
            "wave1 and wave2 selected the SAME reference P -- one ladder serves both")
@@ -657,13 +1285,6 @@ def selftest():
            "P/P_ref = 6 (FourierFT's MEASURED gemma inflation) is ON the ladder")
         ck(min(UP) < 6.0 < max(UP),
            "...and it is INTERIOR, so the prediction can be falsified by this search")
-        # ⭐ the coordinate itself is checked against the port's own derived lr*:
-        #   at the reference scale, P/P_ref = 1 MUST reproduce derived_lr exactly.
-        for a in ARMS:
-            sc = tgt[a]["scale"]
-            ck(abs(lr_for(1.0, sc) - tgt[a]["derived_lr"]) < 1e-9,
-               f"{a}: P/P_ref=1 at scale {sc:g} reproduces the port's lr* "
-               f"{tgt[a]['derived_lr']:.6g}")
         ck(int(ref["wave1"]["scale"]) in US,
            "wave1's own RoBERTa-tuned scaling (75) is on the scaling ladder")
         ck(int(ref["wave2"]["scale"]) in US,
@@ -677,10 +1298,6 @@ def selftest():
         ck(max(US) / max(ref[a]["scale"] for a in ARMS) >= 30,
            "the scaling ladder runs >=30x past the RoBERTa-tuned scale")
         ck(min(UP) < 1.0, "there is a rung BELOW RoBERTa's step (the floor anchor)")
-        # ⛔ a P grid must not silently become an lr grid
-        ck(all("p_mult" in c for c in cs), "every w1 cell carries its P multiplier")
-        ck(len({c["lr"] for c in cs}) > len(P_MULTS),
-           "CONTROL: lr is DERIVED per (P, scaling), not a swept axis")
         # ⛔ NOT-SWEPT knobs must be absent from the id and constant in the command
         one = " ".join(cell_cmd(cs[0]))
         ck("--haar_mu" in one and "--haar_init_std 0.0" in one,
@@ -696,17 +1313,59 @@ def selftest():
         ck({_mu(c) for c in cells(["wave2"])} == {"2"},
            "wave2 is mu=2 in EVERY cell (this repo's rank fix)")
 
+    # ------------------------------------------------------------------
+    # ⭐ THE REF BLOCK. Its whole job is that the PUBLISHED point was RUN, so the
+    #   checks are about fidelity to the publication, not about a ladder.
+    # ------------------------------------------------------------------
+    if _G.get("published_point"):
+        tgtw = FP.port()["targets"][TARGETS]["arms"]
+        for a in ARMS:
+            cw = [c for c in cells([a])][0]
+            # the derived scaling must reproduce the PUBLISHED atom at THIS width
+            atom = cw["scaling"] * tgtw[a]["atom_median"] / tgtw[a]["scale"]
+            ck(abs(atom - PUBLISHED_WAVEFT["atom"]) < 1e-9 * PUBLISHED_WAVEFT["atom"],
+               f"{a}: the derived scaling {cw['scaling']:.6g} reproduces the PUBLISHED "
+               f"atom (lambda) {PUBLISHED_WAVEFT['atom']:g} at this width")
+            ck(cw["lr"] == PUBLISHED_WAVEFT["lr"],
+               f"{a}: the learning rate IS the published {PUBLISHED_WAVEFT['lr']:g}, "
+               f"not a derived one")
+        # ⛔ AND IT MUST BE OUTSIDE THE SEARCHED LADDERS, or it is not a REF cell --
+        #   it is a duplicate. [R.258] is only a finding because the point is far out.
+        UPw = {c["p_mult"] for c in _cells_of(WAVE_ALL)}
+        pm = cells()[0]["p_mult"]
+        ck(pm < min(UPw),
+           f"CONTROL: the published P/P_ref {pm:.4g} is BELOW w1/w2's bottom rung "
+           f"{min(UPw):g} -- if it were inside, these cells would be redundant")
+        ck(not ({cell_id(c) for c in cs} & {cell_id(c) for c in _cells_of(WAVE_ALL)}),
+           "no REF cell duplicates a searched cell (they are new budget, honestly counted)")
+        ck(set(CLF_LRS) == set(W1["clf_lrs"]),
+           "the REF cells use w1's classifier_lr pair, so the head is not a new variable")
+
     # --- the command really carries the swept values, for BOTH arms
     for arm in ARMS:
-        c = dict(cells([arm])[7])
+        # ⚠ cell 7 on a searched grid (deliberately not cell 0 -- a corner);
+        #   a REF block has only 2 cells per arm, so take the last one it has.
+        _sub = cells([arm])
+        c = dict(_sub[7] if len(_sub) > 7 else _sub[-1])
         cmd = cell_cmd(c)
         s = " ".join(cmd)
         ck(f"--learning_rate {c['lr']:g}" in s, f"{arm}: lr reaches the command")
         ck(f"--classifier_lr {c['classifier_lr']:g}" in s, f"{arm}: classifier_lr reaches it")
-        ck(f"{FA.ARM_SCALE_FLAG[arm]} {c['scaling']}" in s, f"{arm}: scaling reaches it")
+        if c.get("scaling") is None:
+            # ⛔ CONTROL, IN THE OTHER DIRECTION: a no-scale arm must acquire NO
+            #   scale flag. `scora`'s whole contrast with `scora2` is that its scale
+            #   is derived a priori (fir_arms: "DO NOT ADD ONE").
+            ck(FA.ARM_SCALE_FLAG[arm] is None and "--slr_scaling" not in s,
+               f"{arm}: NO scale flag appears (its scale is derived a priori)")
+        else:
+            # ⚠ format it the way _set_flag does (`:g`), or a derived scale like
+            #   73.65268377433769 is looked up as its repr and never found.
+            ck(f"{FA.ARM_SCALE_FLAG[arm]} {c['scaling']:g}" in s,
+               f"{arm}: scaling reaches it")
         ck(s.count("--learning_rate") == 1, f"{arm}: exactly ONE --learning_rate")
         ck(s.count("--classifier_lr") == 1, f"{arm}: exactly ONE --classifier_lr")
-        ck(s.count(FA.ARM_SCALE_FLAG[arm]) == 1, f"{arm}: exactly ONE scale flag")
+        ck(FA.ARM_SCALE_FLAG[arm] is None
+           or s.count(FA.ARM_SCALE_FLAG[arm]) == 1, f"{arm}: exactly ONE scale flag")
         ck("query" not in s and "value" not in s, f"{arm}: no RoBERTa module name survives")
         ck(f"--adapter_target_modules {FP.TARGET_SETS[TARGETS]}" in s,
            f"{arm}: the generic target override is present")
@@ -827,25 +1486,53 @@ def main():
                   f"(mrpc train 3,668 / batch {FP.BATCH} x {EPOCHS} epochs)")
             print(f"  warmup        : {FP.warmup_for(TASK, EPOCHS)} steps (RTE's ratio, MRPC's steps)")
             return
-        if COORD == "p":
+        if _G.get("published_point"):
+            # ⛔ A REF BLOCK IS NOT A LADDER, so it must not be printed as one.
+            c0 = cs[0]
+            print(f"  ⚠ REF CELLS at {_G['published_point'].upper()}'s OWN PUBLISHED "
+                  f"POINT -- a FIXED point, not a search. [R.258]")
+            print(f"  published     : atom (lambda) {PUBLISHED_WAVEFT['atom']:g}   "
+                  f"lr {PUBLISHED_WAVEFT['lr']:g}")
+            print(f"  derived here  : {FA.ARM_SCALE_FLAG[c0['arm']]} {c0['scaling']:.6g}   "
+                  f"--learning_rate {c0['lr']:g}")
+            print(f"  P/P_ref       : {c0['p_mult']:.5g}  "
+                  f"(P_ref = {p_ref():.7f}) -- {1/c0['p_mult']:.0f}x BELOW the "
+                  f"searched ladder's bottom rung, which is why it is a REF cell")
+            print(f"  classifier_lr : {CLF_LRS}")
+        elif COORD == "p":
             # ⭐ Print the DERIVED lr for every cell of the plane. The swept knob is
             #   P; lr is what actually reaches the command line, and a reader who
             #   cannot see it cannot sanity-check the corners.
-            pr, aps = p_ref(), atom_per_scale()
-            print(f"  coordinate    : P = lr*atom  (atom = scaling/{1/aps:.4f} at {TARGETS})")
-            print(f"  P/P_ref       : {P_MULTS}      P_ref = {pr:.7f}  "
-                  f"[R.305]'s selected step, IDENTICAL for both mu")
-            print(f"  scaling       : {SCALINGS}")
+            pr = p_ref()
+            scs = scalings()
+            if NO_SCALE:
+                print(f"  coordinate    : P = lr*atom  (atom = {atom_fixed():.6g} at "
+                      f"{TARGETS}, FIXED -- this arm derives its scale a priori)")
+            else:
+                print(f"  coordinate    : P = lr*atom  "
+                      f"(atom = scaling * {atom_per_scale():.6g} at {TARGETS})")
+            print(f"  P/P_ref       : {P_MULTS}")
+            print(f"                  P_ref = {pr:.7f} = the [R.305]/[R.306] "
+                  f"roberta-base step, carried")
+            if not NO_SCALE:
+                lab = _G.get("scale_label", "scaling")
+                print(f"  {lab:14s}: " + ", ".join(f"{x:g}" for x in scs))
             print(f"  classifier_lr : {CLF_LRS}")
-            print(f"  derived lr    :  {'P/P_ref':>9s}" +
-                  "".join(f"{('sc'+str(x)):>10s}" for x in SCALINGS))
+            if EXTRA:
+                print(f"  {EXTRA['label']:14s}: {EXTRA['values']}   "
+                      f"⭐ a 4th axis: {EXTRA['flag']}")
+            print()
+            hdr = [f"{'sc ' + _fmt(x):>12s}" for x in scs] or [f"{'lr':>12s}"]
+            print(f"  derived lr    :  {'P/P_ref':>9s}" + "".join(hdr))
             for m in P_MULTS:
-                mark = "  <- RoBERTa" if m == 1.0 else ("  <- prediction" if m == 6.0 else "")
+                mark = "   <- P_ref (the carried roberta step)" if m == 1.0 else ""
+                row = ([lr_for(m, x) for x in scs] if scs
+                       else [lr_for(m, None, no_scale=True)])
                 print(f"                 {m:>9g}" +
-                      "".join(f"{lr_for(m, x):>10g}" for x in SCALINGS) + mark)
+                      "".join(f"{v:>12.6g}" for v in row) + mark)
         else:
             print(f"  learning_rate : {LRS}")
-            print(f"  scaling       : {SCALINGS}")
+            print(f"  scaling       : {scalings()}")
             print(f"  classifier_lr : {CLF_LRS}")
         print(f"  steps per cell: {steps_per_cell()}  "
               f"(mrpc train 3,668 / batch {FP.BATCH} x {EPOCHS} epochs)")
