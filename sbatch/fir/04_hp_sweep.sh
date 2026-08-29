@@ -75,7 +75,21 @@ export FIR_HP_GRID="$GRID_NAME"
 #   knobs, so cells shared by two grids reuse their CSV and their `done` marker and
 #   cost nothing on the re-run. Do NOT split the root per grid.
 SWEEP_ROOT="$FIR_RUN_ROOT/hpsweep"
-mkdir -p "$SWEEP_ROOT"/{csv,logs,done,fail,started}
+mkdir -p "$SWEEP_ROOT"/{csv,logs,done,fail,started,plans}
+
+# ⛔⛔ THE CELL LIST IS A PER-SUBMISSION SNAPSHOT, NOT A SHARED FILE. [2026-08-28]
+#   It used to be ONE `$SWEEP_ROOT/cells.txt`, rewritten by every submit. Five
+#   canaries submitted 40 s apart therefore ALL read the LAST writer's list: four
+#   arrays looked up their index in `scora2`'s cells and ran a scora2 cell id under
+#   a loca / qwha / lyra / scora grid pin. `parse_cell_id` refused every one of
+#   them (fail closed, and it is the reason nothing wrong was measured) -- but four
+#   H100 allocations, and the four wall-clock measurements they existed to produce,
+#   were lost.
+#   ⭐ THE LESSON: an array task resolves its work at RUN time from a path chosen at
+#     SUBMIT time. Anything that path points at must be IMMUTABLE from that moment
+#     on. A name that is unique per submission is the whole fix.
+#   ⚠ The `--run-one` body must NOT compute this (it does not enumerate the grid).
+PLAN_FILE="$SWEEP_ROOT/plans/${GRID_NAME}-$(date -u +%Y%m%dT%H%M%SZ)-$$.txt"
 
 # ===========================================================================
 # THE ARRAY TASK BODY (one cell).  Runs on a compute node.
@@ -106,6 +120,21 @@ if [ -n "$LOCAL_ONE" ]; then
     "$PY_BIN" scripts/fir_hp_run_cell.py --cell "$cid" --run-root "$SWEEP_ROOT"
     rc=$?
     el=$((SECONDS - t0))
+    # ⛔ rc=5 IS "THIS CELL IS NOT IN THIS GRID" -- the plan/grid mismatch above.
+    #   NOTHING TRAINED, so the start marker is a LIE and must be withdrawn: leaving
+    #   it makes the cell look like it ran under a grid it does not belong to, and
+    #   `--status` would report a failure for a cell whose grid never submitted it.
+    #   That is what the 2026-08-28 canaries left behind on three scora2 cells.
+    if [ $rc -eq 5 ]; then
+        rm -f "$SWEEP_ROOT/started/$cid"
+        { echo "exit=5 PLAN/GRID MISMATCH -- nothing ran. node=$(hostname)"
+          echo "cell id '$cid' is not in grid '${FIR_HP_GRID:-?}'."
+          echo "The array read a plan file written for a DIFFERENT grid."
+          echo "⇒ re-submit this grid; the plan file is now per-submission."
+        } > "$SWEEP_ROOT/fail/$cid"
+        echo "### ⛔ PLAN/GRID MISMATCH after ${el}s -- start marker WITHDRAWN"
+        exit $rc
+    fi
     if [ $rc -eq 0 ]; then
         echo "$el" > "$SWEEP_ROOT/done/$cid"
         echo "### cell OK in ${el}s"
@@ -120,8 +149,8 @@ fi
 # ===========================================================================
 # STATUS
 # ===========================================================================
-env/bin/python scripts/fir_hp_plan.py --list > "$SWEEP_ROOT/cells.txt" || exit 1
-TOTAL=$(wc -l < "$SWEEP_ROOT/cells.txt")
+env/bin/python scripts/fir_hp_plan.py --list > "$PLAN_FILE" || exit 1
+TOTAL=$(wc -l < "$PLAN_FILE")
 # ⛔ COUNT ONLY THE MARKERS THAT BELONG TO *THIS* GRID. One sweep root holds every
 #   grid's cells (deliberately -- shared cells resume for free), so a bare count of
 #   done/ reported `done: 160 / 140` the first time g2 was submitted: more than
@@ -129,8 +158,8 @@ TOTAL=$(wc -l < "$SWEEP_ROOT/cells.txt")
 #   along -- it filters by cell id -- but a status line that cannot be true is a
 #   status line nobody can use.
 NDONE_ALL=$(find "$SWEEP_ROOT/done" -type f 2>/dev/null | wc -l)
-NDONE=$(ls "$SWEEP_ROOT/done" 2>/dev/null | grep -Fxf "$SWEEP_ROOT/cells.txt" 2>/dev/null | wc -l)
-NFAIL=$(ls "$SWEEP_ROOT/fail" 2>/dev/null | grep -Fxf "$SWEEP_ROOT/cells.txt" 2>/dev/null | wc -l)
+NDONE=$(ls "$SWEEP_ROOT/done" 2>/dev/null | grep -Fxf "$PLAN_FILE" 2>/dev/null | wc -l)
+NFAIL=$(ls "$SWEEP_ROOT/fail" 2>/dev/null | grep -Fxf "$PLAN_FILE" 2>/dev/null | wc -l)
 NOTHER=$((NDONE_ALL - NDONE))
 if $STATUS; then
     fir_print_provenance
@@ -225,9 +254,10 @@ echo "  sweep root : $SWEEP_ROOT"
 echo "  done       : $NDONE / $TOTAL   (failed so far: $NFAIL)"
 [ "$NOTHER" -gt 0 ] && echo "               +$NOTHER cells done under ANOTHER grid in this root"
 
-# ⭐ THE ARRAY INDEXES cells.txt, and cells.txt is REGENERATED from the planner
-#   every submit. The planner's order is deterministic and selftested, so an index
-#   means the same cell on every submission.
+# ⭐ THE ARRAY INDEXES THE PLAN FILE, a per-submission snapshot of the planner's
+#   output. The planner's order is deterministic and selftested, so an index means
+#   the same cell on every submission -- and because the snapshot is unique to this
+#   submit, a LATER submit of another grid cannot move it under a queued array.
 if [ "$P_CANARY" -gt 0 ]; then
     LAST=$((P_CANARY - 1))
     # ⚠ the canary takes ONE CELL PER ARM, not the first N lines: the first 80 are
@@ -297,12 +327,15 @@ jid=$(sbatch --parsable <<SB
 #SBATCH --output=$SWEEP_ROOT/logs/slurm_%A_%a.out
 cd "\$SLURM_SUBMIT_DIR" || exit 1
 set -uo pipefail
-# ⚠ PIN THE GRID EXPLICITLY. cells.txt was generated by the submitter under this
-#   grid; if the array task resolved a DIFFERENT one, parse_cell_id would refuse
-#   the id (fail closed) -- but relying on sbatch's --export default to carry an
-#   env var that decides WHICH EXPERIMENT RUNS is not something to leave implicit.
+# ⚠ PIN THE GRID EXPLICITLY. The plan file was generated by the submitter under
+#   this grid; if the array task resolved a DIFFERENT one, parse_cell_id refuses the
+#   id (fail closed) -- but relying on sbatch's --export default to carry an env var
+#   that decides WHICH EXPERIMENT RUNS is not something to leave implicit.
+# ⭐ AND THE PLAN PATH IS BAKED IN, unique to this submission, so a LATER submit of
+#   a different grid cannot change what this array reads. That is exactly how the
+#   2026-08-28 canaries lost four cells.
 export FIR_HP_GRID="$GRID_NAME"
-cid=\$(sed -n "\$((SLURM_ARRAY_TASK_ID + 1))p" "$SWEEP_ROOT/cells.txt")
+cid=\$(sed -n "\$((SLURM_ARRAY_TASK_ID + 1))p" "$PLAN_FILE")
 [ -n "\$cid" ] || { echo "FAIL: no cell at index \$SLURM_ARRAY_TASK_ID"; exit 1; }
 bash sbatch/fir/04_hp_sweep.sh --run-one "\$cid"
 SB
