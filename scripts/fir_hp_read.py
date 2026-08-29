@@ -189,6 +189,45 @@ def report(run_root, arms=None, top=15):
                      f"({len(want)} cells, {len(want)//len(H.ARMS)} per arm). The best cell "
                      f"is in block **{bname}**; edges are tested against THAT block, "
                      f"because the union is two disjoint factorials, not one.")
+    elif H.PROBE:
+        # ⛔ A PROBE IS A RAY, AND ITS ONLY MEANING IS RELATIVE TO ITS ANCHOR. Ranking
+        #   its 2 cells among themselves, or printing an edge verdict, would both be
+        #   category errors: every cell here is one step PAST an edge by construction.
+        #   The question is "does the metric keep RISING off the base grid's edge",
+        #   and it can only be answered against the anchor's own measured score.
+        pr = H.EDGE_PROBES[H.PROBE]
+        anchor = H.cell_id(H.probe_anchor_cell(H.PROBE))
+        av = got.get(anchor, {}).get("val")
+        lines.append(f"  ⚠ EDGE PROBE off grid **{pr['base']}** -- a RAY, not a search. "
+                     f"These cells hold the base grid's WINNING cell fixed and step ONE "
+                     f"axis past its edge. Read them ONLY against that anchor; they "
+                     f"cannot relocate an optimum, and they are ONE SEED.")
+        if av is None:
+            lines.append(f"  ⛔ the anchor cell has no result in this run root, so the "
+                         f"probe cannot be read at all: {anchor}")
+            return lines
+        lines.append(f"    anchor  {anchor}")
+        lines.append(f"    anchor  {metric} = {av:.4f}   (the base grid's best cell)")
+        verdicts = []
+        for c in sorted(scored, key=lambda c: -got[c]["val"]):
+            d = got[c]["val"] - av
+            verdicts.append(d)
+            lines.append(f"    probe   {c:58s} {got[c]['val']:8.4f}  "
+                         f"{'+' if d >= 0 else ''}{d:.4f} vs anchor")
+        for c in diverged:
+            lines.append(f"    probe   {c:58s}  DIVERGED -- a RESULT about that value")
+        if verdicts and max(verdicts) > 0:
+            lines.append(f"  ⛔ the metric is still RISING past the edge (best probe "
+                         f"{max(verdicts):+.4f}). ⚠ +{max(verdicts):.4f} at ONE SEED is "
+                         f"NOT a new optimum -- this repo's winner's curse is ~0.02-0.04 "
+                         f"[R.264]. It is a reason to consider a real extension BLOCK, "
+                         f"which is a scope change and a budget-gate question.")
+        elif verdicts:
+            lines.append(f"  ✅ the metric does NOT rise past the edge (best probe "
+                         f"{max(verdicts):+.4f}) -- the edge warning on {pr['base']} is "
+                         f"CLOSED at this anchor, for the cost of {len(verdicts)} cells. "
+                         f"⚠ 'at this anchor': a ray holds every other axis fixed.")
+        return lines
     elif H._G.get("published_point"):
         # ⛔ A REF BLOCK HAS NO INTERIOR AND NO EDGES. "The optimum is at the edge"
         #   is not false here, it is MEANINGLESS: there is one point, chosen by the
@@ -245,6 +284,48 @@ def selftest():
                 w = csv.DictWriter(fh, fieldnames=["task_name", "f1", "accuracy", "best_epoch"])
                 w.writeheader()
                 w.writerow({"task_name": "mrpc", "f1": f1, "accuracy": acc, "best_epoch": ep})
+
+        # ⛔ AN EDGE PROBE IS 2 CELLS AND HAS NO AXES -- cs[2..4] below do not exist
+        #   for it. What must be true of it is that it is read RELATIVE TO ITS
+        #   ANCHOR, and that its verdict can come out BOTH ways.
+        if H.PROBE:
+            anchor = H.cell_id(H.probe_anchor_cell(H.PROBE))
+            # (i) the anchor is a cell of the BASE grid, so it may be absent from
+            #     this run root -- and then the probe means nothing and must say so.
+            write(H.cell_id(cs[0]), 0.80)
+            L = report(d)
+            ck(any("INCOMPLETE" in l for l in L) and any("coverage: 1/2" in l for l in L),
+               "a partial probe is labelled INCOMPLETE, like any other grid")
+            ck(any("cannot be read at all" in l for l in L),
+               "⭐ CONTROL: with no anchor result the probe REFUSES to be read "
+               "(a ray with no origin is not a measurement)")
+            ck(not any("grid EDGE" in l or "INTERIOR on every" in l for l in L),
+               "CONTROL: a probe emits NO edge/interior verdict (it has no ladder)")
+            # (ii) probes BELOW the anchor: the edge warning is closed
+            write(anchor, 0.90)
+            write(H.cell_id(cs[1]), 0.85)
+            L = report(d)
+            ck(any("EDGE PROBE off grid" in l for l in L),
+               "a probe announces itself as a ray off its base grid")
+            ck(any("does NOT rise past the edge" in l for l in L),
+               "⭐ probes below the anchor CLOSE the edge warning")
+            ck(any("-0.0500 vs anchor" in l for l in L),
+               "...and every probe is printed as a DELTA against the anchor")
+            # (iii) a probe ABOVE the anchor: the same code must say the opposite
+            write(H.cell_id(cs[1]), 0.95)
+            L = report(d)
+            ck(any("still RISING past the edge" in l for l in L),
+               "⭐ CONTROL: a probe above the anchor says the metric is still RISING "
+               "(the verdict fires in BOTH directions, or it is not a verdict)")
+            ck(any("winner's curse" in l for l in L),
+               "...and refuses to call +0.05 at one seed a new optimum")
+            for l in ok:
+                print(f"  ✅ {l}")
+            for l in bad:
+                print(f"  ⛔ {l}")
+            print(f"selftest: {len(ok)} passed, {len(bad)} failed")
+            shutil.rmtree(d, ignore_errors=True)
+            return 1 if bad else 0
 
         # a partial grid must say INCOMPLETE and must still rank what it has
         write(H.cell_id(cs[0]), 0.80)

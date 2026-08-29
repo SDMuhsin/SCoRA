@@ -19,6 +19,12 @@
 #   loca       LoCA       144   qwha  QWHA   144    lyra  LYRA  192
 #   scora      SCoRA      36    scora2 SCoRA-2 140  (ours — deliberately the smallest)
 #   wref       WaveFT at its own PUBLISHED point — 4 REF cells, no canary (no centre)
+#   locax qwhax lyrax scora2x   ⭐ EDGE PROBES — 2 cells each, no canary (every cell
+#              is one step PAST an edge, so none of them is central). Submit whole.
+#              Each holds its base grid's WINNING cell fixed and steps ONE axis past
+#              the edge the reader flagged; read with fir_hp_read.py, which scores
+#              them as DELTAS against that anchor. ⚠ scora2x is OUR arm and uses its
+#              last 2 cells of budget headroom (140+2 = the comparator's 142).
 #
 # ONE Slurm ARRAY, one cell per task.  MRPC, q_proj+o_proj, 1 seed (42), 5 epochs.
 #

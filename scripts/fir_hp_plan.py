@@ -468,8 +468,88 @@ WREF = {"arms": WAVE_ARMS, "coord": "p", "published_point": "waveft",
 #   axes would claim a bracketing the design does not have.
 WAVE_ALL = {"arms": WAVE_ARMS, "coord": "p", "union": ["w1", "w2"]}
 
+# ---------------------------------------------------------------------------
+# ⭐⭐ THE EDGE PROBES.  Four 2-cell RAYS off the four grids whose best cell landed
+#   ON a ladder edge (`FIR_GEMMA_PORT.md` §20.3).  A probe is NOT a widened grid.
+# ---------------------------------------------------------------------------
+# `[user, 2026-08-29]`: "extend the search ranges for the 4 cases that need it".
+#
+# ⛔⛔ WHY A RAY AND NOT A WIDER FACTORIAL -- read this before enlarging one.
+#   1. THE QUESTION AN EDGE POSES IS ONE-DIMENSIONAL. The reader flags an edge to
+#      say "the metric may still be RISING when the ladder stops". Two cells off
+#      the end of that one axis, at the winning cell's own other coordinates,
+#      answer exactly that. A full extra factorial block answers it too -- for
+#      28-56x the GPU -- and at ONE SEED the extra cells buy mostly SELECTION
+#      INFLATION, which is the differential `w2` was built to remove (§3.3), not
+#      discovery.
+#   2. ⛔ THE BUDGET GATE IS DIRECTIONAL AND `scora2` HAS EXACTLY 2 CELLS OF
+#      HEADROOM. `max(ours) <= comparator = 142` and scora2 already holds 140. A
+#      3rd cell for OUR arm would have to be paid for by extending the FourierFT
+#      comparator too (2 arms x N cells), so "just widen it" is not a small change:
+#      it is ~8.6 GPU-h for one rung. The ray fits under the gate as it stands.
+#   3. ⭐ AND THE MARGINALS SAY MOST OF THESE EDGES ARE NOT REAL. `[measured, §20]`
+#      max F1 along each flagged axis:
+#        loca   alpha  0.125->4 : .8897 .8801 .8863 .8792 .8908 .8908   FLAT
+#        lyra   exp    1->5     : .8661 .8660 .8696 .8784                FLAT
+#        scora2 scale  16x span : .8950 .8935 .8840 .8847 .8955          FLAT
+#        qwha   P      0.16->15.6: .8308 .8398 .8576 .8780 .8828 .8845   ⭐ RISING
+#      Three of the four axes carry NO trend -- the flag fired because the
+#      single-seed argmax happened to land on the top rung of an INERT axis. Only
+#      QWHA's P axis is monotone to its edge. Spending a factorial block to widen
+#      an inert axis would be measuring noise more precisely.
+#   ⇒ A PROBE THAT RISES IS A REASON TO BUILD A REAL BLOCK. A probe that does not
+#     rise CLOSES the edge warning for ~0.1 GPU-h. Either way the ray comes first.
+#
+# ⚠ WHAT A PROBE CANNOT DO, stated before it is read: it cannot RELOCATE an
+#   optimum. It holds the other axes at the winner's values, so it explores a line,
+#   not a region, and (like everything else here) at ONE SEED. It answers "does the
+#   metric keep rising past the edge", and nothing else.
+#
+# ⛔ THE ANCHOR IS TYPED, AND IT MUST BE. It is a MEASURED result -- the best cell
+#   of a finished grid -- and results live in gitignored `logs/`, which does not
+#   travel to fir (CONTEXT §4.1). A planner that read them would enumerate an EMPTY
+#   probe there, silently, exactly as `r310_plan.selected_args()` would (§3.6). So
+#   the coordinates are constants here, with their provenance, and the selftest
+#   asserts each one RESOLVES TO A CELL OF THE BASE GRID -- which is the property
+#   that would actually break if a ladder were edited.
+EDGE_PROBES = {
+    # best loca cell, F1 0.8908 -- alpha is at the TOP rung of {0.125..4}
+    "locax": {"base": "loca", "arms": ["loca"],
+              "anchor": {"p_mult": 3.5, "scaling": 4.0, "classifier_lr": 2e-3},
+              "steps": [("scaling", [8.0, 16.0])]},
+    # best qwha cell, F1 0.8845 -- P is at the TOP rung of P_LADDER_25.
+    #   ⭐ the one probe whose axis is measurably alive; the scale axis peaked
+    #   INTERIOR (294.6) and needs nothing.
+    "qwhax": {"base": "qwha", "arms": ["qwha"],
+              "anchor": {"p_mult": 15.625, "scale_mult": 2.0, "classifier_lr": 5e-3},
+              "steps": [("p_mult", [39.0625, 97.65625])]},
+    # best lyra cell, F1 0.8784 -- the exponent is at the TOP of {1,2,3,5}
+    # ⭐ [measured, CPU] the exponent SATURATES, and 13 is near its asymptote: at
+    #   d=2048/k=16 the geometric index set is {0,1,2,3,4,5,10,23,...} at ex=5,
+    #   {0..8,17,40,...} at ex=8 and {0..10,18,56,...} at ex=13 -- i.e. it converges
+    #   on this codebase's OWN `freq_mode="contiguous"`. So this probe asks "is the
+    #   flagged edge just LYRA wanting contiguous low frequencies?", and going past
+    #   ~13 would buy almost no new index set. ⭐ k is PRESERVED at every exponent
+    #   (the collision loop increments rather than drops), so budget parity holds.
+    "lyrax": {"base": "lyra", "arms": ["lyra"],
+              "anchor": {"p_mult": 2.5, "scaling": 0.8, "classifier_lr": 5e-3,
+                         "freq_exponent": 5.0},
+              "steps": [("freq_exponent", [8.0, 13.0])]},
+    # ⛔ best scora2 cell, F1 0.8955 -- TWO edges at once (scaling at the top rung,
+    #   classifier_lr at the bottom), and exactly 2 cells of budget headroom. So
+    #   this probe spends ONE cell on EACH edge rather than two on either.
+    "scora2x": {"base": "scora2", "arms": ["scora2"],
+                "anchor": {"p_mult": 6.25, "scale_mult": 4.0, "classifier_lr": 5e-4},
+                "steps": [("scale_mult", [8.0]), ("classifier_lr", [1e-4])]},
+}
+# ⭐ Materialised into grid dicts so every downstream tool (`--list`, the runner,
+#   the reader, the shell gate) sees them as ordinary selectable grids.
+PROBE_GRIDS = {n: {"arms": p["arms"], "coord": "p", "probe": n}
+               for n, p in EDGE_PROBES.items()}
+
 GRIDS = {"g1": G1, "g2": G2, "w1": W1, "w2": W2, "wave": WAVE_ALL,
-         "loca": L1, "qwha": Q1, "lyra": Y1, "scora": S1, "scora2": S2, "wref": WREF}
+         "loca": L1, "qwha": Q1, "lyra": Y1, "scora": S1, "scora2": S2, "wref": WREF,
+         **PROBE_GRIDS}
 # ⛔ THE ARMS WHOSE RESULT WE ARE CLAIMING. The budget gate is DIRECTIONAL -- an
 #   arm we own must never hold a LARGER search budget than the comparator -- so it
 #   needs to know which arms are ours. `[R.306]`: both SCoRA rows always ship
@@ -489,6 +569,10 @@ IS_UNION = "union" in _G
 #   test) branches on this flag rather than on `len(scalings) == 0`.
 NO_SCALE = bool(_G.get("no_scale"))
 EXTRA = _G.get("extra")            # None except LYRA's freq_exponent (a 4th axis)
+# ⛔ A PROBE IS A GRID KIND TOO, for the same reason NO_SCALE is one: everything
+#   downstream (axes, the canary picker, the reader, the shell gate) must branch
+#   on a DECLARED kind, never on the shape of a ladder it happens to find.
+PROBE = _G.get("probe")            # the EDGE_PROBES key, or None
 # ⛔ THE 4th-AXIS KEYS ARE MODULE-LEVEL, NOT READ OFF THE SELECTED GRID. cell_id()
 #   and cell_cmd() must mean the same thing for a cell no matter which grid happens
 #   to be selected -- budget_per_arm() enumerates every grid at once, and an id that
@@ -554,6 +638,11 @@ def resolve_scalings(grid, PT=None):
                        RoBERTa-tuned scale (SCoRA-2: its anchor is [R.306]'s
                        swept optimum, which no port rule moves).
     """
+    if grid.get("probe"):
+        # ⛔ A PROBE HAS NO LADDER OF ITS OWN. Its scale value (when it has one) is
+        #   the ANCHOR's, resolved against the BASE grid -- returning a one-value
+        #   "ladder" here would let an edge test run on a line.
+        return []
     if grid.get("no_scale") or grid.get("union") or grid.get("published_point"):
         # ⛔ NONE of these has a scale LADDER, and each for a different reason: no
         #   scale axis at all; two blocks with two ladders; one fixed published
@@ -667,6 +756,13 @@ def axes_of(grid):
     if "union" in grid:
         raise SystemExit("FAIL CLOSED: a union view has no single axis set -- "
                          "ask its member grids (member_grids())")
+    if grid.get("probe"):
+        # ⛔ A PROBE IS A RAY, NOT A FACTORIAL. Handing back its 1-2 stepped values
+        #   as an "axis" would let the reader's edge test fire on a line whose every
+        #   cell is an endpoint by construction -- the <3-values case, but worse,
+        #   because it would read as a bracketing claim the design never makes.
+        raise SystemExit("FAIL CLOSED: an edge probe is a RAY off a base grid's "
+                         "edge -- it has no interior; read it against its base")
     if grid.get("published_point"):
         # ⛔ A REF BLOCK HAS NO AXES AT ALL, and that is the point of it: it sits at
         #   ONE published point. Handing back a degenerate axis set would let the
@@ -720,6 +816,13 @@ def canary_indices(ids=None):
     if IS_UNION:
         raise SystemExit("FAIL CLOSED: 'wave' is a READING VIEW, not a run target -- "
                          "canary and submit against w1 or w2")
+    if PROBE:
+        # ⛔ A PROBE HAS NO CENTRAL CELL EITHER -- every one of its cells is, by
+        #   construction, one step BEYOND an edge. Picking one and calling it a
+        #   canary would smoke-test the most extreme cell in the block. It is 2
+        #   cells; submit it whole.
+        raise SystemExit("FAIL CLOSED: an edge probe has no central cell (every "
+                         "cell is past an edge). Submit it whole -- it is 2 cells.")
     if _G.get("published_point"):
         # ⛔ A CANARY IS "ONE CENTRAL CELL PER ARM" AND A REF BLOCK HAS NO CENTRE.
         #   It is 4 cells at one fixed point; submit it whole. Refusing is not a
@@ -766,6 +869,8 @@ def _cells_of(grid, arms=None, PT=None):
         return out
     if grid.get("published_point"):
         return _published_cells(grid, arms, PT=PT)
+    if grid.get("probe"):
+        return _probe_cells(grid, arms, PT=PT)
     out = []
     first = grid.get("p_mults") if grid["coord"] == "p" else grid["lrs"]
     ns = bool(grid.get("no_scale"))
@@ -790,6 +895,84 @@ def _cells_of(grid, arms=None, PT=None):
                         else:
                             c["lr"] = v
                         out.append(c)
+    return out
+
+
+def _base_ladder(base, key):
+    """The BASE grid's own ladder for a probed axis key, in the units the probe
+    steps in.  ⛔ `scale_mult` is answered with the MULTIPLIERS and `scaling` with
+    the RESOLVED values: comparing a multiplier against a resolved ladder would
+    silently call 8.0 'outside' a ladder that runs to 1178."""
+    if key == "scale_mult":
+        return list(base.get("scale_mults") or [])
+    if key == "scaling":
+        return list(resolve_scalings(base))
+    if key == "p_mult":
+        return list(base.get("p_mults") or [])
+    if key == "classifier_lr":
+        return list(base.get("clf_lrs") or [])
+    if base.get("extra") and key == base["extra"]["key"]:
+        return list(base["extra"]["values"])
+    return None
+
+
+def probe_anchor_cell(name, PT=None):
+    """The BASE-grid cell an edge probe is anchored on, fully resolved.
+
+    ⭐ Built through the SAME code path as a base-grid cell -- the anchor is stated
+      in the base grid's own coordinates (`scale_mult` where the base derives its
+      ladder, a literal `scaling` where the base types one) and the scale is
+      resolved against the BASE, so a typed anchor cannot drift into a value the
+      base grid never had. The selftest asserts the id it produces is a member of
+      the base grid, which is the check that actually fires when a ladder moves."""
+    pr = EDGE_PROBES[name]
+    base = GRIDS[pr["base"]]
+    ns = bool(base.get("no_scale"))
+    a = dict(pr["anchor"])
+    if "scale_mult" in a:
+        if "scale_mults" not in base:
+            raise SystemExit(f"FAIL CLOSED: probe {name} gives a scale_mult but base "
+                             f"{pr['base']!r} types its ladder -- give `scaling`")
+        anchors = resolve_scalings(base, PT=PT)
+        m = a.pop("scale_mult")
+        mults = base["scale_mults"]
+        # ⛔ RESOLVED THROUGH THE BASE'S OWN LADDER where the multiplier is on it,
+        #   and through its anchor otherwise (that is how a probe STEPS PAST the
+        #   top rung). Never re-derived from a second copy of the anchor value.
+        a["scaling"] = anchors[mults.index(m)] if m in mults else anchors[0] / mults[0] * m
+    c = {"arm": pr["arms"][0], "task": TASK, "targets": TARGETS, "seed": SEED,
+         "epochs": EPOCHS, "scaling": None if ns else a.get("scaling"),
+         "classifier_lr": a["classifier_lr"], "p_mult": a["p_mult"]}
+    if base.get("extra"):
+        c[base["extra"]["key"]] = a.get(base["extra"]["key"])
+    c["lr"] = lr_for(c["p_mult"], c["scaling"], PT=PT, arms=pr["arms"], no_scale=ns)
+    return c
+
+
+def _probe_cells(grid, arms=None, PT=None):
+    """The probe's cells: the anchor, with ONE axis stepped past the base's edge.
+
+    ⛔ ONE AXIS AT A TIME, never a cross product. Two cells that differ in two knobs
+      cannot say which knob moved the metric, and the whole purpose of the block is
+      to attribute a single edge."""
+    name = grid["probe"]
+    pr = EDGE_PROBES[name]
+    base = GRIDS[pr["base"]]
+    ns = bool(base.get("no_scale"))
+    anchor = probe_anchor_cell(name, PT=PT)
+    out = []
+    for arm in (arms or grid["arms"]):
+        for key, vals in pr["steps"]:
+            for v in vals:
+                c = dict(anchor, arm=arm)
+                if key == "scale_mult":
+                    mults = base["scale_mults"]
+                    c["scaling"] = resolve_scalings(base, PT=PT)[0] / mults[0] * v
+                else:
+                    c[key] = v
+                c["lr"] = lr_for(c["p_mult"], c["scaling"], PT=PT,
+                                 arms=pr["arms"], no_scale=ns)
+                out.append(c)
     return out
 
 
@@ -951,7 +1134,9 @@ def selftest():
         ck(len(cs) == n_expect,
            f"union {GRID_NAME} is the sum of its blocks = {len(cs)} cells")
     else:
-        if _G.get("published_point"):
+        if PROBE:
+            _shape = [len(ARMS), sum(len(v) for _k, v in EDGE_PROBES[PROBE]["steps"])]
+        elif _G.get("published_point"):
             _shape = [len(ARMS), len(CLF_LRS)]
         else:
             _shape = [len(ARMS), len(_first)] + ([] if NO_SCALE else [len(scalings())]) \
@@ -966,7 +1151,10 @@ def selftest():
     #   the same commit, deliberately.
     ck({"g1": 160, "g2": 140, "w1": 96, "w2": 192, "wave": 288,
         "loca": 144, "qwha": 144, "lyra": 192, "scora": 36, "scora2": 140,
-        "wref": 4}[GRID_NAME] == len(cs),
+        "wref": 4,
+        # ⛔ 2 EACH, AND scora2x's 2 ARE A HARD CEILING, not a shape preference:
+        #   140 + 2 == the comparator's 142 exactly (the directional gate below).
+        "locax": 2, "qwhax": 2, "lyrax": 2, "scora2x": 2}[GRID_NAME] == len(cs),
        f"{GRID_NAME} has its declared cell count")
     if not IS_UNION:
         _nax = 2 if NO_SCALE else 3
@@ -978,6 +1166,12 @@ def selftest():
                 axes(); ck(False, "CONTROL: a REF block refuses an axis set")
             except SystemExit:
                 ck(True, "CONTROL: a REF block refuses an axis set (it sweeps nothing)")
+            _nax = None
+        if PROBE:
+            try:
+                axes(); ck(False, "CONTROL: an edge probe refuses an axis set")
+            except SystemExit:
+                ck(True, "CONTROL: an edge probe refuses an axis set (it is a ray)")
             _nax = None
         if _nax is not None:
             ck(len(axes()) == _nax and all(len(a[2]) > 0 for a in axes()),
@@ -1083,9 +1277,12 @@ def selftest():
     #   the one arm with a 4th method axis; the exemption is keyed on that fact, not
     #   on its name, so it evaporates the day the axis does.
     def _naxes(a):
+        # ⛔ PROBES AND REF BLOCKS ARE NOT LADDERS, so they cannot contribute an
+        #   axis COUNT -- axes_of() fails closed on both, and a bare comprehension
+        #   over GRIDS would take the exception rather than skip the grid.
         return max((len(axes_of(g)) for _n, g in GRIDS.items()
                     if not g.get("union") and not g.get("published_point")
-                    and a in g["arms"]), default=0)
+                    and not g.get("probe") and a in g["arms"]), default=0)
     comp_ax = _naxes(FFT_ARMS[0])
     for a, n in sorted(B.items()):
         ck(n <= COMP * 1.1 or _naxes(a) > comp_ax,
@@ -1101,7 +1298,8 @@ def selftest():
     def _ratio(a):
         ls = [sorted(g["p_mults"]) for _n, g in GRIDS.items()
               if g.get("coord") == "p" and not g.get("union")
-              and not g.get("published_point") and a in g["arms"]]
+              and not g.get("published_point") and not g.get("probe")
+              and a in g["arms"]]
         rs = [l[i+1] / l[i] for l in ls for i in range(len(l) - 1)]
         return max(rs) if rs else None
     _sr = _ratio("scora")
@@ -1109,6 +1307,56 @@ def selftest():
                                for a in B if _ratio(a) is not None),
        f"⭐ scora's single P axis is the FINEST of every arm's (ratio {_sr:g}) -- "
        f"the number that makes its 36 cells defensible is RESOLUTION, not count")
+    # ------------------------------------------------------------------
+    # ⭐⭐ THE EDGE PROBES. Global (they run under EVERY grid): a probe is a claim
+    #   about the RELATIONSHIP between two grids, so checking it only when the probe
+    #   happens to be selected would be the `--selftest`-skipped-its-fan-out defect
+    #   again (§4.2).
+    # ------------------------------------------------------------------
+    for _pn, _pr in sorted(EDGE_PROBES.items()):
+        _base = GRIDS[_pr["base"]]
+        _bids = {cell_id(c) for c in _cells_of(_base)}
+        _pids = {cell_id(c) for c in _cells_of(GRIDS[_pn])}
+        # ⛔⛔ THE ONE CHECK THAT ACTUALLY FIRES WHEN A LADDER MOVES. The anchor is a
+        #   TYPED measured result; if the base grid is ever edited, this is what
+        #   turns "the probe points at a cell that was never run" from a silent
+        #   wrong answer into a red suite.
+        ck(cell_id(probe_anchor_cell(_pn)) in _bids,
+           f"⭐ {_pn}: its anchor IS a cell of {_pr['base']} "
+           f"({cell_id(probe_anchor_cell(_pn))})")
+        ck(_pr["arms"] == _base["arms"],
+           f"{_pn}: probes exactly the arms {_pr['base']} searched")
+        ck(not (_pids & _bids),
+           f"{_pn}: its {len(_pids)} cells are ALL NEW budget -- none duplicates "
+           f"a cell {_pr['base']} already ran")
+        ck(len(_pids) == sum(len(v) for _k, v in _pr["steps"]) * len(_pr["arms"]),
+           f"{_pn}: one cell per stepped value, one axis at a time (no cross product)")
+        # ⭐ AND EVERY STEP MUST LAND OUTSIDE THE BASE LADDER, or it is not a probe --
+        #   it is a duplicate wearing a new grid name.
+        for _k, _vs in _pr["steps"]:
+            _lad = _base_ladder(_base, _k)
+            for _v in _vs:
+                ck(_lad is not None and (_v > max(_lad) or _v < min(_lad)),
+                   f"⭐ {_pn}: {_k}={_v:g} is OUTSIDE {_pr['base']}'s ladder "
+                   f"({min(_lad):g}..{max(_lad):g}) -- a probe steps PAST an edge")
+        # ⛔ A CONTROL THAT FIRES: the anchor's OWN value on the probed axis is by
+        #   construction INSIDE the ladder, so the test above must reject it.
+        #   Without this, "outside" could be vacuously true for any number.
+        for _k, _vs in _pr["steps"]:
+            _lad = _base_ladder(_base, _k)
+            _av = _pr["anchor"].get(_k)
+            ck(_av is None or not (_av > max(_lad) or _av < min(_lad)),
+               f"CONTROL: {_pn}: the ANCHOR's own {_k}={_av} is INSIDE the base "
+               f"ladder, so the outside-test is a real constraint")
+    # ⛔⛔ AND THE CEILING, MADE ARITHMETIC. `scora2x` exists at exactly 2 cells
+    #   because 140 + 2 == the comparator's budget. Assert the headroom is GONE, so
+    #   that a future 3rd cell fails here rather than in a paper.
+    _B = budget_per_arm()
+    _COMP = min(_B[a] for a in FFT_ARMS)
+    ck(_B["scora2"] == _COMP,
+       f"⭐ scora2's probe uses its LAST cell of headroom ({_B['scora2']} == the "
+       f"comparator's {_COMP}) -- a wider probe for OUR arm would need the "
+       f"comparator extended too [Dodge §6]")
     # ⛔ w2 must be all-new cells, or the budget does not actually rise.
     _w1 = {cell_id(c) for c in _cells_of(W1)}
     _w2 = {cell_id(c) for c in _cells_of(W2)}
@@ -1129,7 +1377,12 @@ def selftest():
         ck(True, "CONTROL: a union refuses a single axis set (it is two blocks)")
     # --- the canary: one cell per arm, CENTRAL on every axis, derived from the grid
     #   (⛔ a union view has none, by design -- that control fires above)
-    _no_canary = IS_UNION or bool(_G.get("published_point"))
+    _no_canary = IS_UNION or bool(_G.get("published_point")) or bool(PROBE)
+    if PROBE:
+        try:
+            canary_indices(); ck(False, "CONTROL: an edge probe refuses to pick a canary")
+        except SystemExit:
+            ck(True, "CONTROL: an edge probe refuses to pick a canary (no centre)")
     if _G.get("published_point"):
         try:
             canary_indices(); ck(False, "CONTROL: a REF block refuses to pick a canary")
@@ -1158,8 +1411,11 @@ def selftest():
         ck(True, "CONTROL: an unknown cell id is refused")
 
     # --- the reference points must be reachable, or the search cannot speak to them
-    ck(5e-3 in (CLF_LRS or {c["classifier_lr"] for c in cs}),
-       "the carried classifier_lr 5e-3 is on the grid")
+    # ⚠ A PROBE CARRIES ITS ANCHOR'S clf_lr, not a ladder: requiring 5e-3 here would
+    #   demand a value the winning cell may not have had (locax's anchor is 2e-3).
+    #   The BASE grid is where that anchor has to hold, and it is checked there.
+    ck(bool(PROBE) or 5e-3 in (CLF_LRS or {c["classifier_lr"] for c in cs}),
+       "the carried classifier_lr 5e-3 is on the grid (a probe inherits its anchor's)")
     PT = FP.port()
     if COORD == "lr":
         dl = PT["targets"][TARGETS]["arms"]["fftm"]["derived_lr"]
@@ -1217,6 +1473,7 @@ def selftest():
             #   the same trap the WaveFT anchors block already documents.
             UPa = sorted({c["p_mult"] for a in ARMS for _n, g in GRIDS.items()
                           if not g.get("union") and not g.get("published_point")
+                          and not g.get("probe")
                           and a in g["arms"] for c in _cells_of(g, [a])})
             ck(min(UPa) <= 0.3 and max(UPa) >= 10.0,
                f"the P ladder searched for {'/'.join(ARMS)} brackets the MEASURED "
