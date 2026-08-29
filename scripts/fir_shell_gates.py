@@ -22,7 +22,7 @@
 
 Usage:  env/bin/python scripts/fir_shell_gates.py --selftest
 """
-import os, re, subprocess, sys, tempfile, shutil
+import os, re, subprocess, sys, tempfile, shutil, glob
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FIR = os.path.join(ROOT, "sbatch", "fir")
@@ -257,7 +257,7 @@ def t_sweep_status_sees_a_killed_cell():
         r0 = sh(f'bash sbatch/fir/04_hp_sweep.sh --status',
                 env={"FIR_SCRATCH_ROOT": tmp, "FIR_LOGGING": "1",
                      "FIR_COLLECT_DIR": os.path.join(tmp, "collected")})
-        cid = open(os.path.join(root, "cells.txt")).read().split("\n")[0]
+        cid = _first_planned_cell(root)
         # ⚠ ASK THE PLANNER, don't hardcode 160: the grid is selectable and the count
         #   changed the day a second grid landed. A test that pins a number the code
         #   is allowed to change fails for the wrong reason.
@@ -309,6 +309,20 @@ def t_sweep_status_sees_a_killed_cell():
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
+
+
+def _first_planned_cell(root):
+    """The first cell id from the MOST RECENT plan snapshot in this sweep root.
+
+    ⛔ It used to read `$SWEEP_ROOT/cells.txt` -- the shared, every-submit-rewritten
+      file whose mutability lost four canaries on 2026-08-28. Plan files are now
+      per-submission, so a reader has to name WHICH submission it means; "the newest"
+      is the right answer for a test that just made one."""
+    plans = os.path.join(root, "plans")
+    files = sorted(glob.glob(os.path.join(plans, "*.txt")), key=os.path.getmtime)
+    if not files:
+        raise FileNotFoundError(f"no plan snapshot under {plans}")
+    return open(files[-1]).read().split("\n")[0]
 
 
 def _grids():
@@ -396,7 +410,7 @@ def t_sweep_submit_plan_is_computable_for_every_grid():
 
             # ⛔ RESUME: plant a done marker for cell 0 and prove it is NOT submitted.
             root = os.path.join(tmp, "runs", "hpsweep")
-            cid = open(os.path.join(root, "cells.txt")).read().split("\n")[0]
+            cid = _first_planned_cell(root)
             open(os.path.join(root, "done", cid), "w").write("100")
             rr = sh('bash sbatch/fir/04_hp_sweep.sh --dry-run', env=env)
             spec2 = [l for l in rr.stdout.splitlines() if l.startswith("DRY RUN: would submit")]
@@ -410,11 +424,54 @@ def t_sweep_submit_plan_is_computable_for_every_grid():
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+def t_a_later_submit_cannot_move_a_queued_array_plan():
+    """⛔⛔ THE DEFECT THAT COST FOUR H100 ALLOCATIONS, 2026-08-28.
+
+    The cell list was ONE `$SWEEP_ROOT/cells.txt`, rewritten by every submit. Five
+    canaries submitted 40 s apart therefore all read the LAST writer's list: four
+    queued arrays looked up their index in `scora2`'s cells and ran a scora2 cell id
+    under a loca/qwha/lyra/scora grid pin. `parse_cell_id` refused every one -- so
+    nothing wrong was measured -- but the four wall-clock measurements the canaries
+    existed to produce were lost, and three bogus `started/` markers were left.
+
+    ⭐ The plan file is now a per-submission snapshot. This proves it, the way the
+      failure actually happened: plan grid A, then plan grid B into the SAME sweep
+      root, then assert A's file still holds A's cells. And a CONTROL that the test
+      can fail: the two plan files must differ, or the check proves nothing.
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        base = {"FIR_SCRATCH_ROOT": tmp, "FIR_LOGGING": "1",
+                "FIR_COLLECT_DIR": os.path.join(tmp, "collected")}
+        plans = os.path.join(tmp, "runs", "hpsweep", "plans")
+        seen = {}
+        for g in ("loca", "scora2"):
+            before = set(os.listdir(plans)) if os.path.isdir(plans) else set()
+            sh('bash sbatch/fir/04_hp_sweep.sh --dry-run --canary 2',
+               env=dict(base, FIR_HP_GRID=g))
+            new = sorted(set(os.listdir(plans)) - before)
+            check(f"[plan] {g} writes its OWN plan file", len(new) == 1, new)
+            if len(new) == 1:
+                seen[g] = os.path.join(plans, new[0])
+        if len(seen) == 2:
+            a = open(seen["loca"]).read().splitlines()
+            b = open(seen["scora2"]).read().splitlines()
+            check("⭐ the FIRST grid's plan is UNCHANGED after a second grid submits",
+                  bool(a) and all("-loca-" in c for c in a), a[:2])
+            check("CONTROL: the second grid's plan is a DIFFERENT list",
+                  bool(b) and all("-scora2-" in c for c in b) and a != b, b[:2])
+            check("CONTROL: the two submissions did not share one file",
+                  seen["loca"] != seen["scora2"], seen)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     for t in (t_syntax, t_nousersite_exported, t_assert_in_venv, t_stage_callsites,
               t_no_bare_python, t_env_gate_location_check, t_provenance,
               t_sweep_status_sees_a_killed_cell,
-              t_sweep_submit_plan_is_computable_for_every_grid):
+              t_sweep_submit_plan_is_computable_for_every_grid,
+              t_a_later_submit_cannot_move_a_queued_array_plan):
         t()
     print(f"selftest: {_P[0]} passed, {_P[1]} failed")
     return 1 if _P[1] else 0

@@ -73,8 +73,25 @@ def verify_receipts(text, cell):
     return True, note
 
 
+# ⛔ A DISTINCT EXIT CODE FOR "THIS CELL IS NOT IN THIS GRID", because it is a
+#   DIFFERENT EVENT from "the cell ran and failed" and the two must not be reported
+#   as one. [2026-08-28] five canaries were submitted 40 s apart against ONE shared
+#   cells.txt; four arrays read the last writer's list and looked up a `scora2` id
+#   under a loca/qwha/lyra/scora pin. This guard refused all four -- ⭐ nothing wrong
+#   was measured, which is the entire point of failing closed -- but the shell could
+#   not tell the difference, so it left `started/` markers for cells that never ran.
+RC_NOT_IN_GRID = 5
+
+
 def run(cell_id, run_root, python=None, timeout=None):
-    c = H.parse_cell_id(cell_id)
+    try:
+        c = H.parse_cell_id(cell_id)
+    except SystemExit as e:
+        print(f"⛔ PLAN/GRID MISMATCH: {e}")
+        print(f"   grid selected here: {H.GRID_NAME!r}  ({len(H.cells())} cells)")
+        print( "   NOTHING RAN. The array read a plan file written for another grid;")
+        print( "   re-submit this grid -- plan files are per-submission now.")
+        return RC_NOT_IN_GRID
     cmd = H.cell_cmd(c)
     env = dict(os.environ)
     env.update(H.cell_env(c, run_root))
@@ -166,6 +183,16 @@ def selftest():
         ck(not okc and "no cell given" not in notec, f"CONTROL: FIRES on {label}")
 
     ck(H.parse_cell_id(H.cell_id(H.cells()[0])) is not None, "a cell id round-trips")
+    # ⛔ CONTROL: a cell id from ANOTHER grid must return RC_NOT_IN_GRID -- a code the
+    #   shell can distinguish from "it ran and failed", so it can WITHDRAW the start
+    #   marker. Not a crash, and not a plain 1.
+    import tempfile as _tf
+    _d = _tf.mkdtemp()
+    ck(run("mrpc-nosucharm-q_o-lr9p9-sc1-clr1-seed42", _d) == RC_NOT_IN_GRID,
+       f"CONTROL: a foreign cell id returns RC_NOT_IN_GRID ({RC_NOT_IN_GRID}), "
+       f"distinguishably from a training failure")
+    ck(not os.path.exists(os.path.join(_d, "logs")),
+       "...and it wrote no log, because nothing ran")
 
     for l in ok:
         print(f"  ✅ {l}")
