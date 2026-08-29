@@ -79,7 +79,16 @@ def coverage(run_root, arms=None):
     want = [H.cell_id(c) for c in H.cells(arms)]
     got = load(run_root)
     done = {c for c in want if c in got}          # includes diverged cells: they RAN
-    failed = {os.path.basename(p) for p in glob.glob(os.path.join(run_root, "fail", "*"))}
+    # ⛔ COUNT ONLY THE FAILURES THAT BELONG TO *THIS* GRID. One sweep root holds
+    #   every grid's cells (deliberately -- shared cells resume for free), so a bare
+    #   listing of fail/ reports another grid's failures under this grid's name:
+    #   [2026-08-29] all five new grids printed "failed: 3" for three markers that
+    #   are `scora2` cell ids. The shell's --status has filtered by cell id since
+    #   the "done: 160 / 140" incident; this reader never did. Same defect, second
+    #   site -- ⭐ FIXING ONE INSTANCE DOES NOT CLOSE THE CLASS.
+    wantset = set(want)
+    failed = {os.path.basename(p) for p in glob.glob(os.path.join(run_root, "fail", "*"))
+              if os.path.basename(p) in wantset}
     missing = [c for c in want if c not in done]
     return want, got, done, failed, missing
 
@@ -293,6 +302,13 @@ def selftest():
         open(os.path.join(d, "fail", H.cell_id(cs[3])), "w").write("exit=1 elapsed=9s")
         L = report(d)
         ck(any("recorded a FAILURE" in l for l in L), "failed cells are named, not dropped")
+        # ⛔ CONTROL: a fail marker for a cell of ANOTHER grid must NOT be counted.
+        #   The sweep root is shared, so this is the normal case, not an exotic one.
+        open(os.path.join(d, "fail", "mrpc-notacell-q_o-lr9p9-sc1-clr1-seed42"),
+             "w").write("exit=1")
+        L2 = report(d)
+        ck(any("failed: 1" in l for l in L2),
+           "CONTROL: a fail marker from another grid is NOT counted as this grid's")
 
         # EDGE control: a winner on the boundary must be called out...
         write(H.cell_id(cs[0]), 0.99)                      # cs[0] is lr min, sc min, clr min
