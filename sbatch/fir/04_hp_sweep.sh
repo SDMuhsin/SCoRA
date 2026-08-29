@@ -250,7 +250,37 @@ echo "  instrument selftests: OK"
 echo
 env/bin/python scripts/fir_hp_plan.py --show
 echo
-echo "  sweep root : $SWEEP_ROOT"
+# ⛔⛔ THE WRONG-CHECKOUT WARNING.  [2026-08-29]
+#   fir_env derives FIR_SCRATCH_ROOT from `basename $(pwd)` -- deliberately, so two
+#   experiments cannot share one venv/cache/runs.  The consequence is that the sweep
+#   root FOLLOWS THE DIRECTORY YOU ARE STANDING IN, and running from a second
+#   checkout does not fail: it silently starts a second sweep from zero, in a root
+#   fir_hp_read.py will never look at.  A table built from either would be partial
+#   and would look complete.  ⭐ Warn, do not block: a genuinely fresh root is legal.
+if [ "$NDONE_ALL" -eq 0 ]; then
+    OTHER=""
+    # ⛔ SIBLINGS OF *THIS* SCRATCH ROOT, not $SCRATCH/$USER rebuilt from scratch.
+    #   The first version expanded `${SCRATCH:-/scratch/$USER}` unconditionally, and
+    #   `$USER` is not set in every environment this script must survive (`set -u`
+    #   made it fatal) -- so a WARNING about being in the wrong place took out every
+    #   local gate. fir_env has already resolved FIR_SCRATCH_ROOT; its parent is the
+    #   only base this check needs, and it exists wherever the script runs at all.
+    for d in "$(dirname "$FIR_SCRATCH_ROOT")"/*/runs/hpsweep; do
+        [ -d "$d/done" ] || continue
+        [ "$d" = "$SWEEP_ROOT" ] && continue
+        n=$(find "$d/done" -type f 2>/dev/null | wc -l)
+        [ "$n" -gt 0 ] && OTHER="$OTHER
+     $n done markers in $d"
+    done
+    if [ -n "$OTHER" ]; then
+        echo "  ⛔⛔ THIS SWEEP ROOT IS EMPTY, BUT ANOTHER ONE IS NOT:$OTHER"
+        echo "     The root is derived from \`basename \$(pwd)\` = '$FIR_REPO_NAME'."
+        echo "     You are probably in the WRONG CHECKOUT. Submitting from here starts a"
+        echo "     SECOND sweep from zero; the reader only ever looks at one root."
+        echo "     ⇒ cd to the checkout that owns those markers, or set FIR_SCRATCH_ROOT."
+    fi
+fi
+echo "  sweep root : $SWEEP_ROOT   (derived from basename \$(pwd) = '$FIR_REPO_NAME')"
 echo "  done       : $NDONE / $TOTAL   (failed so far: $NFAIL)"
 [ "$NOTHER" -gt 0 ] && echo "               +$NOTHER cells done under ANOTHER grid in this root"
 
@@ -309,13 +339,14 @@ fi
 echo "  time/cell  : $P_TIME   account $FIR_ACCOUNT_GPU   gres $FIR_GPU_FULL   mem $FIR_GPU_MEM"
 echo
 
-if $DRY; then
-    echo "DRY RUN: would submit array=$ARRAY_SPEC  (grid $GRID_NAME, time $P_TIME)"
-    echo "         nothing was submitted."
-    exit 0
-fi
-
-jid=$(sbatch --parsable <<SB
+# ⛔⛔ RENDER THE ARRAY BODY BEFORE DECIDING WHETHER TO SUBMIT IT.
+#   It used to be built INSIDE the `sbatch <<SB` heredoc, which --dry-run never
+#   reached -- so the single line that decides WHICH CELL EACH TASK RUNS was the
+#   one line no local gate could see. That is the 2026-08-28 defect's own lesson
+#   turned on the check: A CHECK MUST RUN WHAT THE JOB RUNS. Rendering it here
+#   means --dry-run inspects the exact text sbatch would receive.
+BODY_FILE="${PLAN_FILE%.txt}.sbatch"
+cat > "$BODY_FILE" <<SB
 #!/bin/bash
 #SBATCH --job-name=lrs_hp_mrpc
 #SBATCH --account=$FIR_ACCOUNT_GPU
@@ -339,8 +370,20 @@ cid=\$(sed -n "\$((SLURM_ARRAY_TASK_ID + 1))p" "$PLAN_FILE")
 [ -n "\$cid" ] || { echo "FAIL: no cell at index \$SLURM_ARRAY_TASK_ID"; exit 1; }
 bash sbatch/fir/04_hp_sweep.sh --run-one "\$cid"
 SB
-)
+
+if $DRY; then
+    echo "DRY RUN: would submit array=$ARRAY_SPEC  (grid $GRID_NAME, time $P_TIME)"
+    echo "         plan  : $PLAN_FILE"
+    echo "         script: $BODY_FILE"
+    echo "--- the array body sbatch would receive ---"
+    sed 's/^/    | /' "$BODY_FILE"
+    echo "         nothing was submitted."
+    exit 0
+fi
+
+jid=$(sbatch --parsable < "$BODY_FILE")
 echo "submitted array job $jid"
+echo "script:  $BODY_FILE"
 echo "watch:   squeue -j $jid"
 echo "status:  bash sbatch/fir/04_hp_sweep.sh --status"
 echo

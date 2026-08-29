@@ -408,6 +408,47 @@ def t_sweep_submit_plan_is_computable_for_every_grid():
             check(f"[{g}] ...and it names the grid it planned",
                   f"grid {g}," in spec[0] if spec else False, spec)
 
+            # ⭐⭐ THE END-TO-END CHECK, at the exact point the 2026-08-28 defect
+            #   struck: the ARRAY BODY sbatch receives. It pins a grid AND names a
+            #   plan file, and a task runs whatever line its index picks out of
+            #   that file. Until --dry-run rendered the body, this line was the one
+            #   line no local gate could see -- it lived inside the `sbatch <<SB`
+            #   heredoc, which only a real submit reached. Resolve the index the
+            #   way the array task does and assert the cell belongs to this grid.
+            body = [l[6:] for l in rc.stdout.splitlines() if l.startswith("    | ")]
+            check(f"[{g}] the array body pins THIS grid",
+                  any(l.strip() == f'export FIR_HP_GRID="{g}"' for l in body), body[:3])
+            pf = ""
+            for l in body:
+                if l.startswith("cid=$(sed -n"):
+                    pf = l.split('"')[-2]
+            check(f"[{g}] ...and names a plan file belonging to this submission",
+                  bool(pf) and os.path.basename(pf).startswith(g + "-"), pf)
+            if pf and os.path.exists(pf):
+                lines = open(pf).read().splitlines()
+                # ⛔ MEMBERSHIP IN THE GRID'S OWN CELL LIST -- not "the id contains
+                #   the grid name". Single-arm grids happen to be named after their
+                #   arm; g1/g2/w1/w2 are not, and a check that only works for half
+                #   the grids is the [R.259]-shaped mistake of measuring the easy
+                #   case. Ask the planner, under this grid.
+                own = set(subprocess.run(
+                    [VENV_PY if os.path.exists(VENV_PY) else sys.executable,
+                     "scripts/fir_hp_plan.py", "--list"], capture_output=True,
+                    text=True, cwd=ROOT,
+                    env=dict(os.environ, FIR_HP_GRID=g)).stdout.split())
+                bad = []
+                for tok in [x for x in idx.split(",") if x.isdigit()]:
+                    i = int(tok)
+                    resolved = lines[i] if i < len(lines) else ""
+                    if resolved not in own:
+                        bad.append((tok, resolved))
+                # ⛔ THIS is exactly what four canaries got wrong on 2026-08-28: the
+                #   right index, the right grid pin, and a cell id out of SOMEONE
+                #   ELSE'S list.
+                check(f"[{g}] ⭐ every index the array uses resolves to a cell OF "
+                      f"THIS GRID (the 2026-08-28 failure, checked end to end)",
+                      bool(idx) and not bad, bad or f"idx={idx}")
+
             # ⛔ RESUME: plant a done marker for cell 0 and prove it is NOT submitted.
             root = os.path.join(tmp, "runs", "hpsweep")
             cid = _first_planned_cell(root)
@@ -446,10 +487,16 @@ def t_a_later_submit_cannot_move_a_queued_array_plan():
         plans = os.path.join(tmp, "runs", "hpsweep", "plans")
         seen = {}
         for g in ("loca", "scora2"):
-            before = set(os.listdir(plans)) if os.path.isdir(plans) else set()
+            before = set(glob.glob(os.path.join(plans, "*.txt")))
             sh('bash sbatch/fir/04_hp_sweep.sh --dry-run --canary 2',
                env=dict(base, FIR_HP_GRID=g))
-            new = sorted(set(os.listdir(plans)) - before)
+            # ⚠ COUNT PLAN FILES, not everything in plans/. A submit writes TWO
+            #   artifacts under the same stem -- the cell list `.txt` and the
+            #   rendered `.sbatch` array body -- and this check is about the LIST.
+            #   It asserted "exactly one new file" and went red the moment the body
+            #   started being rendered: a check that pins an incidental count
+            #   rather than the property it is about.
+            new = sorted(set(glob.glob(os.path.join(plans, "*.txt"))) - before)
             check(f"[plan] {g} writes its OWN plan file", len(new) == 1, new)
             if len(new) == 1:
                 seen[g] = os.path.join(plans, new[0])
@@ -466,12 +513,57 @@ def t_a_later_submit_cannot_move_a_queued_array_plan():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def t_wrong_checkout_warning_fires_and_stays_silent():
+    """⭐ THE WRONG-CHECKOUT WARNING, both directions.
+
+    `fir_env` derives the scratch root from `basename $(pwd)`, so the sweep root
+    follows the directory you stand in. Running from a second checkout does not
+    fail -- it silently starts a second sweep from zero in a root the reader never
+    looks at. [2026-08-29] that is what happened, and the missing results looked
+    exactly like jobs that had never started.
+
+    ⛔ AND THE WARNING ITSELF HAD A DEFECT WORTH A PERMANENT TEST: its first version
+      expanded `${SCRATCH:-/scratch/$USER}` unconditionally, and `$USER` is unset in
+      some environments -- under `set -u` that is FATAL, so a warning about being in
+      the wrong place took out 48 checks. A guard must not be able to break the run
+      it is guarding.
+    """
+    tmp = tempfile.mkdtemp()
+    try:
+        other = os.path.join(tmp, "otherrepo", "runs", "hpsweep", "done")
+        os.makedirs(other)
+        for i in range(3):
+            open(os.path.join(other, f"c{i}"), "w").write("400")
+        env = {"FIR_SCRATCH_ROOT": os.path.join(tmp, "thisrepo"),
+               "FIR_REPO_NAME": "thisrepo", "FIR_LOGGING": "1", "FIR_HP_GRID": "loca",
+               "FIR_COLLECT_DIR": os.path.join(tmp, "collected")}
+        r = sh('bash sbatch/fir/04_hp_sweep.sh --dry-run --canary 2', env=env)
+        out = r.stdout + r.stderr
+        check("[checkout] an EMPTY root beside a populated one WARNS",
+              "WRONG CHECKOUT" in out and "3 done markers" in out, out[-400:])
+        check("[checkout] ...and it still PLANS (it warns, it does not block)",
+              "would submit" in out, out[-200:])
+        check("[checkout] ...and the root is printed WITH its derivation",
+              "derived from basename" in out, out[-400:])
+        # ⛔ CONTROL: no sibling root -> silent. A warning that always fires is noise.
+        shutil.rmtree(os.path.join(tmp, "otherrepo"))
+        env2 = dict(env, FIR_SCRATCH_ROOT=os.path.join(tmp, "thisrepo2"),
+                    FIR_REPO_NAME="thisrepo2")
+        r2 = sh('bash sbatch/fir/04_hp_sweep.sh --dry-run --canary 2', env=env2)
+        out2 = r2.stdout + r2.stderr
+        check("[checkout] CONTROL: a genuinely fresh root is SILENT",
+              "WRONG CHECKOUT" not in out2 and "would submit" in out2, out2[-300:])
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     for t in (t_syntax, t_nousersite_exported, t_assert_in_venv, t_stage_callsites,
               t_no_bare_python, t_env_gate_location_check, t_provenance,
               t_sweep_status_sees_a_killed_cell,
               t_sweep_submit_plan_is_computable_for_every_grid,
-              t_a_later_submit_cannot_move_a_queued_array_plan):
+              t_a_later_submit_cannot_move_a_queued_array_plan,
+              t_wrong_checkout_warning_fires_and_stays_silent):
         t()
     print(f"selftest: {_P[0]} passed, {_P[1]} failed")
     return 1 if _P[1] else 0
