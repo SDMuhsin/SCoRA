@@ -368,20 +368,39 @@ def t_sweep_submit_plan_is_computable_for_every_grid():
                 check(f"[{g}] ...and nothing is submitted",
                       "would submit" not in out, out)
                 continue
-            is_ref = subprocess.run(
+            # ⛔ TWO GRID KINDS HAVE NO CENTRAL CELL, for two different reasons: a
+            #   REF block sits at ONE published point, and an edge PROBE is a ray
+            #   whose every cell is past an edge. Both must refuse `--canary` and
+            #   both must still plan a full submit -- so the branch keys on the
+            #   PROPERTY (no centre), not on either grid's name.
+            # ⚠ AND THE LABEL MUST NAME THE KIND IT ACTUALLY TESTED. The first
+            #   version printed "a REF block REFUSES..." for all four PROBE grids --
+            #   green, and describing the wrong object. A check that misnames what it
+            #   covered is how a suite comes to look like it covers something it does
+            #   not (§4.2). So the kind is read from the planner and asserted in the
+            #   refusal message: the two kinds refuse for DIFFERENT reasons and must
+            #   not be able to stand in for each other.
+            kind = subprocess.run(
                 [VENV_PY if os.path.exists(VENV_PY) else sys.executable, "-c",
                  "import sys;sys.path.insert(0,'scripts');import fir_hp_plan as H;"
-                 "print(int(bool(H._G.get('published_point'))))"], capture_output=True,
-                text=True, cwd=ROOT, env=dict(os.environ, FIR_HP_GRID=g)).stdout.strip() == "1"
+                 "print('probe' if H.PROBE else "
+                 "('ref' if H._G.get('published_point') else ''))"],
+                capture_output=True,
+                text=True, cwd=ROOT, env=dict(os.environ, FIR_HP_GRID=g)).stdout.strip()
+            is_ref = bool(kind)
             if is_ref:
+                _name = {"ref": "a REF block", "probe": "an edge PROBE"}[kind]
+                _why = {"ref": "no central cell", "probe": "every cell is past an edge"}[kind]
                 # ⛔ A REF BLOCK HAS NO CENTRAL CELL, so --canary must REFUSE it --
                 #   and the FULL submit must still plan. Both directions, because a
                 #   picker that silently returned cell 0 would look identical to a
                 #   working canary while smoke-testing a corner nobody chose.
                 rc = sh('bash sbatch/fir/04_hp_sweep.sh --dry-run --canary 2', env=env)
                 out = rc.stdout + rc.stderr
-                check(f"[{g}] CONTROL: a REF block REFUSES to plan a canary",
+                check(f"[{g}] CONTROL: {_name} REFUSES to plan a canary",
                       rc.returncode != 0 and "no central cell" in out, out)
+                check(f"[{g}] ...and the refusal gives THIS kind's reason ({_why})",
+                      _why in out, out)
                 rf = sh('bash sbatch/fir/04_hp_sweep.sh --dry-run', env=env)
                 specf = [l for l in rf.stdout.splitlines()
                          if l.startswith("DRY RUN: would submit")]
