@@ -264,8 +264,20 @@ else
 echo "--- login-node gate ---"
 fir_assert_env cpu 02 || { echo "environment not sane — refusing to submit"; exit 1; }
 fi
+# ⛔⛔ PRINT THE FAILURE, DO NOT JUST NAME IT. [2026-08-30] this line swallowed the
+#   selftest output with `>/dev/null`, so six refused canaries said only
+#   "FAIL: fir_final_read selftest" -- the ONE line that could not say WHICH check
+#   failed or why. Two round trips were spent guessing at a message the cluster
+#   already had. ⭐ REPORT THE RECEIPT, NOT THE FLAG; PRINT THE LOCATION OF AN
+#   ERROR, NOT JUST ITS LAST LINE (CONTEXT §4.4.3).
 for g in fir_arms fir_plan fir_hp_plan fir_final_plan fir_final_read; do
-    env/bin/python "scripts/$g.py" --selftest >/dev/null || { echo "FAIL: $g selftest"; exit 1; }
+    if ! _out=$(env/bin/python "scripts/$g.py" --selftest 2>&1); then
+        echo "FAIL: $g selftest -- its own output follows:"
+        printf '%s\n' "$_out" | grep -E "⛔|Error|error|Traceback|selftest:" | tail -25 \
+            | sed 's/^/    | /'
+        echo "    reproduce: env/bin/python scripts/$g.py --selftest"
+        exit 1
+    fi
 done
 env/bin/python scripts/fir_hp_run_cell.py --selftest >/dev/null || { echo "FAIL: run_cell selftest"; exit 1; }
 echo "  instrument selftests: OK"

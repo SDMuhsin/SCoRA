@@ -22,7 +22,7 @@
 
 Usage:  env/bin/python scripts/fir_shell_gates.py --selftest
 """
-import os, re, subprocess, sys, tempfile, shutil, glob
+import os, re, shlex, subprocess, sys, tempfile, shutil, glob
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FIR = os.path.join(ROOT, "sbatch", "fir")
@@ -688,61 +688,172 @@ def _final_n_canary(task):
     return int(r.stdout.strip())
 
 
-def t_fir_stage_imports_survive_without_gitignored_data():
-    """⛔⛔ EVERY MODULE A FIR STAGE SELFTESTS MUST IMPORT WITH `results/` AND
-    `scratchpad/` ABSENT -- because on fir they ARE absent.
+def t_a_failing_instrument_selftest_reports_WHY():
+    """⛔⛔ THE LINE THAT COST TWO ROUND TRIPS. Both stages gate on instrument
+    selftests before submitting; both piped that output to /dev/null, so a refusal
+    said only `FAIL: <module> selftest` -- no failing check, no traceback, no
+    location. The cluster HAD the answer and threw it away.
 
-    [2026-08-30] `fir_final_read` imported `r307_cost_table` to reach the arm ->
-    op-counter map. r307 reads `scratchpad/phaseR/r308/timing.csv` AT IMPORT TIME;
-    `scratchpad/` is gitignored and does not travel. Every check on the dev box was
-    green, and the RTE canary died on the cluster at the submit gate with
-    `FAIL: fir_final_read selftest` -- no cells, one round trip.
-    ⭐ THE CLASS, not the instance: a fir stage's instruments may depend on
-      COMMITTED data only. The map moved to `src/bench_adapter_cost.py` (pure
-      arithmetic, no data), and this proves the property for the whole list.
-    ⚠ WHAT THIS CANNOT CATCH: a module that reads a missing file and SILENTLY
-      returns {} (the `r310_plan.selected_args()` trap). Import survival is
-      necessary, not sufficient.
-    ⛔ AND IT MUST FIRE: the control below re-runs the failing import path with the
-      old dependency and requires it to FAIL, so a green here means something."""
-    mods = ["fir_arms", "fir_plan", "fir_hp_plan", "fir_hp_read", "fir_hp_run_cell",
-            "fir_final_plan", "fir_final_read"]
-    shim = ('import sys,builtins\n'
-            'sys.path.insert(0,"scripts"); sys.path.insert(0,"src")\n'
-            '_ro=builtins.open\n'
-            'def _fo(f,*a,**k):\n'
-            '    p=str(f)\n'
-            '    if "/results/" in p or "/scratchpad/" in p:\n'
-            '        raise FileNotFoundError("[gate] gitignored, does not travel: "+p)\n'
-            '    return _ro(f,*a,**k)\n'
-            'builtins.open=_fo\n')
+    Proven by planting a module that fails, in a throwaway checkout-shaped fixture,
+    and asserting the stage prints something diagnostic. Both directions: a passing
+    suite must stay quiet, or the check would pass on any output at all."""
+    for stage, mod in (("04_hp_sweep.sh", "fir_hp_plan"), ("05_final.sh", "fir_final_read")):
+        src = open(os.path.join(FIR, stage)).read()
+        i = src.index("for g in fir_arms")
+        body = src[i:src.index("done", i) + 4]
+        # ⭐ RUN THE REAL LOOP, out of the real file -- not a paraphrase of it.
+        harness = ('cd "$1"\n'
+                   'env() { :; }\n' + body.replace("env/bin/python", '"$2"'))
+        tmp = tempfile.mkdtemp()
+        try:
+            os.makedirs(os.path.join(tmp, "scripts"))
+            for g in ("fir_arms", "fir_plan", "fir_hp_plan", "fir_final_plan",
+                      "fir_final_read"):
+                with open(os.path.join(tmp, "scripts", g + ".py"), "w") as f:
+                    f.write("import sys\n"
+                            + ("print('  ⛔ the check that failed');"
+                               "print('selftest: 0 passed, 1 failed');sys.exit(1)\n"
+                               if g == mod else "print('selftest: 1 passed, 0 failed')\n"))
+            r = sh(f'bash -c {shlex.quote(harness)} _ {shlex.quote(tmp)} '
+                   f'{shlex.quote(sys.executable)}')
+            out = r.stdout + r.stderr
+            check(f"[{stage}] a failing instrument selftest is REFUSED",
+                  r.returncode != 0 and f"FAIL: {mod} selftest" in out, out[-300:])
+            check(f"[{stage}] ...and the stage PRINTS the failing check, not just its "
+                  f"name", "the check that failed" in out, out[-300:])
+            check(f"[{stage}] ...and how to reproduce it",
+                  f"scripts/{mod}.py --selftest" in out, out[-300:])
+            # CONTROL: with every module green, the loop says nothing and exits 0
+            with open(os.path.join(tmp, "scripts", mod + ".py"), "w") as f:
+                f.write("print('selftest: 1 passed, 0 failed')\n")
+            r2 = sh(f'bash -c {shlex.quote(harness)} _ {shlex.quote(tmp)} '
+                    f'{shlex.quote(sys.executable)}')
+            check(f"[{stage}] CONTROL: an all-green loop is silent and exits 0",
+                  r2.returncode == 0 and "FAIL:" not in (r2.stdout + r2.stderr),
+                  (r2.stdout + r2.stderr)[-300:])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _fir_data_shim():
+    """A temp dir holding a `sitecustomize.py` that makes THIS REPO's gitignored
+    data directories unreadable -- the fir condition, reproduced.
+
+    ⛔⛔ ROOT-ANCHORED, AND THAT IS NOT A DETAIL. The first version blocked any path
+      CONTAINING "/results/", so it also blocked the selftest's own temp fixture at
+      `/tmp/tmpXXXX/results/x.csv` -- the gate failed the module it was checking,
+      for a reason that had nothing to do with the module. ⭐ A GUARD MUST NOT BE
+      ABLE TO BREAK THE RUN IT IS GUARDING (CONTEXT §3.4b, third time).
+    ⭐ On PYTHONPATH so it reaches SUBPROCESSES: both new planners fan out via
+      re-exec, and an in-process patch would have covered the parent only."""
+    d = tempfile.mkdtemp()
+    with open(os.path.join(d, "sitecustomize.py"), "w") as f:
+        f.write("import builtins, os\n"
+                f"_BLOCK = ({os.path.join(ROOT, 'results')!r}, "
+                f"{os.path.join(ROOT, 'scratchpad')!r})\n"
+                "_ro = builtins.open\n"
+                "def _fo(f, *a, **k):\n"
+                "    try:\n"
+                "        p = os.path.abspath(str(f))\n"
+                "    except Exception:\n"
+                "        return _ro(f, *a, **k)\n"
+                "    for b in _BLOCK:\n"
+                "        if p == b or p.startswith(b + os.sep):\n"
+                "            raise FileNotFoundError(\n"
+                "                '[gate] gitignored, does not travel to fir: ' + p)\n"
+                "    return _ro(f, *a, **k)\n"
+                "builtins.open = _fo\n")
+    return d
+
+
+def t_fir_stage_selftests_survive_without_gitignored_data():
+    """⛔⛔ EVERY MODULE A FIR STAGE SELFTESTS MUST *SELFTEST GREEN* WITH `results/`
+    AND `scratchpad/` UNREADABLE -- because that is literally what runs on fir.
+
+    ⭐ THE UPGRADE, AND WHY IT WAS NEEDED IMMEDIATELY. The first version of this
+      gate checked IMPORT only, and said so in its own docstring: "import survival
+      is necessary, not sufficient". One round trip later that caveat was the bug:
+      `fir_final_read` imported cleanly but called `r310_read.collapse_value()`,
+      whose default sizes come from `scratchpad/phaseR/r310/dataset_sizes.json` --
+      gitignored, dev-box only. It FAILS CLOSED at CALL time, so six canaries died
+      at the submit gate with "FAIL: fir_final_read selftest" while every local
+      check was green. ⭐ A CHECK THAT STOPS SHORT OF WHAT THE JOB RUNS WILL BE
+      EXACTLY AS BLIND AS THE GAP IT LEAVES.
+    ⭐ The shim is a `sitecustomize.py` on PYTHONPATH, not an in-process patch, so
+      it reaches the SUBPROCESSES a fanned-out selftest re-execs. An in-process
+      patch would have covered the parent only -- and both new planners fan out."""
+    shim = _fir_data_shim()
     py = VENV_PY if os.path.exists(VENV_PY) else sys.executable
-    for m in mods:
-        r = subprocess.run([py, "-c", shim + f'import {m}\nprint("ok")'],
+    env = dict(os.environ, PYTHONPATH=shim + os.pathsep + os.environ.get("PYTHONPATH", ""))
+    try:
+        # exactly the list `04_hp_sweep.sh` and `05_final.sh` gate on before submitting
+        for m in ["fir_arms", "fir_plan", "fir_hp_plan", "fir_hp_run_cell",
+                  "fir_final_plan", "fir_final_read"]:
+            r = subprocess.run([py, f"scripts/{m}.py", "--selftest"],
+                               capture_output=True, text=True, cwd=ROOT, env=env)
+            check(f"[fir-data] {m} --selftest is GREEN with results/ + scratchpad/ "
+                  f"UNREADABLE (i.e. on fir)", r.returncode == 0,
+                  (r.stdout + r.stderr).strip()[-500:])
+        # ⛔ THE CONTROL, and it must be a CALL-time failure, not an import-time one,
+        #   or it would only re-prove the weaker property this gate replaced.
+        r = subprocess.run(
+            [py, "-c", "import sys;sys.path.insert(0,'scripts');import r310_read as R;"
+                       "print(R.collapse_value('mrpc'))"],
+            capture_output=True, text=True, cwd=ROOT, env=env)
+        check("[fir-data] CONTROL: r310_read.collapse_value() -- whose sizes are the "
+              "GITIGNORED dev-box copy -- still FAILS under the same shim",
+              r.returncode != 0, (r.stdout + r.stderr).strip()[-200:])
+        # ...and the committed replacement must succeed, in the same environment.
+        r = subprocess.run(
+            [py, "-c", "import sys;sys.path.insert(0,'scripts');"
+                       "import r310_read as R, fir_plan as FP;"
+                       "print(R.collapse_value('mrpc', S=FP.sizes()))"],
+            capture_output=True, text=True, cwd=ROOT, env=env)
+        check("[fir-data] ...while the COMMITTED sizes give the same floor there",
+              r.returncode == 0 and r.stdout.strip().startswith("0.812"),
+              (r.stdout + r.stderr).strip()[-200:])
+    finally:
+        shutil.rmtree(shim, ignore_errors=True)
+
+
+def t_fir_stage_imports_survive_without_gitignored_data():
+    """The IMPORT half, kept because it is cheap and it localises a failure: if a
+    module cannot even be imported on fir, the selftest gate above reports the same
+    red with a longer traceback.  ⚠ Necessary, NOT sufficient -- the sufficient
+    check is the selftest one, and the gap between the two is exactly what cost the
+    2026-08-30 canaries (an import that worked and a CALL that did not)."""
+    shim = _fir_data_shim()
+    py = VENV_PY if os.path.exists(VENV_PY) else sys.executable
+    env = dict(os.environ, PYTHONPATH=shim + os.pathsep + os.environ.get("PYTHONPATH", ""))
+    try:
+        for m in ["fir_arms", "fir_plan", "fir_hp_plan", "fir_hp_read",
+                  "fir_hp_run_cell", "fir_final_plan", "fir_final_read"]:
+            r = subprocess.run([py, "-c", f"import sys;sys.path.insert(0,'scripts');"
+                                          f"sys.path.insert(0,'src');import {m};print('ok')"],
+                               capture_output=True, text=True, cwd=ROOT, env=env)
+            check(f"[fir-import] {m} imports with results/ + scratchpad/ ABSENT "
+                  f"(i.e. on fir)", r.returncode == 0 and "ok" in r.stdout,
+                  (r.stdout + r.stderr).strip()[-400:])
+        r = subprocess.run([py, "-c", "import sys;sys.path.insert(0,'scripts');"
+                                      "import r307_cost_table;print('ok')"],
+                           capture_output=True, text=True, cwd=ROOT, env=env)
+        check("[fir-import] CONTROL: r307_cost_table -- which READS a dev-box "
+              "measurement at import -- still FAILS under the same shim",
+              r.returncode != 0, (r.stdout + r.stderr).strip()[-200:])
+        r = subprocess.run([py, "-c",
+                            'import sys;sys.path.insert(0,"scripts");sys.path.insert(0,"src")\n'
+                            'import r307_cost_table as C, bench_adapter_cost as B\n'
+                            'ks=["fftm","fftstock","wave1","wave2","loca","qwha","lyra",'
+                            '"scora","scora2"]\n'
+                            'bad=[k for k in ks if abs(C._unmerged_at(k,4096)-'
+                            'B.arm_flops_per_token(k,4096,768))>1e-9 or '
+                            'abs(C._merged_per_token(k)-B.arm_merged_per_token(k,768,4096))>1e-9]\n'
+                            'print("MISMATCH",bad) if bad else print("ok")'],
                            capture_output=True, text=True, cwd=ROOT)
-        check(f"[fir-import] {m} imports with results/ + scratchpad/ ABSENT "
-              f"(i.e. on fir)", r.returncode == 0 and "ok" in r.stdout,
-              (r.stdout + r.stderr).strip()[-400:])
-    # ⛔ THE CONTROL: the module that actually broke must still break under the
-    #   shim, or this test would pass on a box where the shim does nothing.
-    r = subprocess.run([py, "-c", shim + 'import r307_cost_table\nprint("ok")'],
-                       capture_output=True, text=True, cwd=ROOT)
-    check("[fir-import] CONTROL: r307_cost_table -- which READS a dev-box "
-          "measurement at import -- still FAILS under the same shim",
-          r.returncode != 0, (r.stdout + r.stderr).strip()[-200:])
-    # ⛔ AND THE TWO MAPS MUST AGREE, or moving it changed a number.
-    r = subprocess.run([py, "-c",
-                        'import sys;sys.path.insert(0,"scripts");sys.path.insert(0,"src")\n'
-                        'import r307_cost_table as C, bench_adapter_cost as B\n'
-                        'ks=["fftm","fftstock","wave1","wave2","loca","qwha","lyra",'
-                        '"scora","scora2"]\n'
-                        'bad=[k for k in ks if abs(C._unmerged_at(k,4096)-'
-                        'B.arm_flops_per_token(k,4096,768))>1e-9 or '
-                        'abs(C._merged_per_token(k)-B.arm_merged_per_token(k,768,4096))>1e-9]\n'
-                        'print("MISMATCH",bad) if bad else print("ok")'],
-                       capture_output=True, text=True, cwd=ROOT)
-    check("[fir-import] ...and r307 DELEGATES to that map: all 9 arms agree to 1e-9",
-          "ok" in r.stdout, (r.stdout + r.stderr).strip()[-300:])
+        check("[fir-import] ...and r307 DELEGATES to that map: all 9 arms agree to 1e-9",
+              "ok" in r.stdout, (r.stdout + r.stderr).strip()[-300:])
+    finally:
+        shutil.rmtree(shim, ignore_errors=True)
 
 
 def main():
@@ -753,7 +864,9 @@ def main():
               t_a_later_submit_cannot_move_a_queued_array_plan,
               t_wrong_checkout_warning_fires_and_stays_silent,
               t_final_stage_plan_is_computable_for_every_task,
-              t_fir_stage_imports_survive_without_gitignored_data):
+              t_fir_stage_imports_survive_without_gitignored_data,
+              t_fir_stage_selftests_survive_without_gitignored_data,
+              t_a_failing_instrument_selftest_reports_WHY):
         t()
     print(f"selftest: {_P[0]} passed, {_P[1]} failed")
     return 1 if _P[1] else 0

@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.join(ROOT, "scripts"))
 import fir_final_plan as H                                             # noqa: E402
 import r310_read as R                                                  # noqa: E402
 import fir_preflight_arms as PA                                        # noqa: E402
+import fir_plan as FP                                                  # noqa: E402
 sys.path.insert(0, os.path.join(ROOT, "src"))
 import bench_adapter_cost as BC                                        # noqa: E402
 
@@ -62,6 +63,20 @@ N_MODULES = 36              # [measured, preflight] every arm adapts 36 modules
 HEAD_PARAMS = 4096          # gemma-2b `score` = 2048 x 2
 K = 256                     # the matched budget, every arm
 TOKENS_PER_STEP = 32 * 128  # batch x max_length; padding to max_length is FORCED
+
+
+# ⛔⛔ THE DATASET SIZES MUST COME FROM THE COMMITTED, FIR-SIDE FILE.
+#   `r310_read.collapse_value()` defaults to `r310_plan.sizes()`, which reads
+#   `scratchpad/phaseR/r310/dataset_sizes.json` -- gitignored, dev-box only. On fir
+#   it FAILS CLOSED at CALL time, so the module imported fine and the selftest died,
+#   and `05_final.sh` refused six canaries in a row with "FAIL: fir_final_read
+#   selftest" [2026-08-30, §25.4]. `fir_plan.sizes()` reads
+#   `sbatch/fir/dataset_sizes.json`, which IS committed and IS what every other fir
+#   stage derives its step counts and warmup from.
+#   ⭐ THE SIZES A NUMBER IS DERIVED FROM MUST TRAVEL WITH THE CODE THAT DERIVES IT.
+def _floor(task):
+    """The degenerate-model floor, metric-aware, from the COMMITTED sizes."""
+    return R.collapse_value(task, S=FP.sizes())
 
 
 def load(run_root):
@@ -103,7 +118,7 @@ def load(run_root):
 def rows(run_root, task):
     """[(arm, median, values, best_epochs, n, at_floor, truncated)] for one task."""
     got = load(run_root)
-    floor = R.collapse_value(task)
+    floor = _floor(task)
     ep = H.EPOCHS[task]
     out = []
     for a in H.ARMS:
@@ -310,9 +325,18 @@ def selftest():
        "CoLA's metric is Matthews, read from train_glue -- not accuracy")
     ck(R.metric_of("stsb") == "pearson", "STS-B's is Pearson")
     ck(R.metric_of("mrpc") == "f1", "MRPC's is F1")
-    ck(abs(R.collapse_value("mrpc") - 0.81222707) < 1e-6,
+    ck(abs(_floor("mrpc") - 0.81222707) < 1e-6,
        "⭐ MRPC's F1 floor is the all-positive predictor's 0.81222707, not 0.5")
-    ck(R.collapse_value("cola") == 0.0, "CoLA's MCC floor is 0.0")
+    ck(_floor("cola") == 0.0, "CoLA's MCC floor is 0.0")
+    # ⛔ AND THEY COME FROM THE COMMITTED FILE, NOT r310's dev-box copy -- the
+    #   defect that refused six canaries on fir. Both directions: the committed
+    #   path must exist, and the two files must agree where they overlap (if they
+    #   ever disagreed, one of the two tables would be built on the wrong sizes).
+    ck(os.path.exists(FP.SIZES_PATH),
+       f"⭐ the sizes come from the COMMITTED {os.path.relpath(FP.SIZES_PATH, ROOT)}")
+    _S = FP.sizes()
+    ck(all(t in _S for t in H.TASKS),
+       f"...and it carries every task this stage runs ({', '.join(H.TASKS)})")
 
     d = tempfile.mkdtemp()
     try:
@@ -372,7 +396,7 @@ def selftest():
         L = report(d, tasks=[t])
         ck(any("DIVERGED" in l for l in L), "a NaN cell is reported as DIVERGED")
         # ⛔ the collapse floor
-        fl = R.collapse_value(t)
+        fl = _floor(t)
         if fl is not None:
             for c in cs:
                 write(H.cell_id(c), fl, 1)
