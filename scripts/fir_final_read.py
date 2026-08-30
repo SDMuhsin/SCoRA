@@ -26,6 +26,7 @@ import fir_final_plan as H                                             # noqa: E
 import r310_read as R                                                  # noqa: E402
 import fir_preflight_arms as PA                                        # noqa: E402
 import fir_plan as FP                                                  # noqa: E402
+import fir_hp_run_cell as RC                                           # noqa: E402
 sys.path.insert(0, os.path.join(ROOT, "src"))
 import bench_adapter_cost as BC                                        # noqa: E402
 
@@ -40,8 +41,8 @@ import bench_adapter_cost as BC                                        # noqa: E
 #   INSTRUMENT THAT ALREADY EXISTS.  Nothing here is a new cost model:
 #     * the five memory columns and the two step-time columns are written by
 #       `train_glue.py` into each cell's own CSV -- MEASURED, per seed;
-#     * throughput is those step times inverted, with an EXACT token count
-#       (`--pad_to_max_length` is forced, so a step is exactly 32 x 128 tokens);
+#     * throughput is the MEASURED total training time over the KNOWN step count;
+#       ⛔ NOT `1/avg_step_time` -- that column times `optimizer.step()` alone;
 #     * flops/token come from `src/bench_adapter_cost`, which owns BOTH the frozen
 #       J.2 op-counter and the arm -> counter map. ⭐ The map is IMPORTED, at this
 #       backbone's width -- a second copy that agreed today is precisely the defect
@@ -60,9 +61,15 @@ COST_COLS = ["peak_mem_mib", "param_mem_mib", "opt_mem_mib", "runtime_mem_mib",
              "total_training_time_sec"]
 D_MODEL = 2048              # gemma-2b hidden size (q_proj / o_proj are 2048x2048)
 N_MODULES = 36              # [measured, preflight] every arm adapts 36 modules
-HEAD_PARAMS = 4096          # gemma-2b `score` = 2048 x 2
+# ⛔ THE HEAD IS PER TASK, NOT THE CONSTANT 4,096. STS-B is a REGRESSION task -- one
+#   output, so its `score` head is 2,048. The same constant, hardcoded in the
+#   receipt check, refused a perfectly good STS-B canary cell with exit=3
+#   [2026-08-30]. `fir_hp_run_cell.head_params()` derives it from the measured label
+#   histogram and is the ONE site; this table asks it rather than repeating 4096.
 K = 256                     # the matched budget, every arm
-TOKENS_PER_STEP = 32 * 128  # batch x max_length; padding to max_length is FORCED
+# ⚠ NOT a per-step token count -- padding is DYNAMIC (see cost_of). This is the
+#   batch the FLOPS columns are quoted at, matching [R.307]'s own b = 32 x 128.
+TOKENS_PER_STEP = 32 * 128
 
 
 # ⛔⛔ THE DATASET SIZES MUST COME FROM THE COMMITTED, FIR-SIDE FILE.
@@ -139,8 +146,8 @@ def rows(run_root, task):
     return out, floor
 
 
-def cost_of(arm, got_rows):
-    """{column: value} for one arm: MEASURED costs as the MEDIAN over the seeds
+def cost_of(arm, got_rows, task=None):
+    """{column: value} for one arm on one TASK: MEASURED costs as the MEDIAN over
     that produced them, plus DERIVED throughput and flops/token.
 
     ⛔ MEDIAN, not mean, and over the SAME seeds the metric is reported over -- a
@@ -152,15 +159,38 @@ def cost_of(arm, got_rows):
     for k in COST_COLS:
         vals = [g[k] for g in got_rows if g.get(k) == g.get(k)]     # drop NaN
         out[k] = f"{statistics.median(vals):.6g}" if vals else ""
-    # --- DERIVED throughput. ⚠ `avg_step_time` is seconds per optimiser step.
+    # ------------------------------------------------------------------
+    # ⭐⭐ THROUGHPUT -- and TWO corrections that a surprising number forced.
+    # ------------------------------------------------------------------
+    # ⛔ 1. `avg_step_time` IS NOT THE TRAINING STEP TIME. `train_glue.py:2293`
+    #    starts its timer immediately before `optimizer.step()` and stops it
+    #    immediately after: it measures the OPTIMISER UPDATE ALONE -- no forward, no
+    #    backward, no data loading. [measured] 0.0007-0.0025 s, while the real step
+    #    is ~0.2-0.8 s. `1/avg_step_time` would have published "1,400 steps/s".
+    #    ⭐ It is still a useful column -- it is the adapter's own optimiser cost --
+    #    but it is named `optimizer_step_s`, and throughput comes from the wall clock.
+    # ⛔ 2. PADDING IS DYNAMIC, so tokens/step is NOT 32 x 128. `--pad_to_max_length`
+    #    is forced ONLY for the `tokenmix` arm (train_glue.py:1713); everything here
+    #    tokenises with `padding=False` and pads per batch. [measured] that is why
+    #    CoLA ran 3,216 steps in 628 s while RTE ran 1,560 in 1,291 s -- CoLA is
+    #    single short sentences, RTE is sentence PAIRS. ⭐ I flagged those two
+    #    numbers as "impossible" and they were not: THE PROTOCOL WAS FINE AND MY
+    #    MODEL OF IT WAS WRONG. A tokens/s column would have to MEASURE the tokens,
+    #    which nothing here does, so it is not printed at all rather than guessed.
     st = [g["avg_step_time"] for g in got_rows
           if g.get("avg_step_time") == g.get("avg_step_time") and g["avg_step_time"] > 0]
-    if st:
-        med = statistics.median(st)
-        out["steps_per_sec"] = f"{1.0 / med:.6g}"
-        out["tokens_per_sec"] = f"{TOKENS_PER_STEP / med:.6g}"
+    out["optimizer_step_s"] = f"{statistics.median(st):.6g}" if st else ""
+    tt = [g["total_training_time_sec"] for g in got_rows
+          if g.get("total_training_time_sec") == g.get("total_training_time_sec")
+          and g["total_training_time_sec"] > 0]
+    if tt and task:
+        med = statistics.median(tt)
+        n_steps = H.steps_per_cell(task)
+        out["train_steps"] = str(n_steps)
+        out["sec_per_step"] = f"{med / n_steps:.6g}"
+        out["steps_per_sec"] = f"{n_steps / med:.6g}"
     else:
-        out["steps_per_sec"] = out["tokens_per_sec"] = ""
+        out["train_steps"] = out["sec_per_step"] = out["steps_per_sec"] = ""
     # --- DERIVED flops, from r307's own map at THIS backbone's width -----------
     try:
         un = BC.arm_flops_per_token(arm, TOKENS_PER_STEP, D_MODEL)
@@ -176,7 +206,9 @@ def cost_of(arm, got_rows):
     out["dense_gemm_flops_per_token"] = str(2 * D_MODEL * D_MODEL)
     # --- DERIVED trainable params, from the budget model the receipts check uses
     mult = PA.LOCATION_MULTIPLIER.get(arm, 1)
-    out["trainable_params"] = str(K * mult * N_MODULES + HEAD_PARAMS)
+    head = RC.head_params(task) if task else None
+    out["trainable_params"] = "" if head is None else str(K * mult * N_MODULES + head)
+    out["head_params"] = "" if head is None else str(head)
     out["params_per_module"] = str(K * mult)
     return out
 
@@ -240,7 +272,7 @@ def report(run_root, tasks=None, emit=None):
                               "floor": "" if floor is None else f"{floor:.6f}",
                               "at_floor": int(at_floor),
                               "in_sample": int(t == H.SELECTION_TASK),
-                              **cost_of(a, _rows)})
+                              **cost_of(a, _rows, task=t)})
     # ------------------------------------------------------------------
     # ⭐ THE COMPUTATIONAL TABLE. Printed ONCE, not per task: the memory and
     #   step-time of an arm are properties of the ARM at this backbone, and the
@@ -254,13 +286,16 @@ def report(run_root, tasks=None, emit=None):
         rs = [got[H.cell_id(c)] for t in (tasks or H.tasks())
               for c in H.cells(task=t, arms=[a]) if H.cell_id(c) in got]
         if rs:
-            pooled[a] = (cost_of(a, rs), len(rs))
+            # ⚠ the pooled view spans tasks, so `trainable_params` -- the one
+            #   per-TASK column -- is quoted for the first task shown and the header
+            #   says so. The emitted CSV carries the per-task value on every row.
+            pooled[a] = (cost_of(a, rs, task=(tasks or H.tasks())[0]), len(rs))
     if pooled:
         lines.append("\n### computational cost   ⚠ memory + step time are MEASURED "
                      "(median over every cell of that arm); flops/token are DERIVED "
                      "[r307's frozen op-counter, d=2048]")
         lines.append(f"  {'arm':10s} {'peak MiB':>9s} {'param MiB':>9s} {'opt MiB':>8s} "
-                     f"{'s/step':>8s} {'tok/s':>9s} {'fl/tok(un)':>10s} "
+                     f"{'s/step':>8s} {'opt s':>8s} {'fl/tok(un)':>10s} "
                      f"{'fl/tok(mg)':>10s} {'train par':>10s} {'n':>4s}")
         for a in H.ARMS:
             if a not in pooled:
@@ -271,8 +306,8 @@ def report(run_root, tasks=None, emit=None):
                 return f"{float(c[k]):{w}.{4 if p else 0}f}" if c[k] else f"{'--':>{w}s}"
             lines.append(
                 f"  {a:10s} {g('peak_mem_mib')} {g('param_mem_mib')} "
-                f"{g('opt_mem_mib', 8)} {g('avg_step_time', 8, 'p')} "
-                f"{g('tokens_per_sec', 9)} "
+                f"{g('opt_mem_mib', 8)} {g('sec_per_step', 8, 'p')} "
+                f"{g('optimizer_step_s', 8, 'p')} "
                 f"{float(c['adapter_flops_per_token_unmerged']):10.0f} "
                 f"{float(c['adapter_flops_per_token_merged']):10.1f} "
                 f"{int(c['trainable_params']):10d} {n:4d}")
@@ -412,11 +447,12 @@ def selftest():
         for c, v in zip(cs, [0.5, 0.6, 0.7, 0.8, 0.9]):
             write(H.cell_id(c), v, 1)
         rs0 = [load(d)[H.cell_id(c)] for c in cs]
-        c0 = cost_of(H.ARMS[0], rs0)
+        c0 = cost_of(H.ARMS[0], rs0, task=t)
         ck(c0["peak_mem_mib"] == "" and c0["avg_step_time"] == "",
            "⛔ a cost column the runs did not write comes back EMPTY, not 0")
-        ck(c0["steps_per_sec"] == "" and c0["tokens_per_sec"] == "",
-           "...and a throughput with no step time is EMPTY, not infinite")
+        ck(c0["steps_per_sec"] == "" and c0["sec_per_step"] == ""
+           and c0["optimizer_step_s"] == "",
+           "...and a throughput with no measured time is EMPTY, not infinite")
         # (ii) present -> the MEDIAN over the seeds, and throughput derived from it
         def write_cost(cid, val, step_t, peak):
             row = {"task_name": t, met: val, "best_epoch": 1,
@@ -433,15 +469,25 @@ def selftest():
                                  [0.4, 0.5, 0.5, 0.6, 5.0], [100, 200, 300, 400, 500]):
             write_cost(H.cell_id(c), v, stp, pk)
         rs1 = [load(d)[H.cell_id(c)] for c in cs]
-        c1 = cost_of(H.ARMS[0], rs1)
+        c1 = cost_of(H.ARMS[0], rs1, task=t)
         ck(c1["peak_mem_mib"] == "300", "⭐ peak memory is the MEDIAN over the seeds (300)")
-        ck(c1["avg_step_time"] == "0.5",
-           "⭐ ...and so is step time (0.5) -- the 5.0 s outlier does not drag it, "
-           "which is why it is a median and not a mean")
-        ck(abs(float(c1["tokens_per_sec"]) - (32 * 128) / 0.5) < 1e-6,
-           f"⭐ throughput is DERIVED from it at an EXACT token count "
-           f"(32x128 / 0.5 = {(32*128)/0.5:g} tok/s -- padding to max_length is forced)")
-        ck(abs(float(c1["steps_per_sec"]) - 2.0) < 1e-9, "...and steps/s is 1/0.5")
+        ck(c1["optimizer_step_s"] == "0.5",
+           "⭐ ...and so is the OPTIMISER step time (0.5) -- the 5.0 s outlier does "
+           "not drag it, which is why it is a median and not a mean")
+        # ⛔ THE CORRECTION: throughput is the WALL CLOCK over the KNOWN step count,
+        #   never 1/avg_step_time (which times optimizer.step() alone).
+        _n = H.steps_per_cell(t)
+        ck(c1["train_steps"] == str(_n)
+           and abs(float(c1["sec_per_step"]) - 100.0 / _n) < 1e-6,
+           f"⭐ sec/step is the MEASURED total training time / this task's {_n} steps")
+        ck(abs(float(c1["steps_per_sec"]) - _n / 100.0) < 1e-6,
+           "...and steps/s is its reciprocal")
+        ck(float(c1["steps_per_sec"]) != 1 / 0.5,
+           "⛔ CONTROL: it is NOT 1/avg_step_time -- that would publish the optimiser "
+           "update rate as the training throughput")
+        ck("tokens_per_sec" not in c1,
+           "⛔ CONTROL: NO tokens/s column -- padding is DYNAMIC, so tokens/step is "
+           "task-dependent and nothing here measures it")
         # (iii) flops come from r307's map, at THIS backbone's width -- not a copy
         ck(abs(float(c1["adapter_flops_per_token_unmerged"])
                - BC.arm_flops_per_token(H.ARMS[0], TOKENS_PER_STEP, D_MODEL)) < 1e-6,
@@ -453,11 +499,18 @@ def selftest():
         ck(c1["dense_gemm_flops_per_token"] == str(2 * D_MODEL * D_MODEL),
            "the frozen dense GEMM reference is printed beside them")
         # (iv) the parameter budget, and LoCA's 3x
-        ck(c1["trainable_params"] == str(256 * 36 + 4096),
-           "trainable params are DERIVED from the enforced budget model")
-        cl = cost_of("loca", rs1)
-        ck(cl["trainable_params"] == str(3 * 256 * 36 + 4096),
+        _hd = RC.head_params(t)
+        ck(c1["trainable_params"] == str(256 * 36 + _hd),
+           f"trainable params are DERIVED from the enforced budget model "
+           f"(+ this task's {_hd}-param head)")
+        cl = cost_of("loca", rs1, task=t)
+        ck(cl["trainable_params"] == str(3 * 256 * 36 + _hd),
            "⛔ CONTROL: LoCA's 3x location budget is carried (it is NOT at parity)")
+        # ⛔ AND THE HEAD IS PER TASK: STS-B is regression, so its head is HALF the
+        #   2-class one. A constant 4,096 here would misstate every STS-B row.
+        ck(cost_of(H.ARMS[0], rs1, task="stsb")["head_params"] == "2048"
+           and cost_of(H.ARMS[0], rs1, task="mrpc")["head_params"] == "4096",
+           "⭐ the head column is PER TASK (stsb 2,048 vs mrpc 4,096)")
         L = report(d, tasks=[t])
         ck(any("computational cost" in l for l in L), "the cost table is printed")
         ck(any("NOT at parameter parity" in l for l in L),
@@ -477,8 +530,10 @@ def selftest():
            "...and all five per-seed values beside it, so the median is checkable")
         ck(rr and rr[0]["in_sample"] == str(int(t == H.SELECTION_TASK)),
            "...and whether the task is IN-SAMPLE")
-        for k in ("peak_mem_mib", "tokens_per_sec", "adapter_flops_per_token_unmerged",
-                  "trainable_params", "param_mem_mib", "total_training_time_sec"):
+        for k in ("peak_mem_mib", "steps_per_sec", "sec_per_step", "optimizer_step_s",
+                  "adapter_flops_per_token_unmerged",
+                  "trainable_params", "head_params", "param_mem_mib",
+                  "total_training_time_sec"):
             ck(rr and rr[0].get(k) not in (None, ""),
                f"⭐ the emitted CSV carries the computational column {k!r}")
     finally:

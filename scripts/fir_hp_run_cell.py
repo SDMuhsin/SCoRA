@@ -64,7 +64,7 @@ def verify_receipts(text, cell):
     tr = r.get("trainable")
     if not tr:
         return False, "NO trainable-params receipt -- cannot prove anything ran"
-    head = 4096                       # gemma-2b `score` = hidden 2048 x 2 labels
+    head = head_params(cell.get("task"))
     adapter = tr - head
     if adapter <= 0:
         return False, (f"trainable {tr:,} <= head {head:,} -- the ADAPTER ATTACHED TO "
@@ -86,6 +86,33 @@ def verify_receipts(text, cell):
                  f"per module -- ⚠ NOT at parameter parity, and any table that "
                  f"places it beside the others must say so]")
     return True, note
+
+
+def head_params(task, hidden=2048):
+    """gemma-2b's `score` head: hidden x num_labels, no bias.  ⛔ DERIVED FROM THE
+    TASK, never the constant 4,096.
+
+    ⛔⛔ THE BUG THIS FIXES [2026-08-30]. It WAS the constant 4,096 -- correct for
+      every 2-class task, and correct for the entire MRPC hyperparameter search, so
+      658 cells never touched it. **STS-B IS A REGRESSION TASK: ONE output, so its
+      head is 2,048.** The receipt check therefore subtracted 2,048 too much,
+      derived 28 adapted modules instead of 36, and refused a cell that had trained
+      perfectly (2700/2700 steps, pearson 0.8195) with exit=3.
+    ⭐ AND NOTE HOW NARROWLY IT FAILED SAFE: 7,168 IS a multiple of 256, so the
+      budget-modulo check passed and only the `n_mod != 36` check caught it. Had the
+      arithmetic landed on 36, a WRONG head size would have passed SILENTLY. A
+      derived value removes the coincidence.
+    ⚠ `num_labels` comes from the MEASURED, COMMITTED dataset sizes -- a task with
+      no label histogram is a regression task, which is exactly how `r310_read`
+      decides that a metric has no majority-class floor."""
+    if not task:
+        raise SystemExit("FAIL CLOSED: the head size is PER TASK and cannot be guessed")
+    import fir_plan as FP
+    S = FP.sizes()
+    if task not in S:
+        raise SystemExit(f"FAIL CLOSED: no measured sizes for task {task!r}")
+    lc = S[task].get("label_counts")
+    return hidden * (1 if lc is None else len(lc))
 
 
 # ⛔ A DISTINCT EXIT CODE FOR "THIS CELL IS NOT IN THIS GRID", because it is a
@@ -148,39 +175,69 @@ def selftest():
 
     real = ("INFO - __main__ - SLR target modules: ['q_proj', 'o_proj']\n"
             "trainable params: 13,312 || all params: 2,506,185,728 || trainable%: 0.0005\n")
-    W1 = {"arm": "wave1"}                     # multiplier 1, like every grid arm
+    W1 = {"arm": "wave1", "task": "mrpc"}     # multiplier 1, like every grid arm
     good, note = verify_receipts(real, W1)
     ck(good, f"the REAL preflight receipt passes ({note})")
 
     # stock PEFT prints no module count -- it must still pass, by derivation
     ck(verify_receipts("trainable params: 13,312 || all params: 2,506,189,824 || x\n",
-                       {"arm": "fftstock"})[0],
+                       {"arm": "fftstock", "task": "mrpc"})[0],
        "fftstock's count-free receipt passes by derivation")
     # ⭐ WaveFT: mu costs ZERO parameters, so mu=1 and mu=2 train the SAME 9,216 and
     #   the same derivation holds for both -- asserted, because it is the premise of
     #   letting the wave arms through this check at all.
     for a in ("wave1", "wave2"):
-        ck(verify_receipts(real, {"arm": a})[0], f"{a}: the same 13,312 receipt passes "
+        ck(verify_receipts(real, {"arm": a, "task": "mrpc"})[0],
+           f"{a}: the same 13,312 receipt passes "
                                                  f"(mu costs no parameters)")
     # ⭐ LoCA: [measured, gemma] 31,744 = 4,096 head + 36 x 256 x 3. It must PASS,
     #   and the note must SAY it is not at parameter parity -- [R.310] flags exactly
     #   this as the thing a joint table has to disclose.
     loca_receipt = "trainable params: 31,744 || all params: 2,506,204,160 || x\n"
-    okl, notel = verify_receipts(loca_receipt, {"arm": "loca"})
+    okl, notel = verify_receipts(loca_receipt, {"arm": "loca", "task": "mrpc"})
     ck(okl and "36 modules" in notel and "parity" in notel,
        f"loca's measured 31,744 receipt passes at multiplier 3 ({notel[:60]}...)")
     # ⛔ CONTROL THAT THE MULTIPLIER IS LOAD-BEARING: the SAME receipt read at
     #   multiplier 1 must be REFUSED. Without this, teaching the guard the arm would
     #   look identical to disabling it.
-    ck(not verify_receipts(loca_receipt, {"arm": "wave1"})[0],
+    ck(not verify_receipts(loca_receipt, {"arm": "wave1", "task": "mrpc"})[0],
        "CONTROL: loca's receipt is REFUSED when read at multiplier 1 (108 modules, "
        "not 36) -- the location budget is doing real work here")
     ck(not verify_receipts("trainable params: 13,312 || all params: 2 || x\n",
-                           {"arm": "loca"})[0],
+                           {"arm": "loca", "task": "mrpc"})[0],
        "CONTROL: a NON-loca receipt is refused when read at multiplier 3 "
        "(the guard fires in both directions)")
     ck(not verify_receipts(real, None)[0],
        "CONTROL: no cell at all is refused (the budget model is per-arm)")
+
+    # ------------------------------------------------------------------
+    # ⭐⭐ THE HEAD SIZE IS PER TASK. [2026-08-30] this was the constant 4,096 --
+    #   right for every 2-class task and for all 658 MRPC search cells, and WRONG
+    #   for STS-B, which is a REGRESSION task with ONE output. It refused a cell
+    #   that had trained perfectly (2700/2700 steps, pearson 0.8195) with exit=3.
+    # ------------------------------------------------------------------
+    ck(head_params("mrpc") == 4096 and head_params("rte") == 4096
+       and head_params("qnli") == 4096,
+       "the 2-class tasks keep the measured 4,096-param head (658 search cells)")
+    ck(head_params("stsb") == 2048,
+       "⭐ STS-B is REGRESSION -- one output, so its head is 2,048, DERIVED from the "
+       "measured label histogram being absent")
+    # a real STS-B receipt: 36 x 256 adapter + a 2,048 head
+    stsb_receipt = "trainable params: 11,264 || all params: 2,506,183,680 || x\n"
+    ck(verify_receipts(stsb_receipt, {"arm": "wave1", "task": "stsb"})[0],
+       "⭐ an STS-B receipt (11,264 = 36 x 256 + 2,048) now PASSES")
+    # ⛔ CONTROLS, both directions -- the task must be LOAD-BEARING, or deriving it
+    #   would be indistinguishable from having removed the check.
+    ck(not verify_receipts(stsb_receipt, {"arm": "wave1", "task": "mrpc"})[0],
+       "⛔ CONTROL: the SAME receipt read as a 2-class task is REFUSED (28 modules, "
+       "not 36) -- that is exactly the failure this fixes")
+    ck(not verify_receipts(real, {"arm": "wave1", "task": "stsb"})[0],
+       "⛔ CONTROL: and an MRPC receipt read as STS-B is refused too (44 modules)")
+    try:
+        verify_receipts(real, {"arm": "wave1"})
+        ck(False, "CONTROL: a cell with no task is refused")
+    except SystemExit:
+        ck(True, "CONTROL: a cell with NO task fails closed -- the head cannot be guessed")
 
     for label, text in (
         ("the adapter attaching to NOTHING (head trains alone)",
