@@ -80,40 +80,22 @@ def _wht(L):
 
 
 def _build_flops(key, d=None):
-    """Flops to REBUILD the dense m x n dW once, per arm, from its own params.
+    """⭐ DELEGATES to `bench_adapter_cost.arm_build_flops` -- ONE map, and it lives
+    beside the op-counter rather than inside this table.
 
-    ⭐ `d` DEFAULTS to this table's own backbone width but is a PARAMETER, because
-      the gemma-2b final runs quote the same op-count at d=2048 and the arm ->
-      op-counter mapping must exist in ONE place. A second copy of this map that
-      agreed today is exactly the defect class this repo keeps paying for."""
-    d = D_MODEL if d is None else d
-    if key in ("fftm", "fftstock"):
-        return BC.FFT_C(d) * d * 2 + d * d          # ifft2 over rows+cols, then scale
-    if key.startswith("wave"):
-        mu = 2 if key == "wave2" else 1
-        r = BC._haar_tail(d)
-        return d * (3 * d - 2 * r) * 2 + 2 * mu * K  # 2-D inverse Haar + core
-    if key == "loca":
-        return 2 * K * d * d                        # k rank-1 DCT outer products
-    if key == "qwha":
-        # ⚠️ CONSTRUCTED, not QWHA's algorithm: QWHA never builds dW -- it works
-        # in the WHT domain end-to-end.  This is what merging WOULD cost if it
-        # did, included so the column is uniform.  Flagged in the report.
-        return d * _wht(d) * 2 + 2 * K              # 2-D inverse WHT + sparse add
-    if key == "lyra":
-        p_ = q_ = max(1, int(round(K ** 0.5)))
-        return 2 * d * p_ * q_ + 2 * d * q_ * d     # U D, then (UD) V^T
-    if key.startswith("scora"):
-        s_ = t_ = K // 2
-        return 2 * d * s_ + 2 * d * t_ + 2 * d * d  # rebuild u,v then u v^T
-    raise KeyError(key)
+    ⛔ WHY IT MOVED [2026-08-30]: this module reads MEASURED dev-box artefacts at
+      import time (`scratchpad/phaseR/r308/timing.csv`), and `scratchpad/` does not
+      travel to fir. A fir stage that imported this file to reach the map was
+      un-importable ON THE CLUSTER while passing every check here -- the submit
+      gate refused it and it cost a round trip. A pure computation must not be
+      reachable only through a module that reads data."""
+    return BC.arm_build_flops(key, D_MODEL if d is None else d)
 
 
 def _merged_per_token(key, d=None, b=None):
     """Rebuild + fold-in, amortised over the batch the accuracy was measured at."""
-    d = D_MODEL if d is None else d
-    b = B_TOKENS if b is None else b
-    return (_build_flops(key, d) + d * d) / b
+    return BC.arm_merged_per_token(key, D_MODEL if d is None else d,
+                                   B_TOKENS if b is None else b)
 
 
 def _crossover(key):
@@ -137,27 +119,13 @@ DENSE_GEMM_PER_TOKEN = BC.GEMM(1, D_MODEL, D_MODEL)    # 2mn, the frozen layer
 def _unmerged_at(key, b, d=None):
     """The arm's own UNMERGED forward, per token, at batch `b`.
 
-    This is the path each method publishes, except where this repo's own
-    implementation is dearer -- and where it is, the AS-RUN column says so.
-    ⭐ `d` is a PARAMETER for the same reason `_build_flops`'s is: ONE arm ->
-      op-counter map, quoted at whatever width the accuracy was measured on."""
-    m = n = D_MODEL if d is None else d
-    if key in ("fftm", "fftstock"):
-        a = "fourierft_stock"
-        kw = {}
-    elif key == "loca":
-        a, kw = "loca_stock", {}
-    elif key == "qwha":
-        a, kw = "qwha", {}
-    elif key.startswith("wave"):
-        a, kw = "waveft_factored", {"r": 2 if key == "wave2" else 1}
-    elif key == "lyra":
-        a, kw = "lyra_factored", {}
-    elif key.startswith("scora"):
-        a, kw = "slr_factored", {}
-    else:
+    ⭐ DELEGATES to `bench_adapter_cost.arm_flops_per_token` (see `_build_flops`).
+    Returns None for a key the map does not know, which is what this table's
+    callers expect."""
+    try:
+        return BC.arm_flops_per_token(key, b, D_MODEL if d is None else d)
+    except KeyError:
         return None
-    return BC.theoretical_flops(a, m, n, b, K, **kw)["fwd_adapter"] / b
 
 
 # ---- the arms, in the order the accuracy table ranks them ------------------

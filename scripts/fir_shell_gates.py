@@ -688,6 +688,63 @@ def _final_n_canary(task):
     return int(r.stdout.strip())
 
 
+def t_fir_stage_imports_survive_without_gitignored_data():
+    """⛔⛔ EVERY MODULE A FIR STAGE SELFTESTS MUST IMPORT WITH `results/` AND
+    `scratchpad/` ABSENT -- because on fir they ARE absent.
+
+    [2026-08-30] `fir_final_read` imported `r307_cost_table` to reach the arm ->
+    op-counter map. r307 reads `scratchpad/phaseR/r308/timing.csv` AT IMPORT TIME;
+    `scratchpad/` is gitignored and does not travel. Every check on the dev box was
+    green, and the RTE canary died on the cluster at the submit gate with
+    `FAIL: fir_final_read selftest` -- no cells, one round trip.
+    ⭐ THE CLASS, not the instance: a fir stage's instruments may depend on
+      COMMITTED data only. The map moved to `src/bench_adapter_cost.py` (pure
+      arithmetic, no data), and this proves the property for the whole list.
+    ⚠ WHAT THIS CANNOT CATCH: a module that reads a missing file and SILENTLY
+      returns {} (the `r310_plan.selected_args()` trap). Import survival is
+      necessary, not sufficient.
+    ⛔ AND IT MUST FIRE: the control below re-runs the failing import path with the
+      old dependency and requires it to FAIL, so a green here means something."""
+    mods = ["fir_arms", "fir_plan", "fir_hp_plan", "fir_hp_read", "fir_hp_run_cell",
+            "fir_final_plan", "fir_final_read"]
+    shim = ('import sys,builtins\n'
+            'sys.path.insert(0,"scripts"); sys.path.insert(0,"src")\n'
+            '_ro=builtins.open\n'
+            'def _fo(f,*a,**k):\n'
+            '    p=str(f)\n'
+            '    if "/results/" in p or "/scratchpad/" in p:\n'
+            '        raise FileNotFoundError("[gate] gitignored, does not travel: "+p)\n'
+            '    return _ro(f,*a,**k)\n'
+            'builtins.open=_fo\n')
+    py = VENV_PY if os.path.exists(VENV_PY) else sys.executable
+    for m in mods:
+        r = subprocess.run([py, "-c", shim + f'import {m}\nprint("ok")'],
+                           capture_output=True, text=True, cwd=ROOT)
+        check(f"[fir-import] {m} imports with results/ + scratchpad/ ABSENT "
+              f"(i.e. on fir)", r.returncode == 0 and "ok" in r.stdout,
+              (r.stdout + r.stderr).strip()[-400:])
+    # ⛔ THE CONTROL: the module that actually broke must still break under the
+    #   shim, or this test would pass on a box where the shim does nothing.
+    r = subprocess.run([py, "-c", shim + 'import r307_cost_table\nprint("ok")'],
+                       capture_output=True, text=True, cwd=ROOT)
+    check("[fir-import] CONTROL: r307_cost_table -- which READS a dev-box "
+          "measurement at import -- still FAILS under the same shim",
+          r.returncode != 0, (r.stdout + r.stderr).strip()[-200:])
+    # ⛔ AND THE TWO MAPS MUST AGREE, or moving it changed a number.
+    r = subprocess.run([py, "-c",
+                        'import sys;sys.path.insert(0,"scripts");sys.path.insert(0,"src")\n'
+                        'import r307_cost_table as C, bench_adapter_cost as B\n'
+                        'ks=["fftm","fftstock","wave1","wave2","loca","qwha","lyra",'
+                        '"scora","scora2"]\n'
+                        'bad=[k for k in ks if abs(C._unmerged_at(k,4096)-'
+                        'B.arm_flops_per_token(k,4096,768))>1e-9 or '
+                        'abs(C._merged_per_token(k)-B.arm_merged_per_token(k,768,4096))>1e-9]\n'
+                        'print("MISMATCH",bad) if bad else print("ok")'],
+                       capture_output=True, text=True, cwd=ROOT)
+    check("[fir-import] ...and r307 DELEGATES to that map: all 9 arms agree to 1e-9",
+          "ok" in r.stdout, (r.stdout + r.stderr).strip()[-300:])
+
+
 def main():
     for t in (t_syntax, t_nousersite_exported, t_assert_in_venv, t_stage_callsites,
               t_no_bare_python, t_env_gate_location_check, t_provenance,
@@ -695,7 +752,8 @@ def main():
               t_sweep_submit_plan_is_computable_for_every_grid,
               t_a_later_submit_cannot_move_a_queued_array_plan,
               t_wrong_checkout_warning_fires_and_stays_silent,
-              t_final_stage_plan_is_computable_for_every_task):
+              t_final_stage_plan_is_computable_for_every_task,
+              t_fir_stage_imports_survive_without_gitignored_data):
         t()
     print(f"selftest: {_P[0]} passed, {_P[1]} failed")
     return 1 if _P[1] else 0

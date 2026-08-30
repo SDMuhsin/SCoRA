@@ -24,8 +24,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
 import fir_final_plan as H                                             # noqa: E402
 import r310_read as R                                                  # noqa: E402
-import r307_cost_table as C7                                           # noqa: E402
 import fir_preflight_arms as PA                                        # noqa: E402
+sys.path.insert(0, os.path.join(ROOT, "src"))
+import bench_adapter_cost as BC                                        # noqa: E402
 
 # ---------------------------------------------------------------------------
 # ⭐⭐ THE COMPUTATIONAL COLUMNS.
@@ -40,10 +41,19 @@ import fir_preflight_arms as PA                                        # noqa: E
 #       `train_glue.py` into each cell's own CSV -- MEASURED, per seed;
 #     * throughput is those step times inverted, with an EXACT token count
 #       (`--pad_to_max_length` is forced, so a step is exactly 32 x 128 tokens);
-#     * flops/token come from `r307_cost_table`, which owns the arm -> op-counter
-#       map and the frozen J.2 counter `src/bench_adapter_cost.theoretical_flops`.
-#       ⭐ That map is IMPORTED, at this backbone's width -- a second copy that
-#       agreed today is precisely the defect class this repo keeps paying for.
+#     * flops/token come from `src/bench_adapter_cost`, which owns BOTH the frozen
+#       J.2 op-counter and the arm -> counter map. ⭐ The map is IMPORTED, at this
+#       backbone's width -- a second copy that agreed today is precisely the defect
+#       class this repo keeps paying for, and `r307_cost_table` delegates to the
+#       same functions so the two tables cannot drift.
+# ⛔⛔ AND IT IS IMPORTED FROM THERE, NOT FROM `r307_cost_table` [2026-08-30].
+#   r307 reads `scratchpad/phaseR/r308/timing.csv` AT IMPORT, and `scratchpad/` is
+#   gitignored: it does not travel to fir. Importing r307 here made THIS module
+#   un-importable ON THE CLUSTER while every check on this box stayed green -- the
+#   05 submit gate refused with "FAIL: fir_final_read selftest" and nothing ran.
+#   ⭐ A fir stage may only import modules that survive with `results/` and
+#   `scratchpad/` ABSENT; `fir_shell_gates.t_fir_stage_imports_survive_...` now
+#   proves that for every module the submit path selftests.
 COST_COLS = ["peak_mem_mib", "param_mem_mib", "opt_mem_mib", "runtime_mem_mib",
              "theoretical_mem_mib", "avg_step_time", "std_step_time",
              "total_training_time_sec"]
@@ -138,8 +148,8 @@ def cost_of(arm, got_rows):
         out["steps_per_sec"] = out["tokens_per_sec"] = ""
     # --- DERIVED flops, from r307's own map at THIS backbone's width -----------
     try:
-        un = C7._unmerged_at(arm, TOKENS_PER_STEP, d=D_MODEL)
-        mg = C7._merged_per_token(arm, d=D_MODEL, b=TOKENS_PER_STEP)
+        un = BC.arm_flops_per_token(arm, TOKENS_PER_STEP, D_MODEL)
+        mg = BC.arm_merged_per_token(arm, D_MODEL, TOKENS_PER_STEP)
     except (KeyError, TypeError):
         un = mg = None
     # ⛔ PLAIN DECIMAL, NOT %g. A flop count is exact and 8,388,608 formatted with
@@ -410,12 +420,12 @@ def selftest():
         ck(abs(float(c1["steps_per_sec"]) - 2.0) < 1e-9, "...and steps/s is 1/0.5")
         # (iii) flops come from r307's map, at THIS backbone's width -- not a copy
         ck(abs(float(c1["adapter_flops_per_token_unmerged"])
-               - C7._unmerged_at(H.ARMS[0], TOKENS_PER_STEP, d=D_MODEL)) < 1e-6,
-           "⭐ flops/token are r307's own op-counter, imported, at d=2048")
+               - BC.arm_flops_per_token(H.ARMS[0], TOKENS_PER_STEP, D_MODEL)) < 1e-6,
+           "⭐ flops/token are the frozen J.2 op-counter, imported, at d=2048")
         ck(float(c1["adapter_flops_per_token_unmerged"])
-           != C7._unmerged_at(H.ARMS[0], TOKENS_PER_STEP),
-           "⛔ CONTROL: and they are NOT r307's ROBERTA number (d=768) -- a width "
-           "that silently defaulted would be a plausible, wrong cost table")
+           != BC.arm_flops_per_token(H.ARMS[0], TOKENS_PER_STEP, 768),
+           "⛔ CONTROL: and they are NOT the ROBERTA number (d=768) -- a width that "
+           "silently defaulted would be a plausible, wrong cost table")
         ck(c1["dense_gemm_flops_per_token"] == str(2 * D_MODEL * D_MODEL),
            "the frozen dense GEMM reference is printed beside them")
         # (iv) the parameter budget, and LoCA's 3x

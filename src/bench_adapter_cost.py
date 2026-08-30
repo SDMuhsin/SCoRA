@@ -121,6 +121,75 @@ def _haar_tail(d: int) -> int:
     return L
 
 
+# ---------------------------------------------------------------------------
+# ⭐⭐ THE ARM -> OP-COUNTER MAP.  ONE SITE.
+# ---------------------------------------------------------------------------
+# It lived in `scripts/r307_cost_table.py`, which is the right place for a TABLE
+# but the wrong place for a MAP: r307 reads MEASURED dev-box artefacts at import
+# time (`scratchpad/phaseR/r308/timing.csv`), and `scratchpad/` is gitignored and
+# does not travel to fir.  Importing r307 to get at this map therefore made a fir
+# stage un-importable ON FIR while passing every check here -- [2026-08-30] it
+# refused `05_final.sh`'s submit gate and cost a round trip.
+# ⭐ THE LESSON, WHICH IS BIGGER THAN THE BUG: A COMPUTATION MUST NOT BE REACHABLE
+#   ONLY THROUGH A MODULE THAT READS DATA.  The op-count is pure arithmetic; it
+#   belongs beside the op-counter, where every caller -- dev box or cluster -- can
+#   reach it without a measurement file existing.
+# ⚠ r307 now DELEGATES here, so there is still exactly one map; its own 57 checks
+#   pin the numbers and are what proves this move changed nothing.
+def arm_flops_per_token(key: str, b: int, d: int) -> float:
+    """The arm's own UNMERGED adapter forward, per token, for ONE m=n=d module."""
+    a, kw = _ARM_TO_COUNTER(key)
+    return theoretical_flops(a, d, d, b, ADAPTER_K, **kw)["fwd_adapter"] / b
+
+
+def _ARM_TO_COUNTER(key):
+    if key in ("fftm", "fftstock"):
+        return "fourierft_stock", {}
+    if key == "loca":
+        return "loca_stock", {}
+    if key == "qwha":
+        return "qwha", {}
+    if key.startswith("wave"):
+        return "waveft_factored", {"r": 2 if key == "wave2" else 1}
+    if key == "lyra":
+        return "lyra_factored", {}
+    if key.startswith("scora"):
+        return "slr_factored", {}
+    raise KeyError(key)
+
+
+ADAPTER_K = 256          # the matched per-module budget every arm in this program trains
+
+
+def arm_build_flops(key: str, d: int) -> float:
+    """Flops to REBUILD the dense d x d dW once, per arm, from its own params."""
+    if key in ("fftm", "fftstock"):
+        return FFT_C(d) * d * 2 + d * d          # ifft2 over rows+cols, then scale
+    if key.startswith("wave"):
+        mu = 2 if key == "wave2" else 1
+        r = _haar_tail(d)
+        return d * (3 * d - 2 * r) * 2 + 2 * mu * ADAPTER_K
+    if key == "loca":
+        return 2 * ADAPTER_K * d * d             # k rank-1 DCT outer products
+    if key == "qwha":
+        # ⚠️ CONSTRUCTED, not QWHA's algorithm: QWHA never builds dW -- it works in
+        # the WHT domain end to end. This is what merging WOULD cost if it did,
+        # included so the column is uniform. Every caller must flag it.
+        return d * (d * math.log2(d)) * 2 + 2 * ADAPTER_K
+    if key == "lyra":
+        p_ = q_ = max(1, int(round(ADAPTER_K ** 0.5)))
+        return 2 * d * p_ * q_ + 2 * d * q_ * d
+    if key.startswith("scora"):
+        s_ = t_ = ADAPTER_K // 2
+        return 2 * d * s_ + 2 * d * t_ + 2 * d * d
+    raise KeyError(key)
+
+
+def arm_merged_per_token(key: str, d: int, b: int) -> float:
+    """Rebuild + fold-in, amortised over a batch of `b` tokens."""
+    return (arm_build_flops(key, d) + d * d) / b
+
+
 def theoretical_flops(arm: str, m: int, n: int, b: int, k: int, r: int = 1) -> dict:
     """Exact op-count for ONE module, ONE unmerged forward over `b` tokens.
 
