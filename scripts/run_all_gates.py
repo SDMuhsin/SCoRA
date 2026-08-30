@@ -45,6 +45,8 @@ GATES = [
     ("scripts/fir_hp_plan.py",         "[fir] the MRPC hp grids g1/g2 (lr) + w1 (WaveFT, P coordinate), all checked"),
     ("scripts/fir_hp_run_cell.py",     "[fir] one sweep cell + its OWN attachment receipt (a lone cell has no cross-arm check)"),
     ("scripts/fir_hp_read.py",         "[fir] the grid reader: F1 not accuracy, coverage before ranking, edge report"),
+    ("scripts/fir_final_plan.py",      "[fir] the FINAL runs: 9 arms x 6 tasks x 5 seeds at the FROZEN proxy HPs, every task view"),
+    ("scripts/fir_final_read.py",      "[fir] the final reader: MEDIAN over 5 seeds of the MAX over epochs, per-task metric"),
     ("scripts/r237_confirm_gen.py",   "5-seed confirmation block generator"),
     ("scripts/r236_gate_columns.py",  "results-row columns"),
     ("scripts/r239_gate_subsample.py", "--max_train_samples on GLUE"),
