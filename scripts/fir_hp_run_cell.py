@@ -20,6 +20,21 @@ sys.path.insert(0, os.path.join(ROOT, "scripts"))
 import fir_hp_plan as H                                                # noqa: E402
 import fir_preflight_arms as PA                                        # noqa: E402
 
+
+# ⭐⭐ ONE RUNNER, TWO STAGES.  The SEARCH (`fir_hp_plan`) and the FINAL RUNS
+#   (`fir_final_plan`) enumerate different cells, but a cell is executed and
+#   VERIFIED identically: same command builder contract, same receipt check, same
+#   fail-closed exits.  ⛔ Forking this file would fork `verify_receipts` -- the one
+#   thing standing between "the adapter attached to nothing" and a plausible number
+#   -- so the planner is a PARAMETER, not a copy.
+PLANNERS = {"hp": "fir_hp_plan", "final": "fir_final_plan"}
+
+
+def _planner(name):
+    if name not in PLANNERS:
+        raise SystemExit(f"FAIL CLOSED: --planner must be one of {sorted(PLANNERS)}")
+    return __import__(PLANNERS[name])
+
 # the per-module budget every arm in a sweep grid trains (n_frequency / k = 256)
 K = 256
 
@@ -83,12 +98,14 @@ def verify_receipts(text, cell):
 RC_NOT_IN_GRID = 5
 
 
-def run(cell_id, run_root, python=None, timeout=None):
+def run(cell_id, run_root, python=None, timeout=None, planner="hp"):
+    H = _planner(planner)
     try:
         c = H.parse_cell_id(cell_id)
     except SystemExit as e:
         print(f"⛔ PLAN/GRID MISMATCH: {e}")
-        print(f"   grid selected here: {H.GRID_NAME!r}  ({len(H.cells())} cells)")
+        _sel = getattr(H, "GRID_NAME", None) or getattr(H, "TASK_NAME", "?")
+        print(f"   selected here: {_sel!r}  ({len(H.cells())} cells)")
         print( "   NOTHING RAN. The array read a plan file written for another grid;")
         print( "   re-submit this grid -- plan files are per-submission now.")
         return RC_NOT_IN_GRID
@@ -193,6 +210,22 @@ def selftest():
        f"distinguishably from a training failure")
     ck(not os.path.exists(os.path.join(_d, "logs")),
        "...and it wrote no log, because nothing ran")
+    # ⭐ THE PLANNER IS A PARAMETER, SO BOTH VALUES MUST BE EXERCISED -- and each
+    #   must REFUSE the other's cell ids, or the two stages could silently run each
+    #   other's work out of a shared plan file (the 2026-08-28 failure, one level up).
+    import fir_final_plan as _FP
+    _fin = _FP.cell_id(_FP.cells(task="rte")[0])
+    _hp = "mrpc-scora-q_o-lr0p0451498-clr0p002-seed42"
+    ck(run(_fin, _d, planner="hp") == RC_NOT_IN_GRID,
+       "CONTROL: a FINAL cell id is refused by the hp planner")
+    ck(run(_hp, _d, planner="final") == RC_NOT_IN_GRID,
+       "CONTROL: an hp cell id is refused by the final planner")
+    try:
+        _planner("nope"); ck(False, "CONTROL: an unknown planner is refused")
+    except SystemExit:
+        ck(True, "CONTROL: an unknown planner is refused")
+    ck(_planner("final") is _FP and _planner("hp") is H,
+       "...and the two names resolve to the two real planner modules")
 
     for l in ok:
         print(f"  ✅ {l}")
@@ -206,13 +239,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cell")
     ap.add_argument("--run-root")
+    ap.add_argument("--planner", default="hp", choices=sorted(PLANNERS))
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
     if a.selftest:
         sys.exit(selftest())
     if not a.cell or not a.run_root:
         raise SystemExit("FAIL CLOSED: --cell and --run-root are required")
-    sys.exit(run(a.cell, a.run_root))
+    sys.exit(run(a.cell, a.run_root, planner=a.planner))
 
 
 if __name__ == "__main__":

@@ -79,9 +79,14 @@ def _wht(L):
     return L * math.log2(L)          # additions-only, as in bench_adapter_cost
 
 
-def _build_flops(key):
-    """Flops to REBUILD the dense m x n dW once, per arm, from its own params."""
-    d = D_MODEL
+def _build_flops(key, d=None):
+    """Flops to REBUILD the dense m x n dW once, per arm, from its own params.
+
+    ⭐ `d` DEFAULTS to this table's own backbone width but is a PARAMETER, because
+      the gemma-2b final runs quote the same op-count at d=2048 and the arm ->
+      op-counter mapping must exist in ONE place. A second copy of this map that
+      agreed today is exactly the defect class this repo keeps paying for."""
+    d = D_MODEL if d is None else d
     if key in ("fftm", "fftstock"):
         return BC.FFT_C(d) * d * 2 + d * d          # ifft2 over rows+cols, then scale
     if key.startswith("wave"):
@@ -104,9 +109,11 @@ def _build_flops(key):
     raise KeyError(key)
 
 
-def _merged_per_token(key):
+def _merged_per_token(key, d=None, b=None):
     """Rebuild + fold-in, amortised over the batch the accuracy was measured at."""
-    return (_build_flops(key) + D_MODEL * D_MODEL) / B_TOKENS
+    d = D_MODEL if d is None else d
+    b = B_TOKENS if b is None else b
+    return (_build_flops(key, d) + d * d) / b
 
 
 def _crossover(key):
@@ -127,12 +134,14 @@ def _crossover(key):
 DENSE_GEMM_PER_TOKEN = BC.GEMM(1, D_MODEL, D_MODEL)    # 2mn, the frozen layer
 
 
-def _unmerged_at(key, b):
+def _unmerged_at(key, b, d=None):
     """The arm's own UNMERGED forward, per token, at batch `b`.
 
     This is the path each method publishes, except where this repo's own
-    implementation is dearer -- and where it is, the AS-RUN column says so."""
-    m = n = D_MODEL
+    implementation is dearer -- and where it is, the AS-RUN column says so.
+    ⭐ `d` is a PARAMETER for the same reason `_build_flops`'s is: ONE arm ->
+      op-counter map, quoted at whatever width the accuracy was measured on."""
+    m = n = D_MODEL if d is None else d
     if key in ("fftm", "fftstock"):
         a = "fourierft_stock"
         kw = {}

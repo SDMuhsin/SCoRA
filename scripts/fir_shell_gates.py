@@ -576,13 +576,126 @@ def t_wrong_checkout_warning_fires_and_stays_silent():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def t_final_stage_plan_is_computable_for_every_task():
+    """⭐⭐ THE SAME BATTERY AS 04, RUN AGAINST 05 -- because 05 is a second copy of
+    the submit machinery and an untested copy is worse than no copy.
+
+    ⛔ 05 exists as its own file (a different job shape: one array PER TASK), and
+      the price of that decision is exactly this function. Every property 04's gate
+      proves is proved here too: the canary plan is computable off-cluster, it names
+      one cell per expected slot, the array body pins THIS task and a per-submission
+      plan file, every array index resolves to a cell OF THIS STAGE (the 2026-08-28
+      defect, end to end), and a finished cell is not re-queued.
+    ⛔ Plus the one property 04 has no analogue for: the `all` view REFUSES to
+      submit, in both directions."""
+    import json as _json
+    for t in _final_tasks() + ["all"]:
+        tmp = tempfile.mkdtemp()
+        try:
+            env = {"FIR_SCRATCH_ROOT": tmp, "FIR_LOGGING": "1", "FIR_FINAL_TASK": t,
+                   "FIR_COLLECT_DIR": os.path.join(tmp, "collected")}
+            if t == "all":
+                # ⛔ BOTH DIRECTIONS: `all` refuses every submitting path, and still
+                #   answers --status. A view that silently submitted six tasks under
+                #   one --time wall would kill every SST-2 cell.
+                for flags in ("--dry-run", "--dry-run --canary 9"):
+                    rc = sh(f'bash sbatch/fir/05_final.sh {flags}', env=env)
+                    out = rc.stdout + rc.stderr
+                    check(f"[final:all] CONTROL: `{flags}` is REFUSED",
+                          rc.returncode != 0 and "READING VIEW" in out, out)
+                    check(f"[final:all] ...and nothing is submitted by `{flags}`",
+                          "would submit" not in out, out)
+                rs = sh('bash sbatch/fir/05_final.sh --status', env=env)
+                check("[final:all] ...but --status over ALL tasks IS supported",
+                      rs.returncode == 0 and "cells: 270" in rs.stdout,
+                      rs.stdout + rs.stderr)
+                continue
+            n_can = _final_n_canary(t)
+            rc = sh('bash sbatch/fir/05_final.sh --dry-run --canary 9', env=env)
+            spec = [l for l in rc.stdout.splitlines() if l.startswith("DRY RUN: would submit")]
+            check(f"[final:{t}] the canary plan is computable off-cluster",
+                  bool(spec) and rc.returncode == 0, rc.stdout + rc.stderr)
+            idx = spec[0].split("array=")[1].split()[0] if spec else ""
+            check(f"[final:{t}] the canary is the covering slice for this task "
+                  f"({n_can} cell(s))",
+                  len([x for x in idx.split(",") if x]) == n_can, idx)
+            body = [l[6:] for l in rc.stdout.splitlines() if l.startswith("    | ")]
+            check(f"[final:{t}] the array body pins THIS task",
+                  any(l.strip() == f'export FIR_FINAL_TASK="{t}"' for l in body), body[:3])
+            pf = ""
+            for l in body:
+                if l.startswith("cid=$(sed -n"):
+                    pf = l.split('"')[-2]
+            check(f"[final:{t}] ...and names a plan file belonging to this submission",
+                  bool(pf) and os.path.basename(pf).startswith(f"final-{t}-"), pf)
+            check(f"[final:{t}] ...and the body calls 05, not 04",
+                  any("05_final.sh --run-one" in l for l in body), body[-2:])
+            if pf and os.path.exists(pf):
+                lines = open(pf).read().splitlines()
+                own = set(subprocess.run(
+                    [VENV_PY if os.path.exists(VENV_PY) else sys.executable,
+                     "scripts/fir_final_plan.py", "--list"], capture_output=True,
+                    text=True, cwd=ROOT,
+                    env=dict(os.environ, FIR_FINAL_TASK=t)).stdout.split())
+                bad = []
+                for tok in [x for x in idx.split(",") if x.isdigit()]:
+                    i = int(tok)
+                    resolved = lines[i] if i < len(lines) else ""
+                    if resolved not in own:
+                        bad.append((tok, resolved))
+                check(f"[final:{t}] ⭐ every index the array uses resolves to a cell OF "
+                      f"THIS TASK (the 2026-08-28 failure, checked end to end)",
+                      bool(idx) and not bad, bad or f"idx={idx}")
+                # ⛔ AND THE CANARY MUST NOT BE ALL ONE ARM. Its whole job is to
+                #   cover the arm axis; a picker that returned five seeds of one arm
+                #   would look identical in the index list.
+                arms = {lines[int(x)].split("-")[1] for x in idx.split(",") if x.isdigit()}
+                check(f"[final:{t}] ...and they are {n_can} DISTINCT arm(s), not "
+                      f"seeds of one", len(arms) == n_can, sorted(arms))
+            root = os.path.join(tmp, "runs", "final")
+            cid = _first_planned_cell(root)
+            open(os.path.join(root, "done", cid), "w").write("100")
+            rr = sh('bash sbatch/fir/05_final.sh --dry-run', env=env)
+            spec2 = [l for l in rr.stdout.splitlines() if l.startswith("DRY RUN: would submit")]
+            got = spec2[0].split("array=")[1].split("%")[0] if spec2 else ""
+            check(f"[final:{t}] a finished cell is NOT re-queued (index 0 dropped)",
+                  bool(spec2) and not got.startswith("0-") and not got.startswith("0,"),
+                  rr.stdout + rr.stderr)
+            check(f"[final:{t}] CONTROL: the rest of the task still IS queued",
+                  got.startswith("1-"), got)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _final_tasks():
+    r = subprocess.run([VENV_PY if os.path.exists(VENV_PY) else sys.executable, "-c",
+                        "import sys;sys.path.insert(0,'scripts');"
+                        "import fir_final_plan as H;print(' '.join(H.TASKS))"],
+                       capture_output=True, text=True, cwd=ROOT)
+    return r.stdout.split()
+
+
+def _final_n_canary(task):
+    """How many canary cells this task owns -- ⛔ ASKED, never assumed. The picker
+    gives the 3 spare slots to the cheapest task, so the count is 1 for most tasks
+    and 4 for one of them, and a hardcoded 1 here would go red the day the arm or
+    task list changes length."""
+    r = subprocess.run([VENV_PY if os.path.exists(VENV_PY) else sys.executable, "-c",
+                        "import sys;sys.path.insert(0,'scripts');"
+                        "import fir_final_plan as H;"
+                        f"print(sum(1 for c in H.canary_cells() if c['task']=={task!r}))"],
+                       capture_output=True, text=True, cwd=ROOT)
+    return int(r.stdout.strip())
+
+
 def main():
     for t in (t_syntax, t_nousersite_exported, t_assert_in_venv, t_stage_callsites,
               t_no_bare_python, t_env_gate_location_check, t_provenance,
               t_sweep_status_sees_a_killed_cell,
               t_sweep_submit_plan_is_computable_for_every_grid,
               t_a_later_submit_cannot_move_a_queued_array_plan,
-              t_wrong_checkout_warning_fires_and_stays_silent):
+              t_wrong_checkout_warning_fires_and_stays_silent,
+              t_final_stage_plan_is_computable_for_every_task):
         t()
     print(f"selftest: {_P[0]} passed, {_P[1]} failed")
     return 1 if _P[1] else 0
