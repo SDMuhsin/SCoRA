@@ -2295,7 +2295,13 @@ def run_single_seed(base_args: argparse.Namespace, seed: int):
     amp_dtype = torch.float16 if args.mixed_precision == "fp16" else torch.bfloat16
     # bf16 spans fp32's exponent range, so it needs no loss scaler; fp16 does, and
     # WITHOUT one it is measurably untrainable (see the flag's note).
-    scaler = torch.cuda.amp.GradScaler(enabled=(args.mixed_precision == "fp16"))
+    # ⛔⛔ `torch.cuda.amp.GradScaler(...)` IS DEPRECATED and this repo runs on TWO
+    #   torch builds: the dev box is 2.5.1 (where it warns) and fir is 2.10.0 (where
+    #   it may be gone). CONTEXT §3.1: the fir comparator matches on NUMERICS, but the
+    #   torch BUILD still differs -- so an API that merely warns here can be an
+    #   AttributeError there, and the only place that would surface is a burnt H100.
+    #   `torch.amp.GradScaler("cuda", ...)` is the supported spelling in both.
+    scaler = torch.amp.GradScaler("cuda", enabled=(args.mixed_precision == "fp16"))
     if amp_enabled:
         logger.info("[amp] mixed_precision=%s  autocast dtype=%s  loss_scaler=%s  master weights=fp32",
                     args.mixed_precision, amp_dtype, args.mixed_precision == "fp16")
