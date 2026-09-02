@@ -394,6 +394,23 @@ def parse_args():
     parser.add_argument("--grad_clipping", type=float, default=1.0, help="Gradient clipping value. 0.0 to disable.")
     parser.add_argument("--beta1", type=float, default=0.0, help="Beta1 for Adam-like optimizers (e.g., Adafactor).")
     parser.add_argument("--dtype", type=str, default="bfloat16" if torch.cuda.is_bf16_supported() else "float32", help="Data type for model training (bfloat16, float16, float32).")
+    # ⭐ MIXED PRECISION, and it is NOT the same knob as --dtype.
+    #   --dtype CASTS the model, its gradients AND its optimizer state.  [measured
+    #   2026-09-02, llmdocs/FP16_BASELINE.md] that makes full fine-tuning UNTRAINABLE
+    #   in half precision: fp16 sits at its init accuracy across lr 1e-5..1e-2 (seven
+    #   rungs, three orders of magnitude) because gradients underflow fp16's exponent
+    #   range to ZERO, and bf16 -- which has fp32's range -- trains only once the lr is
+    #   raised ~5x, the signature of the UPDATE underflowing a half mantissa.
+    #   This flag is what the literature means by "mixed precision" (Liu et al. 2019
+    #   Table 10, the recipe LoRA and FourierFT both cite): fp32 MASTER WEIGHTS and
+    #   fp32 optimizer state, half-precision COMPUTE under autocast, and a loss scaler
+    #   to keep fp16 gradients inside the representable range.
+    # ⛔ Default "no" leaves every prior run bit-identical -- this adds a path, it does
+    #   not change one.  Combine with --dtype float32 (a cast + autocast is neither).
+    parser.add_argument("--mixed_precision", type=str, default="no", choices=["no", "fp16", "bf16"],
+                        help="Mixed-precision COMPUTE with fp32 master weights (autocast + GradScaler). "
+                             "Unlike --dtype this does NOT cast the model or the optimizer state. "
+                             "'no' (default) is the shipped path and is bit-identical to before.")
 
     # GaLore / GALE Specific Arguments
     parser.add_argument("--rank", type=int, default=128, help="Rank for GaLore/GALE projection matrices.")
@@ -2265,6 +2282,24 @@ def run_single_seed(base_args: argparse.Namespace, seed: int):
     # becomes its own result row, so each keeps its own best epoch.
     best_multi_eval: Dict[str, Dict[str, float]] = {}
 
+    # --- Mixed precision (see --mixed_precision) ---
+    # ⛔ FAIL CLOSED: autocast is CUDA-only here.  Asking for it on CPU is a silent
+    #   no-op that would report a half-precision result from an fp32 run.
+    amp_enabled = args.mixed_precision != "no"
+    if amp_enabled and device.type != "cuda":
+        raise SystemExit(f"--mixed_precision {args.mixed_precision} requires CUDA (device={device})")
+    if amp_enabled and dtype != torch.float32:
+        raise SystemExit(
+            f"--mixed_precision {args.mixed_precision} needs fp32 MASTER WEIGHTS but --dtype is "
+            f"{args.dtype}. A cast plus autocast is neither mixed precision nor a pure cast.")
+    amp_dtype = torch.float16 if args.mixed_precision == "fp16" else torch.bfloat16
+    # bf16 spans fp32's exponent range, so it needs no loss scaler; fp16 does, and
+    # WITHOUT one it is measurably untrainable (see the flag's note).
+    scaler = torch.cuda.amp.GradScaler(enabled=(args.mixed_precision == "fp16"))
+    if amp_enabled:
+        logger.info("[amp] mixed_precision=%s  autocast dtype=%s  loss_scaler=%s  master weights=fp32",
+                    args.mixed_precision, amp_dtype, args.mixed_precision == "fp16")
+
     # --- Training Loop ---
     for epoch in range(args.num_train_epochs):
         model.train()
@@ -2278,20 +2313,27 @@ def run_single_seed(base_args: argparse.Namespace, seed: int):
             if is_regression and "labels" in batch:
                 batch["labels"] = batch["labels"].to(dtype)
 
-            outputs = model(**batch)
-            loss = outputs.loss
-            
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+                outputs = model(**batch)
+                loss = outputs.loss
+
             if args.gradient_accumulation_steps > 1:
                 loss = loss / args.gradient_accumulation_steps
-            
-            loss.backward()
+
+            scaler.scale(loss).backward()
 
             if (step + 1) % args.gradient_accumulation_steps == 0 or (step == len(train_loader) - 1):
+                # ⛔ UNSCALE BEFORE CLIPPING. clip_grad_norm_ on still-scaled grads
+                #   would clip to the WRONG norm by the scale factor -- silently, and
+                #   the factor moves every time the scaler backs off.
+                if scaler.is_enabled():
+                    scaler.unscale_(optimizer)
                 if args.grad_clipping > 0.0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clipping)
-                
+
                 step_start_time = time.perf_counter()
-                optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
                 step_times.append(time.perf_counter() - step_start_time)
 
                 lr_scheduler.step()
@@ -2534,6 +2576,7 @@ def main():
         # slr_init caused an undetected CoLA(zero)/RTE(matched) confound; num_warmup_steps
         # is worth +0.0036..+0.0450 [R.67/R.68/R.78] and appeared in 0 of 43 drivers.
         # [R.200] and the LR SCHEDULE itself was never recorded either -- same 1.5c family.
+        "mixed_precision",
         "lr_scheduler_type", "lr_scheduler_num_cycles",
         "num_warmup_steps", "slr_init", "slr_rank", "slr_s", "slr_beta_lr_ratio", "shrinkft_q", "sparseft_support",
         "offgrid_k", "offgrid_train_locations", "offgrid_seed", "offgrid_scaling", "offgrid_init_std",
@@ -2625,6 +2668,7 @@ def main():
         "lr_scheduler_type": str(args.lr_scheduler_type),
         "lr_scheduler_num_cycles": (args.lr_scheduler_num_cycles
                                     if args.lr_scheduler_num_cycles is not None else 'N/A'),
+        "mixed_precision": args.mixed_precision,
         "num_warmup_steps": args.num_warmup_steps,
         "slr_init": args.slr_init if args.adapter_method == 'slr' else 'N/A',
         "slr_rank": args.slr_rank if args.adapter_method == 'slr' else 'N/A',

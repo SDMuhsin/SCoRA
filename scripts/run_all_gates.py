@@ -47,6 +47,8 @@ GATES = [
     ("scripts/fir_hp_read.py",         "[fir] the grid reader: F1 not accuracy, coverage before ranking, edge report"),
     ("scripts/fir_final_plan.py",      "[fir] the FINAL runs: 9 arms x 6 tasks x 5 seeds at the FROZEN proxy HPs, every task view"),
     ("scripts/fir_final_read.py",      "[fir] the final reader: MEDIAN over 5 seeds of the MAX over epochs, per-task metric"),
+    ("scripts/fir_baseline_plan.py",   "[fir] STAGE 06: the FP16 FULL-FT baseline grid -- real AMP, no adapter, winners fail closed"),
+    ("scripts/fp16_baseline_plan.py",  "[dev] the fp16 full-FT baseline recipe + roberta grid (the ONE place the recipe lives)"),
     ("scripts/r237_confirm_gen.py",   "5-seed confirmation block generator"),
     ("scripts/r236_gate_columns.py",  "results-row columns"),
     ("scripts/r239_gate_subsample.py", "--max_train_samples on GLUE"),
