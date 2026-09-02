@@ -173,13 +173,13 @@ fi
 # ===========================================================================
 STAGE="${FIR_BASE_STAGE:-search}"
 # ⛔ THE STAGE IS PART OF THE PLAN FILE'S IDENTITY. `final` emits ZERO cells
-#   until fir_baseline_plan.WINNERS is filled in from the search, so a
+#   until fir_baseline_plan.PROXY is filled in from the search, so a
 #   premature `final` submit produces an EMPTY plan and is refused below
 #   rather than silently submitting the whole ladder at five seeds.
 env/bin/python scripts/fir_baseline_plan.py --list --stage "$STAGE" > "$PLAN_FILE" || exit 1
 TOTAL=$(wc -l < "$PLAN_FILE")
 # ⛔⛔ AN EMPTY PLAN IS A REFUSAL, NOT A NO-OP. `--stage final` emits zero cells
-#   until fir_baseline_plan.WINNERS is filled in from the search. Without this guard
+#   until fir_baseline_plan.PROXY is filled in from the search. Without this guard
 #   the array spec (computed separately, below) still produced 0-11 and sbatch would
 #   have allocated 12 H100s to read an EMPTY plan file -- the 2026-08-28 failure
 #   shape exactly: an array index resolving out of a list nobody checked.
@@ -187,8 +187,8 @@ if [ "$TOTAL" -eq 0 ]; then
     echo "⛔ REFUSING: the plan for grid '$GRID_NAME' stage '$STAGE' is EMPTY."
     if [ "$STAGE" = "final" ]; then
         echo "   The final stage runs the SEARCH's winner at the remaining seeds, and"
-        echo "   fir_baseline_plan.WINNERS is still empty. Run and READ the search first,"
-        echo "   then write the measured (lr, batch) per task into WINNERS."
+        echo "   fir_baseline_plan.PROXY is still empty. Run and READ the search first,"
+        echo "   then write the measured (lr, batch) into PROXY."
     fi
     exit 1
 fi

@@ -29,15 +29,29 @@ env/bin/python scripts/r310_reap.py "$D" || exit 1
 
 echo "[fp16base] ===== START $(date +%F' '%T) ====="
 echo "[fp16base] tasks: $TASKS"
-for stage in search final; do
-  echo "[fp16base] ========== STAGE $stage =========="
-  for t in $TASKS; do
-    echo "[fp16base] ---- $stage / $t  $(date +%F' '%T) ----"
-    $PLAN --generate "$t" --stage "$stage" || exit 1
-    [ -s "$D/jobs_${t}.tsv" ] || { echo "[fp16base] $t empty, skipping"; continue; }
-    R310_DIR="$D" scripts/r310_drive.sh "$t"
-  done
-  $PLAN --read || true
+SEL=$($PLAN --selection-task) || exit 1
+
+# ⭐ STAGE 1 sweeps the SELECTION TASK ONLY -- one ladder, not six.
+echo "[fp16base] ========== STAGE search (selection task: $SEL) =========="
+$PLAN --generate "$SEL" --stage search || exit 1
+[ -s "$D/jobs_${SEL}.tsv" ] || { echo "[fp16base] no search cells -- aborting"; exit 1; }
+R310_DIR="$D" scripts/r310_drive.sh "$SEL"
+$PLAN --read || true
+
+# ⛔ THE PROXY MUST EXIST BEFORE ANY FINAL CELL RUNS. If the sweep did not complete,
+#   `--proxy` exits non-zero and we stop here rather than carrying a winner chosen
+#   from a partial ladder.
+PROXY=$($PLAN --proxy) || {
+    echo "[fp16base] ⛔ the sweep on $SEL produced no winner -- refusing to run the"
+    echo "           final stage. Re-run this script; it resumes the sweep."
+    exit 1; }
+echo "[fp16base] ========== STAGE final (proxy carried: lr/bs = $PROXY) =========="
+for t in $TASKS; do
+  echo "[fp16base] ---- final / $t  $(date +%F' '%T) ----"
+  $PLAN --generate "$t" --stage final || exit 1
+  [ -s "$D/jobs_${t}.tsv" ] || { echo "[fp16base] $t empty, skipping"; continue; }
+  R310_DIR="$D" scripts/r310_drive.sh "$t"
 done
+$PLAN --read || true
 echo "[fp16base] ===== DONE $(date +%F' '%T) ====="
 $PLAN --read || true

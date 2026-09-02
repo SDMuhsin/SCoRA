@@ -58,10 +58,20 @@ LRS = [5e-6, 1e-5, 2e-5, 3e-5, 5e-5, 1e-4]
 BATCHES = [16, 32]                 # the recipe's own two rungs
 SEARCH_SEED = 42
 
-# ⭐ THE SEARCH'S WINNERS -- (lr, batch) per task, EMPTY until the search has run
-#   and been read.  This is the stage-06 analogue of GEMMA_HP_PROXY.md: a measured
-#   table, written once, never guessed.  ⛔ Selection is on the SEARCH SEED ONLY.
-WINNERS: dict = {}
+# ⭐⭐ ONE SWEEP, CARRIED AS A PROXY -- the protocol this program already uses
+#   [user, 2026-09-02; memory: hp-transfer-proxy].  The ladder is swept on ONE task
+#   and the winner is carried UNCHANGED to all six columns.
+# ⛔ THE SELECTION TASK IS **MRPC**, because stage 05's nine PEFT arms were tuned on
+#   MRPC (GEMMA_HP_PROXY.md) and carried to these same six columns.  Baseline and
+#   arms therefore share ONE in-sample task, which stage 05's reader already labels.
+#   Choosing a different one would put two different in-sample tasks in one table.
+SELECTION_TASK = "mrpc"
+
+# ⭐ THE PROXY: (lr, batch) from the sweep. EMPTY until the search has been read --
+#   the stage-06 analogue of GEMMA_HP_PROXY.md: measured, written once, never guessed.
+# ⛔ Selection is on the SEARCH SEED ONLY; picking on all five and reporting those
+#   same five is selection on the test set.
+PROXY: tuple = ()
 
 TASK_NAME = os.environ.get("FIR_BASE_TASK", "all")
 if TASK_NAME not in TASKS + ["all"]:
@@ -98,6 +108,9 @@ def cells(task=None, stage="search", seeds=None):
     out = []
     for t in ([task] if task else tasks()):
         if stage == "search":
+            # ⛔ THE SWEEP RUNS ON THE SELECTION TASK ONLY.
+            if t != SELECTION_TASK:
+                continue
             for b in BATCHES:
                 for lr in LRS:
                     out.append({"arm": ARM, "task": t, "lr": lr, "batch": b,
@@ -107,15 +120,12 @@ def cells(task=None, stage="search", seeds=None):
             #   function enumerated the WHOLE ladder at the remaining four seeds --
             #   288 gemma-2b full-FT cells, several hundred GPU-h, for a stage whose
             #   final row needs SIX configurations. `--selftest` now asserts that an
-            #   empty WINNERS table yields ZERO final cells, so the accident cannot
+            #   empty PROXY yields ZERO final cells, so the accident cannot
             #   be submitted.
-            w = WINNERS.get(t)
-            if w is None:
+            if not PROXY:
                 continue
-            lr, b = w
+            lr, b = PROXY
             for s in (seeds or SEEDS):
-                if s == SEARCH_SEED:
-                    continue
                 out.append({"arm": ARM, "task": t, "lr": lr, "batch": b,
                             "seed": s, "epochs": EPOCHS[t]})
     return out
@@ -206,6 +216,7 @@ def show():
 
 
 def selftest():
+    global PROXY
     ok, bad = [], []
 
     def ck(c, m):
@@ -253,19 +264,41 @@ def selftest():
         ck(False, "CONTROL: a nonsense id is refused")
     except SystemExit:
         ck(True, "⛔ CONTROL: a nonsense cell id fails closed")
-    ck(len(cells(stage="final")) == 0 if not WINNERS else True,
-       "⛔ CONTROL: with an EMPTY winners table the final stage emits ZERO cells "
-       "-- it cannot be submitted before the search is read")
-    _saved = dict(WINNERS)
-    WINNERS.update({"rte": (2e-5, 32)})
-    ck(len(cells(task="rte", stage="final")) == len(SEEDS) - 1,
-       f"...and with one winner declared it emits exactly {len(SEEDS)-1} seeds for that task")
-    ck(all(c["seed"] != SEARCH_SEED for c in cells(task="rte", stage="final")),
-       "⛔ CONTROL: the final stage never re-runs the search seed")
-    WINNERS.clear(); WINNERS.update(_saved)
+    # ⭐ ONE SWEEP, CARRIED
+    ck(SELECTION_TASK in TASKS,
+       f"the selection task ({SELECTION_TASK}) IS one of the six -- stage 05's arms are "
+       f"in-sample on the same task, so the table has ONE in-sample column, not two")
+    srch = [c for t in TASKS for c in cells(task=t, stage="search")]
+    ck(len(srch) == len(LRS) * len(BATCHES),
+       f"the sweep is {len(LRS)}x{len(BATCHES)} = {len(srch)} cells, on ONE task")
+    ck({c["task"] for c in srch} == {SELECTION_TASK},
+       f"⛔ CONTROL: every swept cell is on {SELECTION_TASK}")
+    for t in TASKS:
+        if t != SELECTION_TASK:
+            ck(cells(task=t, stage="search") == [],
+               f"⛔ CONTROL: asking to sweep {t} yields ZERO cells")
+    ck(not PROXY and len([c for t in TASKS for c in cells(task=t, stage="final")]) == 0,
+       "⛔ CONTROL: with an EMPTY proxy the final stage emits ZERO cells -- it cannot "
+       "be submitted before the search is read")
+    _saved = PROXY
+    PROXY = (2e-5, 32)
+    fin = [c for t in TASKS for c in cells(task=t, stage="final")]
+    ck(len(fin) == len(TASKS) * len(SEEDS),
+       f"...and with a proxy declared it is {len(TASKS)} columns x {len(SEEDS)} seeds = {len(fin)}")
+    ck({(c["lr"], c["batch"]) for c in fin} == {(2e-5, 32)},
+       "⛔ CONTROL: EVERY final cell carries the SAME (lr, batch) -- a per-task winner "
+       "here would be a silent sweep")
+    ck({c["task"] for c in fin} == set(TASKS), "final covers all six columns")
+    PROXY = _saved
 
     ci = canary_indices()
-    ck(len(ci) == len(tasks()), f"canary picks exactly one cell per selected task ({len(ci)})")
+    # ⛔ ONE PER TASK **PRESENT IN THIS STAGE'S CELLS**, not per selected task. The
+    #   search stage only ever contains the selection task, so a check written against
+    #   tasks() said "expected 6, got 1" -- the CHECK was stale after the protocol
+    #   changed from six sweeps to one, not the picker.
+    _st = {c["task"] for c in cells(stage="search")}
+    ck(len(ci) == len(_st),
+       f"canary picks exactly one cell per task PRESENT in the stage ({len(ci)} of {len(_st)})")
     ck(len({cells()[i]["task"] for i in ci}) == len(ci), "canary cells are on DISTINCT tasks")
     ck(all(cells()[i]["lr"] not in (min(LRS), max(LRS)) for i in ci),
        "⛔ canary cells are CENTRAL in lr -- an edge rung may collapse and tell you nothing")
