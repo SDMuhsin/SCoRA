@@ -27,7 +27,8 @@ import fir_preflight_arms as PA                                        # noqa: E
 #   fail-closed exits.  ⛔ Forking this file would fork `verify_receipts` -- the one
 #   thing standing between "the adapter attached to nothing" and a plausible number
 #   -- so the planner is a PARAMETER, not a copy.
-PLANNERS = {"hp": "fir_hp_plan", "final": "fir_final_plan"}
+PLANNERS = {"hp": "fir_hp_plan", "final": "fir_final_plan",
+            "baseline": "fir_baseline_plan"}
 
 
 def _planner(name):
@@ -37,6 +38,19 @@ def _planner(name):
 
 # the per-module budget every arm in a sweep grid trains (n_frequency / k = 256)
 K = 256
+
+# ⭐ gemma-2b's FROZEN BACKBONE, excluding the classification head.  [measured,
+#   preflight_56905037/56922969] and asserted across all nine PEFT arms.  The
+#   full-fine-tuning BASELINE is the one cell kind that trains it, so it is the one
+#   kind whose receipt must be checked against this number DIRECTLY.
+BACKBONE = 2_506_172_416
+
+# ⛔ THE BASELINE IS NOT AN ADAPTER, AND THE ADAPTER BUDGET MODEL CANNOT DESCRIBE IT.
+#   (trainable - head) / 256 == 36 is the invariant for every PEFT arm; full FT has
+#   NO adapter and NO frozen backbone, so that arithmetic is not merely wrong for it,
+#   it is meaningless.  Naming the arm here keeps the dispatch explicit rather than
+#   letting an unknown arm fall through to a check that cannot apply.
+BASELINE_ARMS = {"base"}
 
 
 def verify_receipts(text, cell):
@@ -58,6 +72,25 @@ def verify_receipts(text, cell):
     #   n_mod check below rejects. A CONTROL in the selftest fires on exactly that.
     if not cell or not cell.get("arm"):
         return False, "no cell given -- the budget model is PER-ARM and cannot be guessed"
+
+    if cell["arm"] in BASELINE_ARMS:
+        # FULL FINE-TUNING: every parameter trains, so `trainable` must equal `all`,
+        # and both must equal the measured backbone plus THIS TASK's head.
+        r = PA.parse_receipts(text)
+        tr, al = r.get("trainable"), r.get("all_params")
+        if not tr:
+            return False, "NO trainable-params receipt -- cannot prove anything ran"
+        if not al:
+            return False, "NO all-params receipt -- cannot prove the backbone trained"
+        if tr != al:
+            return False, (f"full FT must train EVERY parameter, but trainable {tr:,} "
+                           f"!= all {al:,} -- {al - tr:,} params stayed frozen")
+        want = BACKBONE + head_params(cell.get("task"))
+        if tr != want:
+            return False, (f"trainable {tr:,} != backbone {BACKBONE:,} + head "
+                           f"{head_params(cell.get('task')):,} = {want:,} -- this is not "
+                           f"the same model the PEFT arms adapted")
+        return True, f"FULL FT: all {tr:,} params trainable (backbone + head)"
     mult = PA.LOCATION_MULTIPLIER.get(cell["arm"], 1)
     budget = K * mult
     r = PA.parse_receipts(text)
@@ -239,6 +272,28 @@ def selftest():
     except SystemExit:
         ck(True, "CONTROL: a cell with NO task fails closed -- the head cannot be guessed")
 
+    # ---- the FULL-FT BASELINE arm (llmdocs/FP16_BASELINE.md) --------------------
+    base_mrpc = ("trainable params: 2,506,176,512 || all params: 2,506,176,512 || x\n")
+    base_stsb = ("trainable params: 2,506,174,464 || all params: 2,506,174,464 || x\n")
+    ck(verify_receipts(base_mrpc, {"arm": "base", "task": "mrpc"})[0],
+       "⭐ a full-FT receipt (backbone 2,506,172,416 + a 4,096 head, ALL trainable) PASSES")
+    ck(verify_receipts(base_stsb, {"arm": "base", "task": "stsb"})[0],
+       "⭐ and STS-B's regression head (2,048) is derived for the baseline too")
+    # ⛔ CONTROLS, both directions.
+    ck(not verify_receipts(base_mrpc, {"arm": "base", "task": "stsb"})[0],
+       "⛔ CONTROL: a 2-class full-FT receipt read as STS-B is REFUSED (wrong head)")
+    ck(not verify_receipts(
+        "trainable params: 2,506,172,416 || all params: 2,506,176,512 || x\n",
+        {"arm": "base", "task": "mrpc"})[0],
+       "⛔ CONTROL: a baseline cell that left the HEAD frozen is refused -- full FT "
+       "means trainable == all, and 4,096 params stayed put")
+    ck(not verify_receipts(real, {"arm": "base", "task": "mrpc"})[0],
+       "⛔ CONTROL: an ADAPTER receipt claimed as the baseline is refused -- 13,312 "
+       "trainable is not the whole model")
+    ck(not verify_receipts(base_mrpc, {"arm": "wave1", "task": "mrpc"})[0],
+       "⛔ CONTROL: and the BASELINE receipt claimed by a PEFT arm is refused too -- "
+       "the two receipt models must not be interchangeable")
+
     for label, text in (
         ("the adapter attaching to NOTHING (head trains alone)",
          "trainable params: 4,096 || all params: 2,506,172,416 || x\n"),
@@ -281,8 +336,20 @@ def selftest():
         _planner("nope"); ck(False, "CONTROL: an unknown planner is refused")
     except SystemExit:
         ck(True, "CONTROL: an unknown planner is refused")
+    # ⛔ ENUMERATE THE REGISTRY, do not spell out two of it. This check used to name
+    #   `final` and `hp` literally, so registering a THIRD planner (`baseline`) left
+    #   it silently uncovered -- CONTEXT §4.2: *fixing one instance does not close the
+    #   class*, and a check that covers less than the registry is that class exactly.
+    for _name in PLANNERS:
+        _m = _planner(_name)
+        ck(_m.__name__ == PLANNERS[_name],
+           f"planner {_name!r} resolves to the real module {PLANNERS[_name]}")
+        ck(callable(getattr(_m, "parse_cell_id", None))
+           and callable(getattr(_m, "cell_cmd", None))
+           and callable(getattr(_m, "cell_env", None)),
+           f"planner {_name!r} implements the parse/cmd/env interface run() needs")
     ck(_planner("final") is _FP and _planner("hp") is H,
-       "...and the two names resolve to the two real planner modules")
+       "...and the two long-standing names still resolve to the same modules")
 
     for l in ok:
         print(f"  ✅ {l}")

@@ -30,7 +30,10 @@ set -u
 cd /workspace/lora_research_signal || exit 1
 
 TASK=${1:?usage: r310_drive.sh <cb|mrpc|stsb|cola|boolq|sst2|mnli>}
-D=scratchpad/phaseR/r310
+# ⭐ The state directory is a PARAMETER so a second grid (the fp16 full-FT baseline,
+#   scripts/fp16_baseline_plan.py) can reuse this worker pool without sharing state
+#   with [R.310]. Default unchanged => every existing invocation is bit-identical.
+D=${R310_DIR:-scratchpad/phaseR/r310}
 mkdir -p "$D"/{csv,logs,done,claim,failed}
 
 JOBS="$D/jobs_${TASK}.tsv"
