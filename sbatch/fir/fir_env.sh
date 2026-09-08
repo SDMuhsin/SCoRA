@@ -153,8 +153,58 @@ fir_link_scratch() {
                 echo "FAIL: $link is a symlink pointing somewhere else:"
                 echo "      $(readlink -f "$link")  !=  $(readlink -f "$target")"; return 1; }
         elif [ -e "$link" ]; then
+            # ⛔ 2026-09-08, narval: this fired on ./env and said ONLY that it had
+            #   fired. Refusing to delete is right; refusing WITHOUT SAYING WHAT THE
+            #   THING IS makes the user choose between `rm -rf` on an unknown
+            #   directory and a round trip. Nothing in this tree creates a real
+            #   ./env -- it is a symlink by construction -- so whatever is there
+            #   arrived another way (an rsync of a dev box, a hand-built venv), and
+            #   the ONE fact that decides what to do is what it contains.
             echo "FAIL: $link exists and is NOT a symlink."
-            echo "      Move it aside by hand — refusing to delete data."; return 1
+            echo "      Refusing to delete it. What it is:"
+            echo "        type    : $(stat -c '%F' "$link" 2>/dev/null || echo unknown)"
+            echo "        real path: $(readlink -f "$link")"
+            echo "        entries : $(ls -A "$link" 2>/dev/null | wc -l)  |  files (recursive): $(find -L "$link" -type f 2>/dev/null | wc -l)"
+            echo "        size    : $(du -sh "$link" 2>/dev/null | cut -f1)"
+            local disposable=""
+            if [ -x "$link/bin/python" ]; then
+                echo "        ⭐ it is a VENV: $("$link/bin/python" -V 2>&1)"
+                echo "           torch: $("$link/bin/python" -c 'import torch;print(torch.__version__)' 2>&1 | tail -1)"
+                echo "           -> $LRS_STAGE_DIR/01_setup_venv.sh builds its OWN venv on scratch"
+                echo "              and points $link at it. NOTHING reads a pre-existing $link,"
+                echo "              so this one holds nothing the pipeline wants."
+                disposable=yes
+            fi
+            # ⚠⚠ A materialised venv inside the repo is not merely untidy when the
+            #   repo lives on /project: /project has a FILE-COUNT quota (fir was at
+            #   486K of 500K, narval at 267K), a venv is tens of thousands of files,
+            #   and going over breaks writes for EVERY job in the allocation, not
+            #   just this one. ⛔ `mv`-ing it aside keeps paying that cost in full,
+            #   so on /project the safe-sounding advice is the wrong advice.
+            local on_project=""
+            case "$(readlink -f "$link")" in
+                */project/*|/lustre*/project/*) on_project=yes ;;
+            esac
+            if [ -n "$on_project" ]; then
+                echo "        ⛔⛔ it is on /project, which has a FILE-COUNT quota."
+                echo "           Check headroom:  diskusage_report"
+                echo "           This is exactly why env/data/temp live on scratch."
+            fi
+            echo
+            if [ -n "$disposable" ] && [ -n "$on_project" ]; then
+                echo "      Fix — DELETE it. It is a venv (nothing here reads it) sitting on a"
+                echo "      file-quota'd filesystem, where moving it aside keeps paying the cost:"
+                echo "          rm -rf $link"
+            elif [ -n "$disposable" ]; then
+                echo "      Fix — it is a venv nothing here reads, so either is fine:"
+                echo "          rm -rf $link          # or, to keep it:"
+                echo "          mv $link $link.bak.$(date -u +%Y%m%dT%H%M%SZ)"
+            else
+                echo "      Fix — this is NOT a venv, so it is not ours to judge. Move, do not delete:"
+                echo "          mv $link $link.bak.$(date -u +%Y%m%dT%H%M%SZ)"
+            fi
+            echo "      then re-run this stage."
+            return 1
         else
             ln -s "$target" "$link" || return 1
         fi

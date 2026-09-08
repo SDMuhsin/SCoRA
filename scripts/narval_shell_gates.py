@@ -534,6 +534,94 @@ def t_probe_blocks_on_a_missing_hf_token():
 
 
 
+# ---------------------------------------------------------------------------
+def t_narval_scripts_are_executable():
+    """⛔ 2026-09-08: sbatch/narval/*.sh shipped WITHOUT the executable bit that
+    sbatch/fir/*.sh carries, so `sbatch/narval/01_setup_venv.sh` was Permission
+    denied and the user had to chmod and commit the fix. The README says
+    `bash <script>`, which hides it -- which is exactly why it needs a gate rather
+    than a habit."""
+    print("\n--- ⭐ every narval script is executable, as fir's are ---")
+    for f in sorted(x for x in os.listdir(NV) if x.endswith(".sh")):
+        check(f"{f} has the executable bit",
+              os.access(os.path.join(NV, f), os.X_OK))
+    # ⛔ This control caught the fix for the bug over-reaching: the `chmod` that
+    #   repaired the scripts hit README.md too. Harmless, but a mode set by a
+    #   blanket chmod is indistinguishable from one set on purpose.
+    check("⛔ CONTROL: README.md is NOT executable (so the check discriminates)",
+          not os.access(os.path.join(NV, "README.md"), os.X_OK))
+    # ⛔ And this one refuted the premise it was written to assert. It was phrased
+    #   as "fir was already right, narval merely lags" -- fir's 04_hp_sweep.sh had
+    #   NEVER carried the bit. Everyone runs these as `bash <script>`, so the tree
+    #   drifted for months without anyone noticing. It is a RULE for both trees,
+    #   not parity with a reference that was itself inconsistent.
+    print("  --- and the same rule for sbatch/fir (where it was NOT already true) ---")
+    for f in sorted(x for x in os.listdir(FIR) if x.endswith(".sh")):
+        check(f"fir/{f} has the executable bit", os.access(os.path.join(FIR, f), os.X_OK))
+
+
+
+# ---------------------------------------------------------------------------
+def t_a_signal_killed_check_names_the_module():
+    """⛔ narval 2026-09-08: the requirements.txt post-install check imports SEVEN
+    modules in one process and was killed by SIGILL. A signal is not an exception --
+    no traceback, nothing to catch -- so the transcript proved only that one of
+    seven native wheels does not run on that CPU. FIR_SETUP Law 12. The bisect must
+    name it, and must NOT fire on an ordinary ImportError."""
+    print("\n--- ⭐ a check killed by a SIGNAL names the module that did it ---")
+    src = open(os.path.join(FIR, "01_setup_venv.sh")).read()
+    fns = re.search(r"^diagnose_import_sigill\(\).*?^\}", src, re.S | re.M).group(0)
+    fns += "\n" + re.search(r"^stage\(\) \{.*?^\}", src, re.S | re.M).group(0)
+
+    def run(dying_module, kind="ILL"):
+        """A stand-in interpreter that dies BY SIGNAL on one module only."""
+        with tempfile.TemporaryDirectory() as t:
+            py = os.path.join(t, "python")
+            open(py, "w").write(
+                '#!/bin/bash\n'
+                f'if [[ "$*" == *"{dying_module}"* && "$*" != *"pip show"* ]]; then '
+                + (f'kill -{kind} $$; sleep 1; fi\n' if kind else 'exit 1; fi\n') +
+                'if [[ "$1" == "-m" && "$2" == "pip" && "$3" == "show" ]]; then echo "Version: 9.9"; exit 0; fi\n'
+                'exit 0\n')
+            os.chmod(py, 0o755)
+            body = (f"source {t}/fns.sh\nVPY='{py}'\nFIR_ACCOUNT_CPU=def-fake_cpu\n"
+                    "assert_in_venv() { :; }; assert_torch_pin() { :; }\n"
+                    "stage 'reqs' 'import adapters, sklearn, scipy, pandas, filelock; print(1)'"
+                    " 'adapters' -- -q -r requirements.txt\n")
+            open(os.path.join(t, "fns.sh"), "w").write(fns)
+            return sh(body)
+
+    r = run("scipy")
+    check("⭐ the module killed by SIGILL is named",
+          "scipy" in r.stdout and "THIS ONE" in r.stdout, r.stdout + r.stderr)
+    check("...and the SURVIVING modules are shown as ok, so the bisect is legible",
+          "✅ adapters" in r.stdout and "✅ pandas" in r.stdout, r.stdout)
+    check("...and exit 132 is decoded as SIGILL rather than left as a number",
+          "132" in r.stdout and "SIGILL" in r.stdout, r.stdout)
+    check("...and it reports THIS host's CPU and wheel tier (the wheel/CPU mismatch)",
+          "This host:" in r.stdout and "Wheel tier" in r.stdout, r.stdout)
+    check("⭐ ...and warns that a LOGIN node may differ from a COMPUTE node before "
+          "anyone reinstalls on this evidence",
+          "COMPUTE node" in r.stdout and "salloc" in r.stdout, r.stdout)
+    check("...and the stage still FAILS (a diagnosis is not a pass)",
+          r.returncode != 0 and "FAIL: post-install verification" in r.stdout, r.stdout)
+
+    # A different signal must be decoded too, not just the one we happened to hit.
+    r2 = run("pandas", kind="SEGV")
+    check("⛔ CONTROL: a SIGSEGV is attributed the same way, and to the right module",
+          "pandas" in r2.stdout and "THIS ONE" in r2.stdout
+          and "✅ scipy" in r2.stdout, r2.stdout)
+
+    # ⛔ THE CONTROL THAT MATTERS: an ordinary ImportError already prints its own
+    #   traceback; re-bisecting it would be noise, and would wrongly imply a CPU fault.
+    r3 = run("scipy", kind="")
+    check("⛔ CONTROL: an ordinary non-signal failure does NOT trigger the bisect",
+          "THE CHECK DIED WITHOUT A PYTHON TRACEBACK" not in r3.stdout, r3.stdout)
+    check("...but it still fails the stage",
+          r3.returncode != 0, r3.stdout)
+
+
+
 def main():
     print("=" * 78)
     print("NARVAL SHELL GATES — every control exercised in BOTH directions")
@@ -550,7 +638,9 @@ def main():
               t_the_planner_still_selftests_under_the_narval_env,
               t_probe_sizes_mem_from_the_gpu_nodes,
               t_probe_checks_our_pins_not_just_the_newest,
-              t_probe_blocks_on_a_missing_hf_token]:
+              t_probe_blocks_on_a_missing_hf_token,
+              t_narval_scripts_are_executable,
+              t_a_signal_killed_check_names_the_module]:
         t()
     print("\n" + "=" * 78)
     print(f"narval_shell_gates: {len(_ok)} passed, {len(_bad)} FAILED")

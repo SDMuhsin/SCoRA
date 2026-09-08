@@ -252,11 +252,74 @@ PY
         echo "FAIL: packages for '$label' are not installed in the venv"; exit 1; }
 }
 
+# ⛔⛔ WHEN THE CHECK DIES BY *SIGNAL*, IT CANNOT NAME THE MODULE THAT KILLED IT.
+#   narval, 2026-09-08: the requirements.txt check imports SEVEN modules in ONE
+#   process and the process was killed by SIGILL --
+#       01_setup_venv.sh: line 255: 812333 Illegal instruction (core dumped)
+#   -- so the transcript proved only that one of seven native packages used a CPU
+#   instruction this host lacks. FIR_SETUP Law 12: a log that cannot identify its
+#   own failure is not evidence. A signal is not an exception; no traceback exists
+#   and no `except` can catch it, so the ONLY way to attribute it is to import each
+#   module in its OWN process and see which process dies.
+#
+# ⚠ Why this is a real hazard here and not a curiosity: Alliance wheels are built
+#   per micro-arch tier (x86-64-v3 / v4) while PyPI wheels are generic, and narval's
+#   login CPU is an EPYC 7532 (Zen 2 -- AVX2, NO AVX-512). A wheel compiled for a
+#   newer tier installs perfectly and SIGILLs on first use. It is also why the
+#   diagnosis must report WHERE the module came from, not just its name.
+diagnose_import_sigill() {   # diagnose_import_sigill <label> <import-check>
+    local label="$1" check="$2" m rc
+    # Recover the module names from the check string: "import a, b, c; print(...)".
+    local mods
+    mods=$(printf '%s' "$check" | sed -n 's/^ *import \([^;]*\);.*/\1/p' | tr -d ' ' | tr ',' ' ')
+    [ -z "$mods" ] && return 0
+    echo
+    echo "  ⛔ THE CHECK DIED WITHOUT A PYTHON TRACEBACK (exit $3)."
+    echo "     Exit >128 means a SIGNAL killed it: 132=SIGILL (illegal instruction,"
+    echo "     i.e. a wheel built for a CPU newer than this one), 133=SIGTRAP,"
+    echo "     134=SIGABRT, 139=SIGSEGV. Importing each module alone to attribute it:"
+    for m in $mods; do
+        "$VPY" -c "import $m" >/dev/null 2>&1; rc=$?
+        if [ "$rc" -eq 0 ]; then
+            printf '       ✅ %-14s ok\n' "$m"
+        elif [ "$rc" -gt 128 ]; then
+            printf '       ⛔ %-14s KILLED BY SIGNAL (exit %s)  <-- THIS ONE\n' "$m" "$rc"
+            echo "          file    : $("$VPY" -c "import $m,os;print(getattr($m,'__file__','?'))" 2>/dev/null || echo '<died before printing>')"
+            echo "          version : $("$VPY" -m pip show "$m" 2>/dev/null | sed -n 's/^Version: //p' | head -1)"
+            echo "          ⇒ this wheel does not run on this CPU. Reinstall it from the"
+            echo "            Alliance wheelhouse for THIS host's tier, or force a build:"
+            echo "              $VPY -m pip install --force-reinstall --no-binary $m $m"
+        else
+            printf '       ⚠ %-14s import failed (exit %s, a normal exception):\n' "$m" "$rc"
+            "$VPY" -c "import $m" 2>&1 | tail -3 | sed 's/^/          /'
+        fi
+    done
+    echo
+    echo "     This host: $(uname -m)  $(sed -n 's/^model name[ \t]*: //p' /proc/cpuinfo | head -1)"
+    echo "     Wheel tier in use: ${RSNT_ARCH:-<unset>}   (PIP_CONFIG_FILE=${PIP_CONFIG_FILE:-<unset>})"
+    echo "     ⚠ A LOGIN node and a COMPUTE node can be different CPUs. If the module"
+    echo "       imports on a compute node, the wheel is fine and only this check's"
+    echo "       host is too old -- confirm before reinstalling anything:"
+    echo "         salloc --account=$FIR_ACCOUNT_CPU --time=0:10:00 --mem=4G bash -c '$VPY -c \"import <mod>\"'"
+}
+
 stage() {   # stage <label> <import-check> <modules-that-must-be-in-the-venv> -- <pip args...>
     local label="$1" check="$2" mods="$3"; shift 4
     echo; echo "--- $label ---"
     "$VPY" -m pip install "$@" || { echo "FAIL: pip install for $label"; exit 1; }
-    "$VPY" -c "$check" || { echo "FAIL: post-install verification for $label"; exit 1; }
+    # ⚠ TWO WAYS TO GET THIS WRONG, BOTH SILENT:
+    #   `if ! cmd; then rc=$?` captures the status of the NEGATION (always 0), and
+    #   `local rc=$?` resets $? to `local`'s own status before the assignment reads
+    #   it. The whole point here is to branch on the exit code, so capture it on its
+    #   own line, in a variable declared beforehand.
+    local rc=0
+    "$VPY" -c "$check"; rc=$?
+    if [ "$rc" -ne 0 ]; then
+        # ⛔ Only a SIGNAL needs the bisect; an ordinary ImportError already printed
+        #   its own traceback and naming it again would be noise.
+        [ "$rc" -gt 128 ] && diagnose_import_sigill "$label" "$check" "$rc"
+        echo "FAIL: post-install verification for $label"; exit 1
+    fi
     assert_in_venv "$label" "$mods"
     assert_torch_pin "$label"
 }
