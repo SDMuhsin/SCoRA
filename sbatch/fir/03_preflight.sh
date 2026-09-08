@@ -146,7 +146,7 @@ echo "    ⛔ These decide whether the fir comparator IS the dev-box comparator.
 #       MISMATCH — it ran and the numbers differ   => the pin decision's real bill
 #       ERROR    — it could not run at all         => says NOTHING about numerics
 #       OK       — it ran and matched
-b_mismatch=""; b_error=""
+b_mismatch=""; b_error=""; b_cpu=""
 for v in verify_merged_fourierft verify_qwha_adapter verify_loca_adapter verify_fourierft_fast; do
     echo "--- $v ---"
     # ⚠ --device EXPLICITLY. verify_fourierft_fast defaulted to `cuda:1`, a dev-box
@@ -159,6 +159,23 @@ for v in verify_merged_fourierft verify_qwha_adapter verify_loca_adapter verify_
     echo "$vout" | tail -25
     if [ $vrc -eq 0 ]; then
         echo "  $v: OK"
+        continue
+    fi
+    # ⛔⛔ A FOURTH OUTCOME, AND IT WOULD HAVE PRODUCED A FALSE HEADLINE.
+    #   [narval 2026-09-08] verify_loca_adapter puts the AUTHORS' vendored peft on
+    #   sys.path, whose ia3/model.py does `import bitsandbytes` -- which dies with
+    #   SIGILL on narval's EPYC (no avx512f). A signal produces NO Python message
+    #   at all, so it matches NONE of the patterns below and would have fallen
+    #   through to the `else` branch and been reported as
+    #       "⛔ MISMATCH — it ran and the numbers differ."
+    #   i.e. exactly the false claim this whole block was written to prevent, one
+    #   class over: it never ran, and it compared nothing. An exit above 128 is a
+    #   signal, and a signal is never a numerical finding.
+    if [ $vrc -gt 128 ]; then
+        echo "  ⚠ $v: CANNOT RUN ON THIS CPU — killed by signal (exit $vrc$([ $vrc -eq 132 ] && echo ' = SIGILL'))."
+        echo "     A dependency is built for instructions this host does not have."
+        echo "     This says NOTHING about numerics, and it is NOT a mismatch."
+        b_cpu="$b_cpu $v"
         continue
     fi
     # An interpreter-level fault means the harness never got to compare anything.
@@ -177,6 +194,21 @@ if [ -n "$b_error" ]; then
     echo "   question is UNANSWERED for them until they execute. Fix the harness, then"
     echo "   re-run -- do not read this as either a pass or a fail."
     rc=1
+fi
+if [ -n "$b_cpu" ]; then
+    echo
+    echo "⚠⚠ VERIFIER(S) CANNOT RUN ON THIS CLUSTER'S CPU:$b_cpu"
+    echo "   ⛔ Stated plainly so it is not mistaken for a pass: on this cluster the"
+    echo "     bit-identity question for these is UNANSWERED. Not verified, not"
+    echo "     refuted -- unasked, because the harness cannot execute here."
+    echo "   ⭐ Why this does not block: the only remaining experiment is stage 06,"
+    echo "     the full fine-tuning baseline, which trains NO ADAPTER. Nothing it"
+    echo "     produces is gated by these verifiers. The results that ARE gated by"
+    echo "     them (stages 04/05) are complete and were verified on fir, where the"
+    echo "     verifiers ran."
+    echo "   ⇒ If a future stage on THIS cluster trains one of these adapters, this"
+    echo "     limitation becomes blocking and must be resolved first."
+    echo "   Diagnose / restore: bash $LRS_STAGE_DIR/00e_diagnose_imports.sh"
 fi
 if [ -n "$b_mismatch" ]; then
     echo

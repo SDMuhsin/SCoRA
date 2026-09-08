@@ -170,17 +170,69 @@ done
 #   This is the check that would have caught the LoCA syntax error directly.
 echo
 echo "--- do the authors' modules IMPORT? (the receipt, not the flag) ---"
+# ⛔⛔ THREE OUTCOMES, NOT TWO. [narval 2026-09-08]
+#   "the authors' code is broken" and "the authors' code cannot RUN ON THIS CPU"
+#   are opposite findings, and the first version of this loop reported the second
+#   as the first. On narval, importing LoCA's vendored peft dies with SIGILL:
+#     peft/auto.py -> mapping.py -> mixed_model.py -> tuners/__init__.py
+#       -> ia3/__init__.py -> ia3/model.py -> `import bitsandbytes`
+#   and bitsandbytes 0.50.1+computecanada uses an instruction narval's EPYC lacks
+#   (no avx512f). The clone is fine; the CPU cannot run one of its dependencies.
+#   ⚠ Note the mechanism, because it recurs: peft guards that import with
+#     is_bnb_available(), which asks whether bitsandbytes is INSTALLED (find_spec)
+#     -- and an installed-but-unrunnable wheel answers YES. A location test cannot
+#     answer an execution question.
+#   ⇒ A signal death is recorded as an ENVIRONMENT LIMITATION with its exact
+#     consequence spelled out, and does NOT fail the stage. An ordinary import
+#     error still does, because that IS the clone being broken.
+CPU_UNRUNNABLE=""
 for spec in "LoCA|peft/src|peft.tuners.loca.layer" "qwha|peft/src|peft.tuners.qwha.hadamard"; do
     IFS='|' read -r name sub mod <<< "$spec"
-    if ( cd "$(pwd)" && PYTHONPATH="$(pwd)/temp/$name/$sub:${PYTHONPATH:-}" \
-         "$FIR_VENV/bin/python" -c "import importlib,sys; importlib.import_module('$mod'); print('    $mod: OK')" 2>&1 | tail -5 ); then
-        :
+    iout="$(PYTHONPATH="$(pwd)/temp/$name/$sub:${PYTHONPATH:-}" \
+            "$FIR_VENV/bin/python" -c "import importlib,sys; importlib.import_module('$mod'); print('    $mod: OK')" 2>&1)"
+    irc=$?
+    echo "$iout" | tail -5
+    if [ $irc -eq 0 ]; then
+        continue
+    elif [ $irc -gt 128 ]; then
+        echo "    ⚠ $mod: KILLED BY SIGNAL (exit $irc$([ $irc -eq 132 ] && echo ' = SIGILL'))"
+        echo "      The clone is NOT broken. One of its dependencies does not run on"
+        echo "      this CPU. Diagnose: bash $LRS_STAGE_DIR/00e_diagnose_imports.sh"
+        CPU_UNRUNNABLE="$CPU_UNRUNNABLE $name"
     else
-        echo "    ⛔ $mod FAILED to import even after patching"
+        echo "    ⛔ $mod FAILED to import even after patching (exit $irc)"
         rc=1
     fi
 done
 [ $rc -eq 0 ] || { echo; echo "############ STAGING FAILED (authors' code does not import) ############"; exit 1; }
+if [ -n "$CPU_UNRUNNABLE" ]; then
+    echo
+    echo "⚠⚠ UNVERIFIABLE ON THIS CLUSTER:$CPU_UNRUNNABLE"
+    echo "   ⛔ What this costs, stated plainly: the bit-identity verifier(s) for"
+    echo "     these authors' code CANNOT RUN here, so on this cluster their"
+    echo "     comparator is UNCHECKED. That is an open question, not a pass."
+    echo "   ⭐ What it does NOT cost: the only remaining experiment is stage 06,"
+    echo "     the full fine-tuning baseline, which trains NO ADAPTER -- so no"
+    echo "     number it produces depends on these verifiers. Stages 04/05, which"
+    echo "     do use adapters, are COMPLETE and were verified on fir."
+    echo "   ⇒ Proceeding. 03_preflight records the same limitation and will NOT"
+    echo "     report it as a bit-identity mismatch."
+    echo
+    echo "   To restore it, the dependency must be replaced with a build this CPU"
+    echo "   can run (the Alliance wheel is the one at fault):"
+    # ⚠ PIP_CONFIG_FILE=/dev/null IS THE LOAD-BEARING PART, not the index-url.
+    #   The Alliance pip config adds the CVMFS wheelhouse via find-links, and the
+    #   local wheel is 0.50.1+computecanada -- a HIGHER version string than any
+    #   PyPI release -- so pip would resolve straight back to the broken wheel and
+    #   report success. Neutralising the config removes find-links entirely.
+    echo "       PIP_CONFIG_FILE=/dev/null $FIR_VENV/bin/python -m pip install \\"
+    echo "           --force-reinstall --no-deps --index-url https://pypi.org/simple bitsandbytes"
+    echo "       $FIR_VENV/bin/python -c 'import bitsandbytes'   # must not die"
+    echo "     ⛔ Verify with that second line. A pip install that reports success"
+    echo "       proves the file changed, never that the code runs (Law 2)."
+    echo "     ⚠ Nothing in stage 06 uses bitsandbytes, so this is OPTIONAL and"
+    echo "       changes an installed version -- do it deliberately, not by habit."
+fi
 
 echo
 echo "--- gate at stage 01c (temp/ now ENFORCED; the stage-02 cache check is not) ---"
