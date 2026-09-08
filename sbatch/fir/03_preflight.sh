@@ -34,7 +34,12 @@
 set -uo pipefail
 FIR_SELF="$(readlink -f "$0")"
 cd "$(dirname "$FIR_SELF")/../.." || exit 1
-source sbatch/fir/fir_env.sh
+# ⭐ THE ENV FILE IS SELECTABLE, AND THAT IS THE WHOLE PORT MECHANISM.
+#   sbatch/narval/<same name>.sh sets LRS_ENV to sbatch/narval/narval_env.sh and
+#   re-execs THIS file, so narval runs the SAME implementation under DIFFERENT
+#   measured cluster values. Two copies of a protocol are two protocols; there is
+#   one copy of this stage and there will only ever be one.
+source "${LRS_ENV:-sbatch/fir/fir_env.sh}"
 fir_log_to fir_preflight "$@"
 
 P_TARGETS="${P_TARGETS:-q_o}"
@@ -84,7 +89,13 @@ cd "\$SLURM_SUBMIT_DIR" || exit 1
 #    a Python traceback and a clean run are indistinguishable through a pipe.
 set -uo pipefail
 export P_TARGETS="$P_TARGETS" P_PORT_MODE="$P_PORT_MODE" P_TASK="$P_TASK" P_STEPS="$P_STEPS"
-bash sbatch/fir/03_preflight.sh --local --targets "$P_TARGETS" --port-mode "$P_PORT_MODE" --task "$P_TASK"
+# ⛔ PIN THE CLUSTER EXPLICITLY, DO NOT LEAN ON sbatch --export=ALL. These two
+#   variables decide WHICH CLUSTER'S ACCOUNT, GRES AND MODULE LINE the body uses;
+#   06_baseline.sh already refuses to leave that implicit and the same rule applies
+#   here. An inherited-by-default value that silently fails to arrive would run the
+#   body under fir's env on a narval node.
+export LRS_ENV="$LRS_ENV" LRS_STAGE_DIR="$LRS_STAGE_DIR"
+bash $LRS_STAGE_DIR/03_preflight.sh --local --targets "$P_TARGETS" --port-mode "$P_PORT_MODE" --task "$P_TASK"
 SB
 )
     echo "submitted preflight job $jid"
@@ -190,7 +201,7 @@ echo; echo "=== D. ALL NINE ARMS TRAIN, WITH RECEIPTS ==="
 echo
 if [ $rc -eq 0 ]; then
     echo "############ PREFLIGHT OK ############"
-    echo "next: bash sbatch/fir/04_pilot_cell.sh --targets $P_TARGETS --port-mode $P_PORT_MODE"
+    echo "next: bash $LRS_STAGE_DIR/03b_probe_gpu_memory.sh   # does stage 06 fit on this GPU?"
 else
     echo "############ PREFLIGHT FAILED ############"
     echo "Read the FAIL lines above. Nothing larger should be submitted."

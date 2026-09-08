@@ -51,6 +51,40 @@
 #   cascade falls back to stdlib `python -m venv` if virtualenv fails at all.
 export PYTHONNOUSERSITE=1
 
+# --- ⛔⛔ WHICH CLUSTER IS THIS, AND WHICH STAGE DIRECTORY OWNS IT? -----------
+# [narval port, 2026-09-08] This file is now the SHARED implementation behind two
+# clusters. sbatch/narval/narval_env.sh sets every value below from MEASURED facts
+# and then sources this file for the FUNCTIONS. Two things follow, and both are
+# load-bearing:
+#
+#  1. ⛔ A GUARD, BECAUSE THE FAILURE IS SILENT. Every cluster value in THIS file
+#     is fir's. Sourcing it on narval would submit with `--gpus=h100:1` against a
+#     cluster that has no h100 -- and FIR_SETUP A1 is explicit that A WRONG GRES
+#     STRING QUEUES FOREVER INSTEAD OF ERRORING, which is indistinguishable from a
+#     busy scheduler. So refuse, loudly, the moment the site says otherwise.
+#     ⚠ Only when $CC_CLUSTER is actually set: it is unset on the dev box, and the
+#       local gates must keep working there.
+#  2. LRS_STAGE_DIR names the directory whose scripts the USER should be told to
+#     run. Hardcoding "sbatch/fir/" into a message shown on narval sends the reader
+#     to the wrong tree -- a papercut that costs a round trip, which is the exact
+#     currency this whole file is written in.
+LRS_CLUSTER="${LRS_CLUSTER:-fir}"
+LRS_STAGE_DIR="${LRS_STAGE_DIR:-sbatch/fir}"
+# ⚠ DEFAULTED HERE TOO, and it is not decorative: 03_preflight bakes this into
+#   its sbatch body through an UNQUOTED heredoc, so an unset value is an
+#   `unbound variable` under `set -u` in the SUBMITTING shell -- i.e. fir's own
+#   preflight would break the moment narval needed the variable to exist.
+LRS_ENV="${LRS_ENV:-sbatch/fir/fir_env.sh}"
+if [ -n "${CC_CLUSTER:-}" ] && [ "${CC_CLUSTER}" != "$LRS_CLUSTER" ]; then
+    echo "⛔⛔ WRONG CLUSTER ENV FILE."
+    echo "   \$CC_CLUSTER says this host is '${CC_CLUSTER}', but you sourced the"
+    echo "   '$LRS_CLUSTER' env file ($LRS_STAGE_DIR)."
+    echo "   Every account, gres string and module line in it is '$LRS_CLUSTER's."
+    echo "   ⛔ A wrong gres string QUEUES FOREVER; it does not error (FIR_SETUP A1)."
+    echo "   ⇒ run the stage under sbatch/${CC_CLUSTER}/ instead."
+    return 1 2>/dev/null || exit 1
+fi
+
 # --- MODULES -----------------------------------------------------------------
 # ⚠ ORDER IS LOAD-BEARING. `module avail cudnn` returns "No module(s) found" on
 #   its own: cudnn is CUDA-dependent in the Lmod hierarchy and only becomes
@@ -92,7 +126,12 @@ FIR_ACCOUNT_CPU="${FIR_ACCOUNT_CPU:-def-seokbum_cpu}"
 #    class of collision this file exists to prevent, and it fails silently.
 #    Override with FIR_SCRATCH_ROOT if you deliberately want them shared.
 FIR_REPO_NAME="${FIR_REPO_NAME:-$(basename "$(readlink -f "$(pwd)")")}"
-FIR_SCRATCH_ROOT="${FIR_SCRATCH_ROOT:-${SCRATCH:-/scratch/$USER}/$FIR_REPO_NAME}"
+# ⚠ $USER is NOT set in every shell this file must survive, and `set -u` makes
+#   that FATAL rather than empty -- which meant this file could not be sourced
+#   under `set -u` on a dev box at all, i.e. the one place it is cheap to test.
+#   ⛔ Law 11: a layer that can only be exercised on the cluster is the defect.
+FIR_USER="${USER:-$(id -un 2>/dev/null || echo unknown)}"
+FIR_SCRATCH_ROOT="${FIR_SCRATCH_ROOT:-${SCRATCH:-/scratch/$FIR_USER}/$FIR_REPO_NAME}"
 FIR_VENV_REAL="${FIR_VENV_REAL:-$FIR_SCRATCH_ROOT/env}"
 FIR_DATA_REAL="${FIR_DATA_REAL:-$FIR_SCRATCH_ROOT/data}"
 FIR_TEMP_REAL="${FIR_TEMP_REAL:-$FIR_SCRATCH_ROOT/temp}"
@@ -178,6 +217,10 @@ fir_load_modules_gpu() { module load $FIR_MODULES_GPU; }
 fir_log_to() {
     [ -n "${FIR_LOGGING:-}" ] && return 0
     local tag="$1"; shift
+    # ⚠ NAME THE LOG AFTER THE CLUSTER THAT PRODUCED IT. Both clusters' transcripts
+    #   land in the same ./logs, and a narval run writing `fir_preflight_*.log` is a
+    #   log that misidentifies its own origin -- the filename half of Law 12.
+    [ "$LRS_CLUSTER" = "fir" ] || tag="${LRS_CLUSTER}_${tag#fir_}"
     [ -n "${FIR_SELF:-}" ] || { echo "fir_log_to: FIR_SELF unset — NOT logging"; return 0; }
     mkdir -p ./logs
     local f="./logs/${tag}_$(date -u +%Y%m%dT%H%M%SZ).log"
@@ -427,8 +470,8 @@ if _outside:
     print("      The pinned stack is NOT what will run. Either ~/.local is shadowing")
     print("      the venv (fir_env.sh exports PYTHONNOUSERSITE=1 -- check it survived),")
     print("      or the venv is EMPTY because pip reported 'already satisfied' against")
-    print("      ~/.local. Rebuild: bash sbatch/fir/01_setup_venv.sh --fresh")
-    print("      Diagnose: bash sbatch/fir/00d_probe_runtime.sh")
+    print("      ~/.local. Rebuild: bash $LRS_STAGE_DIR/01_setup_venv.sh --fresh")
+    print("      Diagnose: bash $LRS_STAGE_DIR/00d_probe_runtime.sh")
     sys.exit(1)
 print(f"  pinned packages     : all 7 resolve inside {_venv}")
 for k, (w, g) in drift.items():
@@ -457,7 +500,7 @@ PY
             echo "  ⛔ RELOCATED VENV: bin/activate says VIRTUAL_ENV=$_stamp"
             echo "     but the venv really lives at $_venv_real"
             echo "     activate will put a NONEXISTENT dir on PATH and bare 'python'"
-            echo "     will NOT be this venv. Rebuild: bash sbatch/fir/01_setup_venv.sh --fresh"
+            echo "     will NOT be this venv. Rebuild: bash $LRS_STAGE_DIR/01_setup_venv.sh --fresh"
             rc=1
         else
             echo "  venv is not relocated (activate stamp matches)"
@@ -527,7 +570,7 @@ PY
         if [ -n "$miss" ]; then
             echo "  ⚠ temp/ author clones MISSING ->$miss"
             echo "    temp/ is gitignored (.gitignore), so a git pull does NOT carry it."
-            echo "    -> bash sbatch/fir/01c_stage_repos.sh"
+            echo "    -> bash $LRS_STAGE_DIR/01c_stage_repos.sh"
             rc=1
         else
             echo "  temp/ author clones: OK"
@@ -550,7 +593,7 @@ try:
           f"(hidden={c.hidden_size} layers={c.num_hidden_layers} kv={getattr(c,'num_key_value_heads','?')})")
 except Exception as e:
     print(f"  FAIL offline model cache: {type(e).__name__}: {str(e)[:200]}")
-    print("    -> run 02_download_cache.sh on a LOGIN node first")
+    print("    -> run $LRS_STAGE_DIR/02_download_cache.sh on a LOGIN node first")
     sys.exit(1)
 PY
     ) || rc=1

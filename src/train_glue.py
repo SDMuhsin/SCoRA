@@ -379,6 +379,28 @@ def parse_args():
 
     # Training Hyperparameters
     parser.add_argument("--optimizer", type=str, default="adamw", help="Optimizer to use (e.g., 'adamw', 'galore_adamw', 'adamw-lora').")
+    # [narval port, 2026-09-08] WHICH torch AdamW/Adam KERNEL runs. It changes MEMORY,
+    # not mathematics: `foreach` (torch's default when it applies) fuses the update
+    # across ALL parameter tensors at once and therefore allocates FULL-SIZE
+    # TEMPORARIES -- `torch._foreach_sqrt(exp_avg_sqs)` alone is another copy of the
+    # entire second-moment buffer.
+    # ⛔ [MEASURED 2026-09-08, A40 44.4 GiB, google/gemma-2b full fine-tune] that
+    #   temporary is what makes stage 06 OOM: params 9.34 + grads 9.34 + Adam 18.67 =
+    #   37.35 GiB of state, and the foreach path then asks for ~9 GiB more. All four
+    #   of {bs 16, bs 32} x {gradient checkpointing on, off} died at 44.4 GiB, in
+    #   `_multi_tensor_adamw`, on the THIRD optimizer step -- batch size and
+    #   checkpointing are irrelevant because the activations are not the problem.
+    # ⚠ `auto` is the default and passes NOTHING to the optimizer, so every number
+    #   already banked in this repo is reproduced bit-identically. Only an explicit
+    #   value changes the kernel.
+    parser.add_argument("--adam_impl", type=str, default="auto",
+                        choices=["auto", "foreach", "fused", "single"],
+                        help="Adam/AdamW kernel: 'auto' = torch's own choice (DEFAULT, "
+                             "bit-identical to every existing result); 'fused' = one "
+                             "in-place CUDA kernel, no full-size temporaries; 'single' = "
+                             "one parameter at a time (foreach=False); 'foreach' = force "
+                             "the multi-tensor path. Affects PEAK MEMORY, not the update "
+                             "rule. Applies to --optimizer adam/adamw only.")
     parser.add_argument("--per_device_train_batch_size", type=int, default=8, help="Per-device batch size for training.")
     parser.add_argument("--per_device_eval_batch_size", type=int, default=8, help="Per-device batch size for evaluation.")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
@@ -2158,6 +2180,24 @@ def run_single_seed(base_args: argparse.Namespace, seed: int):
     }
     optimizer_class = optimizer_classes[args.optimizer_base]
     optimizer_kwargs = {'lr': args.learning_rate, 'weight_decay': args.weight_decay}
+
+    # [narval port] the Adam kernel selector. ⛔ 'auto' passes nothing, so the default
+    #   path is byte-for-byte the one every banked result was measured under.
+    #   ⚠ Only torch.optim.Adam/AdamW accept these kwargs; bnb, GaLore, GALE, Lion and
+    #   Adafactor do not, and passing them would be a TypeError at construction.
+    if args.adam_impl != "auto":
+        if args.optimizer_base not in ("adam", "adamw"):
+            raise SystemExit(
+                f"FAIL CLOSED: --adam_impl {args.adam_impl} is only defined for "
+                f"--optimizer adam/adamw, not {args.optimizer_base!r}.")
+        if args.adam_impl == "fused":
+            optimizer_kwargs["fused"] = True
+        elif args.adam_impl == "single":
+            optimizer_kwargs["foreach"] = False
+        elif args.adam_impl == "foreach":
+            optimizer_kwargs["foreach"] = True
+        _sel = {k: v for k, v in optimizer_kwargs.items() if k in ("fused", "foreach")}
+        logger.info(f"[adam_impl] {args.adam_impl} -> {_sel}")
     
     if args.optimizer_base in ['adafactor', 'galore_adafactor']:
         optimizer_kwargs['beta1'] = None if args.beta1 == 0.0 else args.beta1

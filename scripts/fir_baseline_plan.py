@@ -73,6 +73,58 @@ SELECTION_TASK = "mrpc"
 #   same five is selection on the test set.
 PROXY: tuple = ()
 
+
+def _load_proxy():
+    """⭐ THE PROXY IS READ FROM A FILE THE READER WROTE, NOT FROM A HAND-EDIT.
+
+    It used to be a literal in this module, which put a human edit-commit-push-pull
+    cycle in the MIDDLE of the protocol: run the search on the cluster, copy the
+    CSVs home, edit this line, push, pull, submit the final cells. This repo has
+    already lost a round trip to a fix pushed to a ref nothing pulls, and another to
+    a cluster quietly running older code than its log implied. So the winner is now
+    read where it was measured (`scripts/fir_baseline_read.py --write-proxy`) and
+    lands in `<LRS_STAGE_DIR>/baseline_proxy.json`.
+
+    ⛔ FAIL CLOSED, LOUDLY. The file steers all 30 final cells, so a value that is
+      not an actual cell of the declared ladder is refused rather than used. That is
+      what makes a hand-written or truncated file safe: it cannot quietly become the
+      operating point.
+    ⚠ Absent file => () => the final stage emits ZERO cells, which 06_baseline.sh
+      turns into an explicit refusal. That is the correct early state.
+    """
+    d = os.environ.get("LRS_STAGE_DIR", "sbatch/fir")
+    path = os.path.join(ROOT, d, "baseline_proxy.json")
+    if not os.path.exists(path):
+        return ()
+    import json
+    try:
+        p = json.load(open(path))
+    except Exception as e:
+        raise SystemExit(f"FAIL CLOSED: {path} is not readable JSON: {e}")
+    for k in ("lr", "batch", "selection_task", "search_seed"):
+        if k not in p:
+            raise SystemExit(f"FAIL CLOSED: {path} has no {k!r}. It must be written by "
+                             f"scripts/fir_baseline_read.py --write-proxy, not by hand.")
+    if p["lr"] not in LRS or p["batch"] not in BATCHES:
+        raise SystemExit(
+            f"FAIL CLOSED: {path} names lr={p['lr']!r} batch={p['batch']!r}, which is "
+            f"NOT a cell of this stage's ladder (lr in {LRS}, batch in {BATCHES}). "
+            f"A proxy that was never searched cannot be carried to six columns.")
+    if p["selection_task"] != SELECTION_TASK:
+        raise SystemExit(
+            f"FAIL CLOSED: {path} was selected on {p['selection_task']!r} but this "
+            f"stage's selection task is {SELECTION_TASK!r}. Two in-sample tasks in "
+            f"one row is exactly what SELECTION_TASK exists to prevent.")
+    if p["search_seed"] != SEARCH_SEED:
+        raise SystemExit(
+            f"FAIL CLOSED: {path} was selected at seed {p['search_seed']}, not the "
+            f"search seed {SEARCH_SEED}. Selecting on the reported seeds is selection "
+            f"on the test set.")
+    return (p["lr"], p["batch"])
+
+
+PROXY = _load_proxy()
+
 TASK_NAME = os.environ.get("FIR_BASE_TASK", "all")
 if TASK_NAME not in TASKS + ["all"]:
     raise SystemExit(f"FAIL CLOSED: FIR_BASE_TASK={TASK_NAME!r} is not one of "
@@ -158,6 +210,30 @@ def cell_cmd(c, model=None):
             "--task_name", c["task"],
             "--dtype", "float32",
             "--mixed_precision", "fp16",
+            # ⛔⛔ TWO MEMORY FLAGS, AND THEY ARE PART OF THE PROTOCOL, NOT OF A
+            #   CLUSTER. [MEASURED 2026-09-08, A40 44.4 GiB] a gemma-2b full
+            #   fine-tune holds params + grads + two fp32 AdamW moments = 37.3 GiB
+            #   of state before any activation, and torch's DEFAULT AdamW then asks
+            #   `torch._foreach_sqrt` for a full-size temporary on top. It OOMs on
+            #   every one of {bs 16, bs 32} x {checkpointing on, off}. `fused`
+            #   removes the temporaries (one in-place CUDA kernel) and
+            #   checkpointing removes the activation peak; BOTH are needed:
+            #       foreach + ckpt  OOM     | single + ckpt 42,258 MiB
+            #       fused  + no ckpt 44,090 | ⭐ fused + ckpt 38,311 MiB
+            #   ⭐ THEY ARE SET UNCONDITIONALLY, NOT PER CLUSTER. Stage 06 has never
+            #     produced a cell on any machine, so nothing is invalidated by
+            #     choosing them now -- and a flag that depends on which cluster ran
+            #     the cell would make the six columns of ONE row two protocols.
+            #   ⚠ Neither changes the update rule: `fused` is the same AdamW maths
+            #     in one kernel, and checkpointing recomputes activations exactly.
+            #     [measured, MRPC 1 epoch, seed 42, lr 2e-5] `single` scored
+            #     f1 0.9046 -- the fused arm is compared against it in
+            #     llmdocs/NARVAL_PORT.md rather than assumed equal.
+            #   ⛔ BUT THEY DO CHANGE THE COST COLUMNS. Stage 05's nine PEFT arms ran
+            #     WITHOUT checkpointing, so this row's s/step and peak-memory are NOT
+            #     comparable to theirs. Say so wherever the row is printed.
+            "--adam_impl", "fused",
+            "--gradient_checkpointing",
             "--per_device_train_batch_size", str(c["batch"]),
             "--num_train_epochs", str(c["epochs"]),
             "--num_warmup_steps", str(warmup(c["task"], c["batch"], c["epochs"])),
@@ -237,6 +313,10 @@ def selftest():
         ck("--mixed_precision fp16" in s, f"{t}: real AMP, not a cast")
         ck("--dtype float32" in s, f"{t}: fp32 master weights")
         ck("--classifier_lr" not in s, f"{t}: NO separate head lr (full FT is one group)")
+        # ⛔ the two memory flags are protocol. A silent removal would not fail any
+        #   other check here -- it would simply OOM on a 40 GiB GPU, hours later.
+        ck("--adam_impl fused" in s, f"{t}: fused AdamW (no full-size foreach temporaries)")
+        ck("--gradient_checkpointing" in s, f"{t}: gradient checkpointing")
         ck("adapter" not in s and "target_modules" not in s, f"{t}: no adapter flag")
         ck("query" not in s and "value" not in s, f"{t}: no RoBERTa module name survives")
         ck(s.count("--learning_rate") == 1, f"{t}: exactly ONE --learning_rate")
@@ -277,10 +357,15 @@ def selftest():
         if t != SELECTION_TASK:
             ck(cells(task=t, stage="search") == [],
                f"⛔ CONTROL: asking to sweep {t} yields ZERO cells")
-    ck(not PROXY and len([c for t in TASKS for c in cells(task=t, stage="final")]) == 0,
+    # ⛔ CONTROL: test the MECHANISM, not the ambient state. This check used to read
+    #   the live PROXY, so the day the reader legitimately wrote one on the cluster
+    #   the control would have started FAILING for the one reason that is not a
+    #   defect. Force the empty case, exactly as the populated case below is forced.
+    _saved = PROXY
+    PROXY = ()
+    ck(len([c for t in TASKS for c in cells(task=t, stage="final")]) == 0,
        "⛔ CONTROL: with an EMPTY proxy the final stage emits ZERO cells -- it cannot "
        "be submitted before the search is read")
-    _saved = PROXY
     PROXY = (2e-5, 32)
     fin = [c for t in TASKS for c in cells(task=t, stage="final")]
     ck(len(fin) == len(TASKS) * len(SEEDS),
