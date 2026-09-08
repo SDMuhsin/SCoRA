@@ -103,8 +103,38 @@ def t_assert_in_venv():
         check("assert_in_venv FIRES on a module outside the venv (~/.local case)",
               "EXIT=1" in r_out.stdout and "OUTSIDE" in r_out.stdout, r_out.stdout)
         r_miss = sh(f'bash "{hp}" no_such_module_xyz', env=e)
-        check("assert_in_venv FIRES on a module that does not import at all",
+        # ⚠ RENAMED to what it actually exercises. It passes a module that does not
+        #   EXIST; it never tested one that exists and fails to import, so it could
+        #   not have noticed the contract change below.
+        check("assert_in_venv FIRES on a module that is NOT INSTALLED at all",
               "EXIT=1" in r_miss.stdout, r_miss.stdout)
+
+        # ⭐ THE CONTRACT CHANGE, MADE EXPLICIT [narval 2026-09-08].
+        #   assert_in_venv used to IMPORT each module to find out where it lives.
+        #   galore_torch imports bitsandbytes, bitsandbytes SIGILLs on narval, and a
+        #   SIGNAL cannot be caught -- so the location check was killed by the answer
+        #   to a question it was not asking, and stage 01 failed on a cluster where
+        #   every arm we run is fine. It now uses importlib.util.find_spec, which
+        #   resolves origin WITHOUT executing the module.
+        #   ⇒ "installed, in the venv, but raises on import" is DELIBERATELY no
+        #     longer this function's business. Asserting that here pins the new
+        #     contract so nobody 'restores' the import and reintroduces the defect.
+        open(os.path.join(libd, "fir_raises_probe.py"), "w").write(
+            "raise RuntimeError('this module is installed but explodes on import')\n")
+        r_raise = sh(f'bash "{hp}" fir_raises_probe', env=e)
+        check("⭐ a module that is IN the venv but raises on import now PASSES the "
+              "LOCATION check (it is no longer imported at all)",
+              "EXIT=0" in r_raise.stdout, r_raise.stdout)
+        check("⛔ CONTROL: ...and the harness proves it really would have raised",
+              sh(f'{sys.executable} -c "import fir_raises_probe"', env=e).returncode != 0)
+        # ⛔ And the question it gave up is still asked SOMEWHERE: the stage's own
+        #   import check imports exactly what the job imports.
+        setup = open(SETUP_SH).read()
+        check("⛔ CONTROL: ...because the stage's import check still imports the "
+              "packages the runner actually imports",
+              'stage "requirements.txt (under constraints)"' in setup
+              and "import adapters, lion_pytorch, sklearn, scipy, pandas, filelock" in setup,
+              setup[setup.find('stage "requirements.txt'):][:300])
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
