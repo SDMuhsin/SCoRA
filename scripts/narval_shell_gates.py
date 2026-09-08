@@ -242,6 +242,49 @@ def t_stage06_dry_run_end_to_end():
               "REFUSING TO SUBMIT" not in (r3.stdout + r3.stderr), (r3.stdout + r3.stderr)[-800:])
 
 
+def t_wall_clock_warning():
+    """⛔ `--time` is a HARD KILL and a killed cell records nothing but a `started`
+    marker. The SHARED default is 02:00:00 while an sst2 cell is [predicted] ~3.1 h,
+    so the default silently kills the two most expensive canaries -- the one job
+    whose entire purpose is to produce a measured wall-clock."""
+    print("\n--- ⚠ the wall-clock warning fires on the expensive tasks only ---")
+    import tempfile
+    with tempfile.TemporaryDirectory() as t:
+        m = os.path.join(t, "measured.sh"); open(m, "w").write(good_measured(NARVAL_SCRATCH=t))
+        g = os.path.join(t, "gpu.sh")
+        open(g, "w").write('NARVAL_GPU_NAME="A100"\nNARVAL_GPU_MIB=40960\n'
+                           'NARVAL_GPU_MIB_SOURCE=measured\nNARVAL_STAGE06_PEAK_MIB=38325\n')
+        base = {"NARVAL_MEASURED": m, "NARVAL_MEASURED_GPU": g}
+
+        def run(task, extra=""):
+            return sh(f"bash sbatch/narval/06_baseline.sh --dry-run {extra}",
+                      env={**base, "FIR_BASE_TASK": task})
+
+        r = run("mrpc")
+        check("mrpc at the 2h default -> quiet (the wall is ample)",
+              "at least 2x the prediction" in r.stdout, r.stdout[-900:])
+        r = run("sst2")
+        check("⛔ CONTROL: sst2 at the 2h DEFAULT -> WARNS (this is the real trap)",
+              "THE WALL IS UNDER 2x" in r.stdout, r.stdout[-900:])
+        r = run("qnli")
+        check("⛔ CONTROL: qnli at the 2h default -> WARNS", "THE WALL IS UNDER 2x" in r.stdout)
+        r = run("sst2", "--time 08:00:00")
+        check("sst2 with an 8h wall -> quiet", "at least 2x the prediction" in r.stdout,
+              r.stdout[-900:])
+        # ⚠ sst2 has NO search cells (only the selection task is swept), so its dry
+        #   run correctly stops at the EMPTY-PLAN refusal. That is exactly what
+        #   proves the warning did not block: execution reached the PLAN stage,
+        #   which is downstream of it. (An earlier version of this check asserted
+        #   "DRY RUN:" appears and failed for that reason -- the check was wrong,
+        #   not the warning.)
+        o = run("sst2").stdout
+        check("...and it is a WARNING, never a block (execution reached the plan stage)",
+              "REFUSING TO SUBMIT STAGE 06 ON THIS GPU" not in o
+              and "is EMPTY" in o, o[-700:])
+        check("⭐ mrpc DOES reach the submit plan (the warning gates nothing)",
+              "DRY RUN:" in run("mrpc").stdout, run("mrpc").stdout[-500:])
+
+
 def t_run_one_is_reachable_without_a_gpu_measurement():
     """⛔ THE ARRAY-TASK PATH. `--run-one` is what each of the N array tasks executes,
     already inside an allocation. It must NOT re-run the memory gate: the decision
@@ -364,7 +407,8 @@ def main():
     print("=" * 78)
     for t in [t_syntax, t_refuses_without_measured, t_refuses_on_each_missing_key,
               t_audit_catches_a_leaked_fir_default, t_env_binds_measured_values,
-              t_stage06_memory_gate, t_stage06_dry_run_end_to_end, t_run_one_is_reachable_without_a_gpu_measurement,
+              t_stage06_memory_gate, t_stage06_dry_run_end_to_end, t_wall_clock_warning,
+              t_run_one_is_reachable_without_a_gpu_measurement,
               t_wrappers_delegate_and_do_not_fork,
               t_no_stage_04_or_05_on_narval, t_fir_env_refuses_on_the_wrong_cluster,
               t_probe_refuses_to_write_from_the_wrong_cluster,

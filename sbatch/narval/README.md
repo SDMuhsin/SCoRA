@@ -204,7 +204,7 @@ the table has **one** in-sample column rather than two.
 ```bash
 # --- half 1: the 12-cell search -------------------------------------------
 FIR_BASE_TASK=mrpc bash sbatch/narval/06_baseline.sh --dry-run       # plan only
-FIR_BASE_TASK=mrpc bash sbatch/narval/06_baseline.sh --canary 1      # ⭐ ALWAYS FIRST
+FIR_BASE_TASK=mrpc bash sbatch/narval/06_baseline.sh --canary 1 --time 04:00:00   # ⭐ FIRST
 FIR_BASE_TASK=mrpc bash sbatch/narval/06_baseline.sh --status        # MEASURED s/cell
 FIR_BASE_TASK=mrpc bash sbatch/narval/06_baseline.sh --time HH:MM:SS --concurrent 6
 
@@ -215,10 +215,17 @@ FIR_BASE_TASK=mrpc LRS_STAGE_DIR=sbatch/narval env/bin/python scripts/fir_baseli
     --run-root "$FIR_RUN_ROOT/baseline" --write-proxy
 
 # --- half 2: the 30 final cells, ONE ARRAY PER TASK -----------------------
+# ⛔ PASS --time EXPLICITLY. The shared default is 02:00:00 and [predicted] an sst2
+#   cell is ~3.1 h and a qnli cell ~2.9 h, so the DEFAULT SILENTLY KILLS those two
+#   canaries -- and a cell killed at the wall records nothing but a `started` marker,
+#   i.e. the one job whose purpose is to measure a wall-clock produces no measurement.
+#   narval's limit is 7 days, so over-asking costs queue priority and nothing else.
+#   ⭐ The wrapper WARNS when the wall is under 2x the prediction; heed it.
 for t in rte mrpc stsb cola sst2 qnli; do
-  FIR_BASE_TASK=$t FIR_BASE_STAGE=final bash sbatch/narval/06_baseline.sh --canary 1
+  FIR_BASE_TASK=$t FIR_BASE_STAGE=final bash sbatch/narval/06_baseline.sh \
+      --canary 1 --time 08:00:00
 done
-# ...then size --time per task from each canary and submit the rest.
+# ...then size --time PER TASK from each canary's MEASURED max and submit the rest.
 ```
 
 ⛔ **`--time` is a hard kill and the per-task wall-clock spans ~11×**, which is why
