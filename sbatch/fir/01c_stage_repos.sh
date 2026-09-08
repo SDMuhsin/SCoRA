@@ -207,19 +207,26 @@ done
 [ $rc -eq 0 ] || { echo; echo "############ STAGING FAILED (authors' code does not import) ############"; exit 1; }
 if [ -n "$CPU_UNRUNNABLE" ]; then
     echo
-    echo "⚠⚠ UNVERIFIABLE ON THIS CLUSTER:$CPU_UNRUNNABLE"
-    echo "   ⛔ What this costs, stated plainly: the bit-identity verifier(s) for"
-    echo "     these authors' code CANNOT RUN here, so on this cluster their"
-    echo "     comparator is UNCHECKED. That is an open question, not a pass."
-    echo "   ⭐ What it does NOT cost: the only remaining experiment is stage 06,"
-    echo "     the full fine-tuning baseline, which trains NO ADAPTER -- so no"
-    echo "     number it produces depends on these verifiers. Stages 04/05, which"
-    echo "     do use adapters, are COMPLETE and were verified on fir."
-    echo "   ⇒ Proceeding. 03_preflight records the same limitation and will NOT"
-    echo "     report it as a bit-identity mismatch."
+    echo "⚠⚠ NOT IMPORTABLE ON *THIS NODE*:$CPU_UNRUNNABLE"
+    echo "   ⛔⛔ DO NOT CONCLUDE ANYTHING ABOUT THE VERIFIERS FROM THIS LINE."
+    echo "     This is a $([ -n "${SLURM_JOB_ID:-}" ] && echo COMPUTE || echo LOGIN) node, and it is NOT where the"
+    echo "     verifiers run. Whether the bit-identity gates can execute is decided"
+    echo "     on a COMPUTE node, by 03_preflight, which runs them there."
     echo
-    echo "   To restore it, the dependency must be replaced with a build this CPU"
-    echo "   can run (the Alliance wheel is the one at fault):"
+    echo "   ⭐ MEASURED, narval 2026-09-08 -- the first version of this message"
+    echo "     PREDICTED the consequence ('the verifier CANNOT RUN, the comparator"
+    echo "     is UNCHECKED') and the measurement REFUTED it the same evening:"
+    echo "         login node  ng/narval1 (EPYC 7532) : import -> SIGILL"
+    echo "         GPU node    ng10904               : verify_loca_adapter -> OK"
+    echo "     The same import, on the node that matters, works -- most likely"
+    echo "     because bitsandbytes selects its CUDA library where a GPU exists and"
+    echo "     falls back to a CPU build that this login node cannot execute."
+    echo "     ⇒ The LoCA/QWHA bit-identity gates ARE verified on narval. Record the"
+    echo "       outcome, never predict it (FIR_SETUP G5)."
+    echo
+    echo "   Only if 03_preflight ALSO reports it unrunnable is anything actually"
+    echo "   unverified. In that case the dependency needs a build the compute"
+    echo "   node can run:"
     # ⚠ PIP_CONFIG_FILE=/dev/null IS THE LOAD-BEARING PART, not the index-url.
     #   The Alliance pip config adds the CVMFS wheelhouse via find-links, and the
     #   local wheel is 0.50.1+computecanada -- a HIGHER version string than any

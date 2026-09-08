@@ -290,10 +290,23 @@ def t_transitive_sigill_is_not_a_finding():
     check("...while an ordinary import error still DOES (rc=1 preserved)",
           re.search(r"FAILED to import even after patching.*\n\s*rc=1", src01c) is not None,
           src01c[src01c.find("FAILED to import even after"):][:200])
-    check("⭐ ...and it states what is consequently UNVERIFIED, not just that it skipped",
-          "UNVERIFIABLE ON THIS CLUSTER" in src01c and "UNCHECKED" in src01c, "")
-    check("...and why it is safe here specifically (stage 06 trains NO ADAPTER)",
-          "trains NO ADAPTER" in src01c, "")
+    # ⛔⛔ THE CORRECTION. The first version of this banner PREDICTED the
+    #   consequence -- "the bit-identity verifier CANNOT RUN here, the comparator
+    #   is UNCHECKED" -- and narval refuted it the same evening: the identical
+    #   import SIGILLs on the login node and verify_loca_adapter passes on the GPU
+    #   node (job 2677077, ng10904). 01c runs where the verifiers do NOT, so it is
+    #   not entitled to a verdict about them. FIR_SETUP G5: record, never predict.
+    check("⭐ 01c scopes the failure to THIS NODE, not the cluster",
+          "NOT IMPORTABLE ON *THIS NODE*" in src01c
+          and "UNVERIFIABLE ON THIS CLUSTER" not in src01c, "")
+    check("⭐ ...and explicitly forbids concluding anything about the verifiers",
+          "DO NOT CONCLUDE ANYTHING ABOUT THE VERIFIERS" in src01c, "")
+    check("...and names the node type it is actually running on",
+          "SLURM_JOB_ID" in src01c and "COMPUTE" in src01c and "LOGIN" in src01c, "")
+    check("⭐ ...and carries the MEASUREMENT that refuted the prediction",
+          "ng10904" in src01c and "verify_loca_adapter -> OK" in src01c, "")
+    check("⛔ CONTROL: the remedy is now conditional on 03 ALSO failing",
+          "Only if 03_preflight ALSO reports it unrunnable" in src01c, "")
 
     # --- 03: the verifier classifier ------------------------------------------
     src03 = (ROOT / "sbatch/fir/03_preflight.sh").read_text()
