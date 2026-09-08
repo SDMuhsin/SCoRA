@@ -82,6 +82,14 @@ so it was checked against a real epoch rather than assumed:
 Same accuracy to the digit; the f1 gap is one prediction, i.e. floating-point
 reduction order. It is the same optimiser, not a degraded one.
 
+⭐ **The 38,311 MiB is task-independent.** Re-measured with `--pad_to_max_length`,
+which forces every batch to the full 128 tokens and is therefore an upper bound over
+all six tasks: **38,325 MiB**, i.e. **14 MiB more**. At bs 32 / seq 128 *with*
+checkpointing the activations are negligible and the peak is essentially all
+optimizer state — so no task can OOM where MRPC fits. `03b` measures the padded
+bound on narval for exactly this reason: a cell that fits on MRPC and OOMs on QNLI
+twenty hours later is the worst outcome available on a ~6% margin.
+
 ⚠ **That is a different GPU and a different torch build** (2.5.1+cu121 vs narval's
 2.10.0+computecanada), and peak memory is allocator- and kernel-sensitive. So it is
 a *prediction* here. **`03b_probe_gpu_memory.sh` replaces it with narval's own
@@ -92,6 +100,34 @@ per-cluster, because a flag that depends on which machine ran a cell would make 
 six columns of one row two protocols. ⛔ They do change the **cost columns**: stage
 05's arms ran *without* checkpointing, so this row's s/step and peak memory are not
 comparable to theirs. Say so wherever the row is printed.
+
+### 1.1 What the Alliance documentation says — **expectations, not values**
+
+Read 2026-09-08, and recorded here so a surprise is recognisable. ⛔ **Nothing in
+this tree uses any of it.** Every one is measured by stage 0 or stage 3b; the docs
+are what tells you whether a *measurement* is surprising, not a substitute for one.
+
+| documented | why it matters here | who confirms it |
+|---|---|---|
+| **A100-40GB is the only GPU.** 159 nodes × 4, 48 cores, 498 GB RAM | §1's whole argument. There is **no 80 GiB option on narval** — the `fused` + checkpointing recipe is not an optimisation, it is the only way stage 06 runs here | `00` (gres name), `03b` (actual VRAM) |
+| MIG instances are `1g.5gb` / `2g.10gb` / `3g.20gb` | all far below 38 GiB. ⭐ `00` filters MIG types out and nothing here submits to one | `00` |
+| `--gpus=a100:1` | matches what `00` derives from `sinfo` | `00` |
+| *"By policy, Narval's compute nodes cannot access the internet"* | stage 02 is mandatory, and a cold cache offline **hangs**, it does not fail fast | `02 --verify-only` |
+| StdEnv/2023 (2016/2018 blocked) | the module cascade in `00` tries `StdEnv/2023 …` explicitly as a candidate | `00` |
+| max walltime **7 days** | our longest predicted cell is ~3 h, so `--time` has room; size it from the canary anyway | — |
+| ≤1000 queued+running jobs | our largest array is 30 | — |
+
+⚠ **The account suffix is the one to watch.** fir splits accounts (`def-…_gpu` /
+`def-…_cpu`); rorqual did not, and the narval docs do not mention a suffix. `00`
+handles **both**: it prefers a `_gpu` account and falls back to the plain one,
+printing which it chose. Override with `NARVAL_FORCE_ACCOUNT=<name>` if more than
+one allocation is listed.
+
+⚠ **The genuinely open risk is the wheelhouse.** narval's CPUs are EPYC 7413 (Zen 3,
+no AVX-512) against fir's EPYC 9135, so the gentoo micro-arch tier differs and a
+wheel present on fir is not automatically present here. Nothing in the docs settles
+it — **`00c` does**, in a couple of read-only minutes. See §5.1 for what to do if a
+pin does not resolve.
 
 ---
 

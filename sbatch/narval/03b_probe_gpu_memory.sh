@@ -145,11 +145,23 @@ PY
 
     echo
     echo "--- 3. THE RECIPE: --adam_impl fused --gradient_checkpointing ---"
+    # ⛔ MEASURED WITH `--pad_to_max_length`, WHICH THE REAL CELLS DO NOT USE, AND
+    #   THAT IS THE POINT: it forces every batch to the full 128 tokens, so the peak
+    #   is an UPPER BOUND over all six tasks rather than MRPC's typical batch.
+    #   Without it the number would be a measurement of ONE task's sentence lengths,
+    #   and a cell that fits on MRPC and OOMs on QNLI twenty hours later is the worst
+    #   outcome available on a ~6% margin.
+    #   ⭐ [measured, A40] the bound costs almost nothing: dynamic 38,311 MiB vs
+    #     padded 38,325 MiB. At bs 32 / seq 128 WITH checkpointing the activations are
+    #     negligible and the peak is essentially all optimizer state -- i.e. the
+    #     figure is task-independent. Measuring the bound is still what makes that a
+    #     FINDING here rather than an assumption carried from another machine.
     GLUE_SEEDS=42 GLUE_RESULTS_FILE="/tmp/.narval_fit_$$.csv" \
     "$PY" -u src/train_glue.py --model_name_or_path "$FIR_MODEL" --task_name mrpc \
         --dtype float32 --mixed_precision fp16 --per_device_train_batch_size 32 \
         --num_train_epochs 1 --max_train_steps 12 --num_warmup_steps 1 \
         --max_length 128 --optimizer adamw --adam_impl fused --gradient_checkpointing \
+        --pad_to_max_length \
         --learning_rate 3e-5 --weight_decay 0.1 --name "narval-gpumem-recipe" \
         > /tmp/.narval_fit_$$.log 2>&1
     FIT_RC=$?
@@ -190,8 +202,10 @@ PY
         printf 'NARVAL_GPU_MIB=%q\n' "$GPU_MIB"
         echo 'NARVAL_GPU_MIB_SOURCE=measured'
         printf 'NARVAL_STAGE06_PEAK_MIB=%q\n' "${PEAK%%.*}"
-        echo "# the peak above is THIS cluster's own, so the stage-06 gate no longer"
-        echo "# relies on the dev-box A40 number it was seeded with."
+        echo "# The peak above is THIS cluster's own, so the stage-06 gate no longer"
+        echo "# relies on the dev-box A40 number it was seeded with. It was measured"
+        echo "# with --pad_to_max_length, i.e. it is an UPPER BOUND over all six tasks,"
+        echo "# not MRPC's typical batch."
     } > "$OUTFILE"
     echo
     echo "--- wrote $OUTFILE ---"; sed 's/^/  /' "$OUTFILE"
