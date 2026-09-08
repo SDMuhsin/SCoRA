@@ -24,7 +24,12 @@
 set -uo pipefail
 FIR_SELF="$(readlink -f "$0")"
 cd "$(dirname "$FIR_SELF")/../.." || exit 1
-source sbatch/fir/fir_env.sh
+# ⭐ THE ENV FILE IS SELECTABLE, AND THAT IS THE WHOLE PORT MECHANISM.
+#   sbatch/narval/<same name>.sh sets LRS_ENV to sbatch/narval/narval_env.sh and
+#   re-execs THIS file, so narval runs the SAME implementation under DIFFERENT
+#   measured cluster values. Two copies of a protocol are two protocols; there is
+#   one copy of this stage and there will only ever be one.
+source "${LRS_ENV:-sbatch/fir/fir_env.sh}"
 fir_log_to fir_probe_runtime "$@"
 
 echo "############ RUNTIME PROBE — $(date -u +%FT%TZ) ############"

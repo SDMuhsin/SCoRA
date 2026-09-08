@@ -13,3 +13,17 @@ temp/
 *.token
 hf_token*
 *.log
+
+# ⛔ CLUSTER-MEASURED ARTIFACTS — written ON the cluster, by a probe, and they must
+#   NOT travel with the repo. Two reasons, and the second is the expensive one:
+#     1. a value measured on narval is meaningless on any other machine, and a
+#        committed one is indistinguishable from a measured one (the exact
+#        indistinguishability sbatch/narval exists to remove);
+#     2. if they were tracked, the FIRST `git pull` after running the probe would
+#        refuse with "local changes would be overwritten" -- friction in precisely
+#        the workflow this port was built to keep frictionless.
+#   ⚠ They are not lost: 00_probe_narval.sh, 03b_probe_gpu_memory.sh and
+#     fir_baseline_read.py all PRINT their file into the ./logs transcript.
+sbatch/*/measured.sh
+sbatch/*/measured_gpu.sh
+sbatch/*/baseline_proxy.json

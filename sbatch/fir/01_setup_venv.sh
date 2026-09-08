@@ -40,7 +40,12 @@ set -uo pipefail
 # directory, and fir_log_to re-execs this script from the repo root.
 FIR_SELF="$(readlink -f "$0")"
 cd "$(dirname "$FIR_SELF")/../.." || exit 1          # repo root
-source sbatch/fir/fir_env.sh
+# ⭐ THE ENV FILE IS SELECTABLE, AND THAT IS THE WHOLE PORT MECHANISM.
+#   sbatch/narval/<same name>.sh sets LRS_ENV to sbatch/narval/narval_env.sh and
+#   re-execs THIS file, so narval runs the SAME implementation under DIFFERENT
+#   measured cluster values. Two copies of a protocol are two protocols; there is
+#   one copy of this stage and there will only ever be one.
+source "${LRS_ENV:-sbatch/fir/fir_env.sh}"
 fir_log_to fir_setup_venv "$@"
 
 FRESH=false
@@ -355,8 +360,8 @@ echo
 if fir_assert_env cpu 01; then
     echo
     echo "############ SETUP OK ############"
-    echo "next:  bash sbatch/fir/01c_stage_repos.sh     # authors' clones for the bit-identity gates"
-    echo "then:  bash sbatch/fir/02_download_cache.sh   # LOGIN node — compute nodes have no internet"
+    echo "next:  bash $LRS_STAGE_DIR/01c_stage_repos.sh     # authors' clones for the bit-identity gates"
+    echo "then:  bash $LRS_STAGE_DIR/02_download_cache.sh   # LOGIN node — compute nodes have no internet"
 else
     echo
     echo "############ SETUP INCOMPLETE ############"

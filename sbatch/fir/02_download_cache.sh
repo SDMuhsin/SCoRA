@@ -29,7 +29,12 @@
 set -uo pipefail
 FIR_SELF="$(readlink -f "$0")"
 cd "$(dirname "$FIR_SELF")/../.." || exit 1
-source sbatch/fir/fir_env.sh
+# ⭐ THE ENV FILE IS SELECTABLE, AND THAT IS THE WHOLE PORT MECHANISM.
+#   sbatch/narval/<same name>.sh sets LRS_ENV to sbatch/narval/narval_env.sh and
+#   re-execs THIS file, so narval runs the SAME implementation under DIFFERENT
+#   measured cluster values. Two copies of a protocol are two protocols; there is
+#   one copy of this stage and there will only ever be one.
+source "${LRS_ENV:-sbatch/fir/fir_env.sh}"
 fir_log_to fir_download_cache "$@"
 
 # The task set. Default = the [R.310] seven plus rte (the cell every selected
@@ -231,4 +236,4 @@ echo
 #   none -- this one is the only evidence the model actually landed.
 echo "cache size: $(du -shL ./data 2>/dev/null | cut -f1)   files: $(find -L ./data -type f 2>/dev/null | wc -l)"
 echo "############ ALL OFFLINE LOADS OK ############"
-echo "next: sbatch/fir/03_preflight.sh   # 1-GPU job; re-runs the bit-identity gates under peft $FIR_PIN_PEFT"
+echo "next: bash $LRS_STAGE_DIR/03_preflight.sh   # 1-GPU job; re-runs the bit-identity gates under peft $FIR_PIN_PEFT"

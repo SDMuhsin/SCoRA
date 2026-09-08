@@ -47,7 +47,12 @@
 set -uo pipefail
 FIR_SELF="$(readlink -f "$0")"
 cd "$(dirname "$FIR_SELF")/../.." || exit 1
-source sbatch/fir/fir_env.sh
+# ⭐ THE ENV FILE IS SELECTABLE, AND THAT IS THE WHOLE PORT MECHANISM.
+#   sbatch/narval/<same name>.sh sets LRS_ENV to sbatch/narval/narval_env.sh and
+#   re-execs THIS file, so narval runs the SAME implementation under DIFFERENT
+#   measured cluster values. Two copies of a protocol are two protocols; there is
+#   one copy of this stage and there will only ever be one.
+source "${LRS_ENV:-sbatch/fir/fir_env.sh}"
 # ⛔ NO ./logs TRANSCRIPT FOR AN ARRAY TASK. fir_log_to names its file by the
 #   SECOND, and 160 array tasks start in bursts: two tasks in the same second
 #   write the SAME file and interleave. The array's own
@@ -92,7 +97,7 @@ if [ "$GRID_NAME" = "all" ] && [ -z "$LOCAL_ONE" ] && ! $STATUS; then
     echo "⛔ FIR_BASE_TASK=all is a READING VIEW, not a run target."
     echo "   --time is per-array and the per-task cost spans ~6x, so the six tasks"
     echo "   are six submissions. Pick one:"
-    echo "     FIR_BASE_TASK=rte bash sbatch/fir/06_baseline.sh --canary 9"
+    echo "     FIR_BASE_TASK=mrpc bash $LRS_STAGE_DIR/06_baseline.sh --canary 1"
     echo "   (--status over 'all' IS supported and is the way to see the whole table.)"
     exit 1
 fi
@@ -388,7 +393,7 @@ PY
 )
     if [ -z "$ARRAY_SPEC" ]; then
         echo "  nothing to submit: every cell already has a done marker."
-        echo "  read: rsync the root back, then FIR_BASE_TASK=<t> bash sbatch/fir/06_baseline.sh --status"
+        echo "  read: rsync the root back, then FIR_BASE_TASK=<t> bash $LRS_STAGE_DIR/06_baseline.sh --status"
         exit 0
     fi
     ARRAY_SPEC="$ARRAY_SPEC%$P_CONCURRENT"
@@ -427,7 +432,7 @@ export FIR_BASE_TASK="$GRID_NAME"
 export FIR_BASE_STAGE="$STAGE"
 cid=\$(sed -n "\$((SLURM_ARRAY_TASK_ID + 1))p" "$PLAN_FILE")
 [ -n "\$cid" ] || { echo "FAIL: no cell at index \$SLURM_ARRAY_TASK_ID"; exit 1; }
-bash sbatch/fir/06_baseline.sh --run-one "\$cid"
+bash $LRS_STAGE_DIR/06_baseline.sh --run-one "\$cid"
 SB
 
 if $DRY; then
@@ -444,7 +449,7 @@ jid=$(sbatch --parsable < "$BODY_FILE")
 echo "submitted array job $jid"
 echo "script:  $BODY_FILE"
 echo "watch:   squeue -j $jid"
-echo "status:  FIR_BASE_TASK=$GRID_NAME bash sbatch/fir/06_baseline.sh --status"
+echo "status:  FIR_BASE_TASK=$GRID_NAME bash $LRS_STAGE_DIR/06_baseline.sh --status"
 echo
 if [ "$P_CANARY" -gt 0 ]; then
     echo "⛔ NEXT: when the canary finishes, run --status. It prints the MEASURED"
