@@ -401,6 +401,139 @@ def t_the_planner_still_selftests_under_the_narval_env():
               r.returncode == 0, "\n".join((r.stdout + r.stderr).splitlines()[-25:]))
 
 
+# ---------------------------------------------------------------------------
+def t_probe_sizes_mem_from_the_gpu_nodes():
+    """⛔ THE 2026-09-08 REGRESSION. Run 1 of the probe recorded NOTHING for
+    NARVAL_GPU_MEM ("sinfo reported no RealMemory"), and the reason it failed was
+    not the reason it was wrong:
+      (a) it parsed `sinfo -h -o "%m" | sort -n | tail -1`, and Slurm writes a '+'
+          suffix on RealMemory when a partition groups unlike nodes ("498000+"),
+          so the numeric test threw and the key was dropped;
+      (b) the query had no node filter at all, so it swept narval's 4 TB cpularge
+          nodes -- had (a) not fired we would have sized a GPU request from a CPU
+          node and never known.
+    These replay real narval `sinfo` shapes through the block that replaced it."""
+    print("\n--- ⭐ --mem is sized from the FULL-GPU nodes, and survives Slurm's '+' ---")
+
+    src = open(os.path.join(NV, "00_probe_narval.sh")).read()
+    start = src.index('echo "--- RealMemory of the nodes carrying')
+    end = src.index('hr "6.')
+    block = src[start:end]
+    check("the memory block is still locatable in the probe (this test's premise)",
+          "NARVAL_GPU_MEM" in block and "sinfo" in block, block[:400])
+
+    def run(sinfo_lines, need=32000, full="a100"):
+        """Run the extracted block with a STUB sinfo replaying real narval output."""
+        with tempfile.TemporaryDirectory() as t:
+            stub = os.path.join(t, "sinfo")
+            open(stub, "w").write("#!/bin/bash\ncat <<'EOF'\n" + sinfo_lines + "\nEOF\n")
+            os.chmod(stub, 0o755)
+            harness = (
+                'set -uo pipefail\n'
+                f'export PATH="{t}:$PATH"\n'
+                f'FULL={full}\n'
+                f'NARVAL_MEM_NEED_MIB={need}\n'
+                'put() { echo "PUT $1=$2"; }\n'
+                'nomeasure() { echo "NOMEASURE $1: $2"; }\n'
+                + block)
+            return sh(harness)
+
+    # narval's real shape: 141 nodes, gpu:a100:4, 498000 MiB, WITH the '+' suffix
+    real = "\n".join(f"ng{n}|498000+|gpu:a100:4(S:0-1)" for n in
+                      (10101, 10102, 10103, 10104, 10201))
+    r = run(real)
+    check("⭐ narval's real shape (498000+ / gpu:a100:4) yields a request",
+          "PUT NARVAL_GPU_MEM=" in r.stdout, r.stdout + r.stderr)
+    check("...and it is the MEASURED NEED, since one GPU's share (124500M) is larger",
+          "PUT NARVAL_GPU_MEM=32000M" in r.stdout, r.stdout)
+    check("⛔ CONTROL: the '+' suffix is what broke run 1 — it must not reappear",
+          "NOMEASURE" not in r.stdout, r.stdout)
+    check("...and the per-GPU share is shown, not just the answer",
+          "per-GPU share" in r.stdout and "124500" in r.stdout, r.stdout)
+
+    # (b) the real defect: CPU nodes must not be able to influence the answer.
+    with_cpu = ("nl10101|4096000|(null)\n"          # a 4 TB cpularge node
+                "nc10101|249000|(null)\n" + real)
+    r2 = run(with_cpu)
+    check("⭐ CONTROL: a 4 TB cpularge node in the dump changes NOTHING (the (b) defect)",
+          r2.stdout.strip() == r.stdout.strip(), r2.stdout)
+
+    # MIG nodes carry a different gres and must be excluded from the divisor.
+    mig = "ng20401|498000|gpu:a100_3g.20gb:3(S:0-1),gpu:a100_1g.5gb:7(S:0-1)\n" + real
+    r3 = run(mig)
+    check("⭐ CONTROL: MIG nodes are excluded (they match 'a100_' but not 'a100:')",
+          r3.stdout.strip() == r.stdout.strip(), r3.stdout)
+
+    # Heterogeneous RealMemory: the request must fit on the SMALLEST node, not the luckiest.
+    het = real + "\nng31401|249000|gpu:a100:4(S:0-1)"
+    r4 = run(het, need=90000)
+    check("⭐ a heterogeneous pool is sized from the SMALLEST node (249000/4=62250)",
+          "PUT NARVAL_GPU_MEM=62250M" in r4.stdout, r4.stdout)
+    check("...and when the share BINDS, it says so loudly rather than silently shrinking",
+          "BELOW the measured need" in r4.stdout, r4.stdout)
+    r4b = run(het, need=32000)
+    check("⛔ CONTROL: the same pool with a need that FITS warns about nothing",
+          "PUT NARVAL_GPU_MEM=32000M" in r4b.stdout
+          and "BELOW the measured need" not in r4b.stdout, r4b.stdout)
+
+    # Fail closed when no full-GPU node exists at all.
+    r5 = run("ng20401|498000|gpu:a100_3g.20gb:3(S:0-1)")
+    check("⛔ no full-GPU node anywhere -> NOMEASURE, never a guess",
+          "NOMEASURE NARVAL_GPU_MEM" in r5.stdout and "PUT" not in r5.stdout, r5.stdout)
+    check("...and the refusal points at the section that holds the evidence",
+          "section 3" in r5.stdout, r5.stdout)
+
+    # A gres type that exists nowhere (the FIR_SETUP A1 shape) must not silently pass.
+    r6 = run(real, full="h100")
+    check("⛔ CONTROL: a gres type absent from this cluster -> NOMEASURE",
+          "NOMEASURE NARVAL_GPU_MEM" in r6.stdout, r6.stdout)
+
+
+# ---------------------------------------------------------------------------
+def t_probe_checks_our_pins_not_just_the_newest():
+    """Run 1's section 8 printed only each package's NEWEST wheel (torch 2.14.0),
+    which reads as 'our pins are gone' while saying nothing about them. The added
+    loop must ask about the ACTUAL pins, read from fir_env.sh rather than typed."""
+    print("\n--- ⭐ the wheelhouse section asks about OUR pins, read from fir_env.sh ---")
+    src = open(os.path.join(NV, "00_probe_narval.sh")).read()
+    check("section 8 uses --all-versions (the default listing is only the newest)",
+          "--all-versions" in src, src[:200])
+    # The pin extractor must actually extract, not silently yield "".
+    # Lift the definition VERBATIM (Law 1: test what the probe runs, not a retype).
+    pin_def = re.search(r"^\s*(pin_of\(\) \{.*?\})\s*$", src, re.S | re.M).group(1)
+    r = sh(pin_def + '\n'
+           'for v in FIR_PIN_TORCH FIR_PIN_TRANSFORMERS FIR_PIN_DATASETS FIR_PIN_PEFT '
+           'FIR_PIN_ACCELERATE FIR_PIN_EVALUATE FIR_PIN_NOPE; do echo "$v=[$(pin_of $v)]"; done')
+    for var, want in [("FIR_PIN_TORCH", "2.10.0"), ("FIR_PIN_TRANSFORMERS", "4.51.3"),
+                      ("FIR_PIN_DATASETS", "4.5.0"), ("FIR_PIN_PEFT", "0.18.1"),
+                      ("FIR_PIN_ACCELERATE", "1.12.0"), ("FIR_PIN_EVALUATE", "0.4.6")]:
+        check(f"...and reads {var} out of fir_env.sh as {want}",
+              f"{var}=[{want}]" in r.stdout, r.stdout + r.stderr)
+    check("⛔ CONTROL: a name that is NOT a pin yields empty, not the previous value",
+          "FIR_PIN_NOPE=[]" in r.stdout, r.stdout)
+
+
+# ---------------------------------------------------------------------------
+def t_probe_blocks_on_a_missing_hf_token():
+    """.hf_token is gitignored, so it is absent on EVERY new cluster by design --
+    it was absent on narval run 1. It blocks stage 02, which is an hour of venv
+    build later, so the probe must stop on it exactly as it stops on a missing key."""
+    print("\n--- ⭐ an absent HF token stops the probe, not stage 02 an hour later ---")
+    src = open(os.path.join(NV, "00_probe_narval.sh")).read()
+    check("the token verdict is recorded, not just printed",
+          "TOKEN_BLOCK=" in src, "")
+    check("...and section 11 refuses on it",
+          re.search(r'if \[ -n "\$MISSING" \] \|\| \[ -n "\$TOKEN_BLOCK" \]', src) is not None,
+          "")
+    check("...and a non-200 from the gated repo counts as blocked, not just an absent file",
+          'GEMMA_HTTP" = "200"' in src, "")
+    check("...and the refusal tells the user where to put the token",
+          ".hf_token" in src and "chmod 600" in src, "")
+    check("⛔ CONTROL: the token is NOT smuggled into measured.sh (it is a credential)",
+          "put NARVAL_HF" not in src and "put NARVAL_TOKEN" not in src, "")
+
+
+
 def main():
     print("=" * 78)
     print("NARVAL SHELL GATES — every control exercised in BOTH directions")
@@ -414,7 +547,10 @@ def main():
               t_probe_refuses_to_write_from_the_wrong_cluster,
               t_both_env_files_source_under_set_u,
               t_logs_are_named_after_the_cluster,
-              t_the_planner_still_selftests_under_the_narval_env]:
+              t_the_planner_still_selftests_under_the_narval_env,
+              t_probe_sizes_mem_from_the_gpu_nodes,
+              t_probe_checks_our_pins_not_just_the_newest,
+              t_probe_blocks_on_a_missing_hf_token]:
         t()
     print("\n" + "=" * 78)
     print(f"narval_shell_gates: {len(_ok)} passed, {len(_bad)} FAILED")

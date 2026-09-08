@@ -14,6 +14,83 @@ ledger; read it before you run anything, and do not re-run a finished stage.
 
 ---
 
+## 0.0 ⭐ WHERE WE ARE — probe run 1 landed 2026-09-08
+
+`00_probe_narval.sh` ran on `narval1` at commit `56be0fd`; transcript in
+`logs/narval/logs/narval_probe_20260908T143200Z.log`. It measured **10 of 11
+keys** and stopped, which is the design working. What it settled:
+
+| | measured on narval | note |
+|---|---|---|
+| gres | **`a100:1`** | 141 nodes × `gpu:a100:4`. MIG types (`a100_1g.5gb` … `a100_4g.20gb`) exist and are correctly **not** recorded |
+| accounts | `def-seokbum_gpu` / `def-seokbum_cpu` | narval **does** split by resource, as fir does |
+| modules | `gcc arrow scipy-stack [cuda cudnn]` | loads; gives python **3.11.5** — same ABI as fir, so the same wheels apply |
+| wheelhouse tier | `x86-64-v3` | CPU is EPYC **7532** (Zen 2), not the 7413 the docs implied. Immaterial: v3 is the tier |
+| scratch | `/scratch/sdmuhsin` — 5.7 GB / 20 TB, 25K / 1000K inodes | ⭐ **inodes are not the constraint here.** On fir /project was at 486K of 500K; narval's scratch has 975K free |
+| Lustre `flock` | **real `flock`**, on `/home`, `/scratch` and `/project` | the shared-CSV writer's locking is safe |
+| internet (login) | pypi / HF / github all **200** | compute nodes have no route, as documented — hence stage 02 |
+
+**Two things block stage 01, and only one of them was narval's.**
+
+1. ⛔ **`NARVAL_GPU_MEM` — my defect, now fixed.** See §0.1. Re-run the probe.
+2. ⛔ **No HF token on narval.** `.hf_token` is a credential and is *gitignored*,
+   so `git clone` correctly did not bring it, and it will be missing on every new
+   cluster by design. It does not block stage 01 — it blocks **stage 02, an hour
+   of venv build later**, which is why the probe now refuses on it up front:
+   ```bash
+   printf '%s' 'hf_xxxxxxxx' > ~/path/to/SCoRA/.hf_token && chmod 600 ~/path/to/SCoRA/.hf_token
+   ```
+   The account owning that token must already have accepted the `google/gemma-2b`
+   licence. Then re-run `00_probe_narval.sh`; it is read-only and safe to repeat.
+
+**Not a blocker, despite how it reads:** section 8 listed torch **2.14.0**,
+transformers **5.14.1**, datasets **5.0.0** — none of them our pins. That listing
+shows only each package's *newest* wheel; fir's looked identically alarming and
+served every pin. Section 8 now asks about the actual pins (`--all-versions`), and
+**`00c_probe_deps.sh` is still the only thing that concludes**, because a wheel can
+exist and its dependency solve can still fail.
+
+### 0.1 ⛔ The `--mem` defect, and what replaced it
+
+Run 1 recorded *nothing* for `NARVAL_GPU_MEM`, saying "sinfo reported no
+RealMemory". **The reason it failed was not the reason it was wrong.**
+
+- **(a) why it failed:** it parsed `sinfo -h -o "%m" | sort -n | tail -1`. Slurm
+  appends `+` to RealMemory when a partition groups unlike nodes — narval reports
+  `498000+` — so the numeric test threw and the key was dropped. Replaying narval's
+  real output through the old line reproduces the exact message.
+- **(b) why it was wrong, and this is the serious half:** the query had **no node
+  filter**, so it swept every partition including narval's **4 TB `cpularge`**
+  nodes. Had (a) not fired, we would have sized a GPU job's memory from a CPU
+  node's RAM and never known. **The parse bug is the only reason the design bug
+  was caught.**
+
+What replaced it measures the RealMemory of the nodes carrying the *full* `a100`
+gres, takes the **minimum** over them (so the request fits on every node, not the
+luckiest), divides by the GPUs on such a node to get the per-GPU share, and
+requests `min(what we need, that share)` — warning loudly if the share is the
+binding term. On narval that is 498000 / 4 = **124,500 MiB** available per GPU.
+
+**And "what we need" is now measured too.** fir requested `64000M`; stage 06 never
+ran on fir, so that number was never validated against `gemma-2b` full FT — it was
+carried, not measured. Under `/usr/bin/time -v`, running the exact command
+`fir_baseline_plan.py` emits:
+
+| task | train examples | peak host RSS | peak GPU |
+|---|---|---|---|
+| mrpc | 3.7k | 15,282,556 KiB = **14,924 MiB** | 38,325 MiB |
+| sst2 | 67k | 15,284,736 KiB = **14,927 MiB** | 38,325 MiB |
+
+⭐ **18× the data costs 3 MiB**, because `datasets` memory-maps Arrow instead of
+loading it. So host RAM is **task-independent** for the same reason the GPU bound
+is, and qnli (105k, 1.6× sst2) needs no separate measurement. We request
+**32000M** — 2.1× the measured peak, and 26% of what one GPU may take anyway. The
+asymmetry earns the headroom: an over-request costs a little queue priority, while
+an under-request is a **SLURM OOM-kill, which ends the log mid-step with no
+traceback** and looks exactly like a node fault.
+
+---
+
 ## 0. ⛔⛔ THE LEDGER — what is already done, and must NOT be re-run
 
 | stage | what it is | state | on narval? |
