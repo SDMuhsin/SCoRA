@@ -46,6 +46,13 @@ if ! $_skip_gate; then
         echo "⛔ REFUSING TO SUBMIT STAGE 06 ON THIS GPU."
         echo "   Nothing was queued. --status still works."
         exit 1; }
+
+    # ⚠ `--time` is a hard kill and the shared default (02:00:00) is under the
+    #   predicted cost of an sst2 or qnli cell. The logic lives in narval_env.sh so
+    #   this file stays a WRAPPER -- the local gate asserts it is under 60 lines,
+    #   and it FIRED when this warning was written inline here. Growing a wrapper is
+    #   how a wrapper becomes a fork.
+    narval_warn_wall_clock "$@"
     echo
 fi
 exec bash "sbatch/fir/06_baseline.sh" "$@"

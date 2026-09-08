@@ -291,3 +291,54 @@ narval_assert_stage06_fits() {
     echo "  ⛔ Nothing in this tree will pick one. Report the measurement."
     return 1
 }
+
+# ---------------------------------------------------------------------------
+
+narval_warn_wall_clock() {
+    # ⚠⚠ THE WALL-CLOCK WARNING. `--time` is a HARD KILL, and a cell killed at the
+    #   wall records NOTHING but a `started/` marker -- for a CANARY, whose entire
+    #   purpose is to produce a measured wall-clock, that is a wasted cycle that
+    #   looks like nothing happened.
+    #   ⛔ The shared default is 02:00:00, and [predicted] an sst2 cell is ~3.1 h and
+    #     a qnli cell ~2.9 h. So the DEFAULT SILENTLY KILLS the two most expensive
+    #     canaries. This warns before the submission rather than after the queue.
+    #   ⚠ IT IS A WARNING, NOT A BLOCK, AND THE NUMBER IS A PREDICTION. It is scaled
+    #     from ONE measured A40 cell across a GPU change, and this repo has been
+    #     wrong doing exactly that (a WaveFT cell predicted at 1.7x a FourierFT one;
+    #     [measured] 1.03x). ⭐ The canary's own MAX is what sizes the real array.
+    #     narval's 7-day limit means over-asking costs queue priority, not a refusal.
+    _want_s=$(env/bin/python - <<'PYW' 2>/dev/null || echo ""
+import os, sys
+sys.path.insert(0, "scripts")
+import fir_plan as FP, fir_baseline_plan as H
+t = os.environ.get("FIR_BASE_TASK", "")
+if t not in H.TASKS:
+    raise SystemExit
+SEC_PER_EX_EPOCH = 121.26 / FP.sizes()["mrpc"]["train"]   # [measured] A40, fused+ckpt
+print(int(SEC_PER_EX_EPOCH * FP.sizes()[t]["train"] * H.EPOCHS[t]))
+PYW
+)
+    if [ -n "${_want_s:-}" ]; then
+        _hhmmss="${P_TIME:-02:00:00}"
+        for _a in "$@"; do
+            case "${_prev:-}" in --time) _hhmmss="$_a" ;; esac
+            _prev="$_a"
+        done
+        _wall_s=$(echo "$_hhmmss" | awk -F: '{n=NF; s=0; for(i=1;i<=n;i++) s=s*60+$i; print s}')
+        echo "--- wall-clock sanity for task '${FIR_BASE_TASK:-?}' ---"
+        printf "  requested --time %s = %s s ; [PREDICTED, A40] this cell ~%s s\n" \
+               "$_hhmmss" "$_wall_s" "$_want_s"
+        if [ "$_wall_s" -lt $((_want_s * 2)) ] 2>/dev/null; then
+            echo "  ⚠⚠ THE WALL IS UNDER 2x THE PREDICTED COST."
+            echo "     --time is a HARD KILL and a killed cell records nothing but a"
+            echo "     'started' marker -- for a canary that is a wasted cycle that"
+            echo "     looks like nothing ran. Pass a bigger --time (narval allows up"
+            echo "     to 7 days), then size the real array from --status's MEASURED max."
+            echo "     ⚠ The prediction is scaled from ONE A40 cell; it is not a"
+            echo "       measurement of this cluster. Erring high costs queue priority only."
+        else
+            echo "  ✅ at least 2x the prediction"
+        fi
+    fi
+
+}
