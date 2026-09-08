@@ -41,6 +41,29 @@ exec > >(tee "$LOG") 2>&1
 #   FATAL rather than empty. It fired in the local gates, on the very first run.
 NARVAL_USER="${USER:-$(id -un 2>/dev/null || echo unknown)}"
 
+# ⭐ HOST RAM the stage-06 recipe actually needs, in MiB, INCLUDING headroom.
+#   Not a guess and not fir's 64000M: measured on the dev box with the exact
+#   command scripts/fir_baseline_plan.py emits (gemma-2b, fp32 master weights,
+#   fp16 autocast, --adam_impl fused --gradient_checkpointing --pad_to_max_length)
+#   under `/usr/bin/time -v`. See README §0.1 for the number and its receipt.
+#   Section 5 requests min(this, one GPU's share of the node) and warns loudly if
+#   the share is the binding one.
+#
+#   RECEIPT (dev box, A40, torch 2.5.1+cu121, /usr/bin/time -v, 12 optimizer steps):
+#       mrpc (3.7k train examples)  peak RSS 15,282,556 KiB = 14,924 MiB
+#       sst2 (67k  train examples)  peak RSS 15,284,736 KiB = 14,927 MiB
+#   ⭐ 18x the data costs 3 MiB, because `datasets` memory-maps Arrow rather than
+#     loading it -- so like the GPU bound, this is TASK-INDEPENDENT and qnli
+#     (105k, 1.6x sst2) needs no separate measurement to be covered.
+#   We ask for 32000M: 2.1x the measured peak. The asymmetry justifies the
+#   generosity -- an over-request costs a little scheduling priority, while an
+#   under-request is a SLURM OOM-kill that leaves a log ending mid-step with no
+#   traceback -- and on narval one GPU's share is ~124 GB, so 32000M is 26% of
+#   what a single-GPU job may take anyway. It is NOT free money: 64000M (fir's
+#   number, never validated against gemma-2b because stage 06 never ran there)
+#   would have been 4.3x a requirement nobody had measured.
+NARVAL_MEM_NEED_MIB="${NARVAL_MEM_NEED_MIB:-32000}"
+
 hr() { echo; echo "=================== $* ==================="; }
 FOUND=""; MISSING=""
 put() {   # put KEY VALUE   -- record a MEASURED fact
@@ -244,16 +267,69 @@ elif [ -d "/scratch/$NARVAL_USER" ]; then
 else
     nomeasure NARVAL_SCRATCH "\$SCRATCH is unset and /scratch/$NARVAL_USER does not exist"
 fi
-# ⚠ --mem is a per-job cap; too low is an OOM-kill, too high hurts scheduling. Take
-#   a fraction of what a real node has rather than carrying fir's 64000M.
-NODE_MEM=$(sinfo -h -o "%m" 2>/dev/null | sort -n | tail -1)
-if [ -n "$NODE_MEM" ] && [ "$NODE_MEM" -gt 0 ] 2>/dev/null; then
-    echo "  largest RealMemory on any node: ${NODE_MEM} MiB"
-    # fir used 64000M against 80 GiB GPUs; keep the same shape but never exceed the node.
-    WANT=64000; [ "$NODE_MEM" -lt 70000 ] && WANT=$((NODE_MEM / 4 * 3))
-    put NARVAL_GPU_MEM "${WANT}M"
+# ⚠⚠ --mem caps HOST ram. Two ways to get it wrong, and neither looks like itself:
+#   too low and SLURM OOM-kills the job -- the log stops mid-step with no python
+#   traceback, indistinguishable from a node fault; too high and the job is billed
+#   as though it took extra GPUs and waits longer for a slot it never needed.
+#
+#   ⛔ 2026-09-08, run 1 of this probe, this block MEASURED THE WRONG THING and
+#     then failed to parse it, which is the only reason the mistake was caught:
+#       NODE_MEM=$(sinfo -h -o "%m" | sort -n | tail -1)
+#     (a) Slurm appends '+' to RealMemory when a partition groups heterogeneous
+#         nodes ("498000+"), so the numeric test threw and we recorded nothing;
+#     (b) far worse, `-o "%m"` with no node filter sweeps EVERY partition,
+#         including narval's 4 TB cpularge nodes. Had (a) not fired, we would have
+#         sized a GPU request from a CPU node's RAM and never known.
+#   What actually bounds the request is the RealMemory of the FULL-GPU nodes we
+#   will submit to, divided by the GPUs on such a node: the per-GPU share. We
+#   measure that, print the evidence either way, and take the MINIMUM over nodes
+#   so the request fits on every one of them rather than the luckiest.
+echo "--- RealMemory of the nodes carrying the FULL '$FULL' gres (the ones we submit to) ---"
+GPU_NODE_TSV=""
+if [ -n "${FULL:-}" ]; then
+    # -N -o "%n|%m|%G": one line per node per partition. Keep only nodes whose gres
+    # is the plain type (`gpu:a100:4`), never a MIG slice (`gpu:a100_3g.20gb:3`),
+    # then dedupe by node name.
+    GPU_NODE_TSV=$(sinfo -h -N -o "%n|%m|%G" 2>/dev/null \
+                   | grep "gpu:${FULL}:" | sort -u -t'|' -k1,1)
+fi
+if [ -n "$GPU_NODE_TSV" ]; then
+    echo "$GPU_NODE_TSV" | head -4 | sed 's/^/    /'
+    echo "    ... $(echo "$GPU_NODE_TSV" | wc -l) such node(s) total"
+    # Strip Slurm's '+' suffix before any arithmetic -- defect (a) above.
+    MIN_MEM=$(echo "$GPU_NODE_TSV" | cut -d'|' -f2 | tr -d '+' | grep '^[0-9][0-9]*$' \
+              | sort -n | head -1)
+    # GPUs per node: the count in `gpu:<type>:<N>`, taking the smallest so the
+    # divisor is never optimistic.
+    GPN=$(echo "$GPU_NODE_TSV" | tr ',' '\n' | sed 's/(.*//' \
+          | sed -n "s/.*gpu:${FULL}:\([0-9][0-9]*\).*/\1/p" | sort -n | head -1)
+    if [ -n "$MIN_MEM" ] && [ -n "$GPN" ] && [ "$GPN" -gt 0 ] 2>/dev/null; then
+        SHARE=$((MIN_MEM / GPN))
+        echo "  smallest RealMemory among them : ${MIN_MEM} MiB"
+        echo "  GPUs per such node             : ${GPN}"
+        echo "  => per-GPU share               : ${SHARE} MiB"
+        # ⭐ THE CAP. 64000M is what fir requested, but stage 06 never ran on fir,
+        #   so that number was never validated against gemma-2b full FT. It is
+        #   justified by a MEASUREMENT taken on the dev box with the exact recipe
+        #   stage 06 emits -- see sbatch/narval/README.md §0.1 (host RSS). We ask
+        #   for the SMALLER of what we need and what one GPU's share allows.
+        WANT="$NARVAL_MEM_NEED_MIB"
+        WHY="the measured requirement"
+        if [ "$SHARE" -lt "$WANT" ]; then WANT="$SHARE"; WHY="the per-GPU share (SMALLER than what we measured we need — see the warning below)"; fi
+        echo "  => requesting ${WANT}M, bounded by ${WHY}"
+        if [ "$SHARE" -lt "$NARVAL_MEM_NEED_MIB" ]; then
+            echo "  ⚠⚠ one GPU's share (${SHARE} MiB) is BELOW the measured need"
+            echo "     (${NARVAL_MEM_NEED_MIB} MiB). The job may be OOM-KILLED BY SLURM, which"
+            echo "     looks like a node fault, not an error. Do not just raise this:"
+            echo "     read README §0.1 and decide whether to request 2 GPUs' worth."
+        fi
+        put NARVAL_GPU_MEM "${WANT}M"
+    else
+        nomeasure NARVAL_GPU_MEM "could not parse RealMemory/GPU-count from the node dump above (mem='$MIN_MEM' gpus-per-node='$GPN')"
+    fi
 else
-    nomeasure NARVAL_GPU_MEM "sinfo reported no RealMemory"
+    echo "    (none matched)"
+    nomeasure NARVAL_GPU_MEM "sinfo -N listed no node carrying gres 'gpu:${FULL:-<unset>}:' — read the Gres dump in section 3"
 fi
 
 # ---------------------------------------------------------------------------
@@ -294,6 +370,27 @@ if command -v avail_wheels >/dev/null 2>&1; then
                adapters galore_torch lion_pytorch bitsandbytes sentencepiece; do
         echo "--- avail_wheels $pkg ---"; avail_wheels "$pkg" 2>&1 | head -8; echo
     done
+    # ⭐ The loop above prints only each package's NEWEST wheel, which on the
+    #   2026-09-08 run showed torch 2.14.0 / transformers 5.14.1 and read as
+    #   "our pins are gone" when it in fact said nothing about them at all --
+    #   fir's wheelhouse looked identically alarming and served every pin. So ask
+    #   the question we actually have: is OUR PINNED VERSION in there?
+    #   ⛔ Still not a conclusion. A wheel can exist and its DEPENDENCY SOLVE can
+    #     still fail, which is why 00c (pip install --dry-run) stays mandatory.
+    echo "--- ⭐ are OUR PINS present? (--all-versions; 00c still decides) ---"
+    pin_of() { sed -n "s/^$1=\"\${$1:-\([^}]*\)}\".*/\1/p" sbatch/fir/fir_env.sh | head -1; }
+    for spec in torch:FIR_PIN_TORCH transformers:FIR_PIN_TRANSFORMERS \
+                datasets:FIR_PIN_DATASETS peft:FIR_PIN_PEFT \
+                accelerate:FIR_PIN_ACCELERATE evaluate:FIR_PIN_EVALUATE; do
+        pkg="${spec%%:*}"; var="${spec##*:}"; want="$(pin_of "$var")"
+        if [ -z "$want" ]; then
+            printf '  ?? %-14s could not read %s out of sbatch/fir/fir_env.sh\n' "$pkg" "$var"
+            continue
+        fi
+        have=$(avail_wheels "$pkg" --all-versions 2>/dev/null | awk -v w="$want" '$2==w || $2 ~ "^"w"[+]" {print $2}' | sort -u | tr '\n' ' ')
+        if [ -n "$have" ]; then printf '  ✅ %-14s pin %-10s present as: %s\n' "$pkg" "$want" "$have"
+        else printf '  ⛔ %-14s pin %-10s NOT in the wheelhouse — see README §5.1\n' "$pkg" "$want"; fi
+    done
 else
     echo "!!! avail_wheels not found — report this; it changes the venv strategy entirely"
 fi
@@ -312,13 +409,21 @@ echo "  ~/.cache/huggingface/token : $([ -s "$HOME/.cache/huggingface/token" ] &
 echo "  ./data/token (HF_HOME)     : $([ -s ./data/token ] && echo present || echo ABSENT)"
 TOK="${HF_TOKEN:-$(cat ./.hf_token 2>/dev/null || cat "$HOME/.cache/huggingface/token" 2>/dev/null)}"
 TOK="$(printf '%s' "$TOK" | tr -d '[:space:]')"
+TOKEN_BLOCK=""
 if [ -n "$TOK" ] && command -v curl >/dev/null 2>&1; then
-    echo "  GET gemma-2b config.json with token -> HTTP $(curl -s -o /dev/null -w '%{http_code}' --max-time 15 \
-         -H "Authorization: Bearer $TOK" "https://huggingface.co/google/gemma-2b/resolve/main/config.json" 2>/dev/null)"
+    GEMMA_HTTP=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 \
+         -H "Authorization: Bearer $TOK" "https://huggingface.co/google/gemma-2b/resolve/main/config.json" 2>/dev/null)
+    echo "  GET gemma-2b config.json with token -> HTTP $GEMMA_HTTP"
     echo "     (200 = access granted; 401/403 = accept the licence at https://huggingface.co/google/gemma-2b)"
+    [ "$GEMMA_HTTP" = "200" ] || TOKEN_BLOCK="the token is present but gemma-2b returned HTTP $GEMMA_HTTP, not 200"
 else
     echo "  ⛔ no token on this node -> 02_download_cache.sh CANNOT fetch the gated model."
+    TOKEN_BLOCK="no HF token exists on narval"
 fi
+# ⭐ .hf_token is GITIGNORED (it is a credential), so `git clone` does NOT bring it
+#   and it will be absent on every new cluster BY DESIGN. That is correct, but it
+#   means the token is a SEPARATE blocker from the measured.sh keys, and it does
+#   not surface until stage 02 -- after a venv build -- unless section 11 says so.
 
 # ---------------------------------------------------------------------------
 hr "10. WRITING $OUT"
@@ -387,9 +492,19 @@ echo "--- $OUT ---"
 sed 's/^/    /' "$OUT"
 
 hr "11. WHAT TO DO NEXT"
-if [ -n "$MISSING" ]; then
+if [ -n "$MISSING" ] || [ -n "$TOKEN_BLOCK" ]; then
     echo "⛔ STOP. Send back this transcript ($LOG)."
-    echo "   Missing:$MISSING"
+    [ -n "$MISSING" ] && echo "   Unmeasured keys:$MISSING"
+    if [ -n "$TOKEN_BLOCK" ]; then
+        echo "   HF token       : $TOKEN_BLOCK"
+        echo "     ⛔ This blocks stage 02, NOT stage 01 -- and it blocks it AFTER a venv"
+        echo "       build, so fix it now rather than discovering it an hour in."
+        echo "     Fix, from a shell on THIS login node (.hf_token is gitignored, so the"
+        echo "     clone did not and must not carry it):"
+        echo "         printf '%s' 'hf_xxxxxxxx' > $(pwd)/.hf_token && chmod 600 $(pwd)/.hf_token"
+        echo "     then re-run this probe. The licence for google/gemma-2b must already be"
+        echo "     accepted by the account owning that token."
+    fi
     exit 1
 fi
 cat <<'NEXT'
