@@ -63,21 +63,85 @@ from transformers import (
 from transformers.utils import check_min_version, send_example_telemetry
 from transformers.utils.versions import require_version
 
-# Import GaLore optimizers (standard ones)
-from galore_torch import GaLoreAdamW, GaLoreAdamW8bit, GaLoreAdafactor
-import bitsandbytes as bnb
+# ⛔⛔ GaLore AND bitsandbytes ARE IMPORTED LAZILY — SEE _resolve_optimizer_class.
+#   [narval, 2026-09-08] `import bitsandbytes` dies with SIGILL on narval:
+#     Illegal instruction (core dumped)
+#   bitsandbytes 0.50.1+computecanada uses an instruction narval's EPYC 7532 lacks
+#   (no avx512f). `galore_torch` imports bitsandbytes transitively, so BOTH die.
+#   These two lines were at module scope, which made train_glue.py UNIMPORTABLE ON
+#   NARVAL FOR EVERY ARM -- including the ones that use plain torch.optim.AdamW and
+#   never touch either package.
+#
+#   ⚠⚠ AND A try/except AROUND THEM WOULD NOT HAVE HELPED. SIGILL is a SIGNAL, not
+#     an exception: it kills the interpreter outright, so there is nothing for
+#     `except ImportError` to catch. (The GALE block that used to sit here was
+#     exactly that shape, which is why it looked like adequate protection and was
+#     not.) The only fix is to NOT EXECUTE THE IMPORT unless the run needs it.
+#
+#   ⚠ This changes no numerics: an import has none, and every optimizer name still
+#     resolves to the identical class. scripts/optimizer_map_gate.py pins that.
 
-# Try to import GALE optimizers (optional, from custom fork)
-try:
-    from galore_torch import GALE_AdamW, GALE_Adafactor, GALE_AdamW8bit, SwiftGaLoreAdamW, GALE_Lion
-    GALE_AVAILABLE = True
-except ImportError:
-    GALE_AVAILABLE = False
-    # Provide dummy classes for when GALE is not available
-    class _DummyOptimizer:
-        def __init__(self, *args, **kwargs):
-            raise ImportError("GALE optimizers not available. Install galore-torch from custom fork.")
-    GALE_AdamW = GALE_Adafactor = GALE_AdamW8bit = SwiftGaLoreAdamW = GALE_Lion = _DummyOptimizer
+
+# ⭐ THE LAZY OPTIMIZER RESOLVER. See the note where the GaLore/bitsandbytes imports
+#   used to be. The old code built a dict of 20 CLASSES, which required importing
+#   every optimizer library to select ONE of them -- so a package that cannot even
+#   load on this CPU broke runs that had no use for it.
+#
+#   ⛔ SEMANTICS DELIBERATELY PRESERVED, because 41 banked drivers ran through the
+#     old dict:
+#       * every name maps to the SAME class it did before;
+#       * an unknown name still raises KeyError, with the same key;
+#     scripts/optimizer_map_gate.py asserts both against the mapping recorded from
+#     the pre-change code.
+_GALORE_NAMES = {
+    'galore_adamw': 'GaLoreAdamW', 'galore_adamw8bit': 'GaLoreAdamW8bit',
+    'galore_adafactor': 'GaLoreAdafactor', 'swift_galore_adamw': 'SwiftGaLoreAdamW',
+    'gale_adamw': 'GALE_AdamW', 'gale_adamw_fused': 'GALE_AdamW',
+    'gale_adamw_fused_approx': 'GALE_AdamW',
+    'gale_adafactor': 'GALE_Adafactor', 'gale_adafactor_fused': 'GALE_Adafactor',
+    'gale_adafactor_fused_approx': 'GALE_Adafactor',
+    'gale_adamw8bit': 'GALE_AdamW8bit', 'gale_adamw8bit_fused': 'GALE_AdamW8bit',
+    'gale_adamw8bit_fused_approx': 'GALE_AdamW8bit',
+    'gale_lion': 'GALE_Lion',
+}
+
+
+def optimizer_names():
+    """Every name the resolver accepts. Exists so a gate can enumerate them without
+    importing any optimizer library."""
+    return ['adam', 'adamw', 'adam8bit', 'adafactor', 'lion'] + sorted(_GALORE_NAMES)
+
+
+def _resolve_optimizer_class(name):
+    """Import ONLY what this run's optimizer needs, then return its class."""
+    if name == 'adam':
+        return torch.optim.Adam
+    if name == 'adamw':
+        return torch.optim.AdamW
+    if name == 'adafactor':
+        return transformers.optimization.Adafactor
+    if name == 'lion':
+        from lion_pytorch import Lion
+        return Lion
+    if name == 'adam8bit':
+        import bitsandbytes as bnb
+        return bnb.optim.Adam8bit
+    if name in _GALORE_NAMES:
+        attr = _GALORE_NAMES[name]
+        import galore_torch
+        try:
+            return getattr(galore_torch, attr)
+        except AttributeError:
+            # ⚠ The GALE_* optimizers live only in a custom fork of galore-torch.
+            #   The old code substituted a dummy class that raised at CONSTRUCTION;
+            #   raising here is the same failure one step earlier, and says which
+            #   name was missing instead of "GALE optimizers not available".
+            raise ImportError(
+                f"--optimizer {name} needs '{attr}', which the installed "
+                f"galore_torch ({getattr(galore_torch, '__file__', '?')}) does not "
+                f"provide. It comes from the custom galore-torch fork.")
+    # ⛔ Same exception, same key, as the dict lookup this replaced.
+    raise KeyError(name)
 
 # Import Lion optimizer
 from lion_pytorch import Lion
@@ -2168,17 +2232,7 @@ def run_single_seed(base_args: argparse.Namespace, seed: int):
     else:
         param_groups = [p for p in model.parameters() if p.requires_grad]
 
-    optimizer_classes = {
-        'adam': torch.optim.Adam, 'adamw': torch.optim.AdamW, 'adam8bit': bnb.optim.Adam8bit,
-        'adafactor': transformers.optimization.Adafactor, 'galore_adamw': GaLoreAdamW,
-        'galore_adamw8bit': GaLoreAdamW8bit, 'galore_adafactor': GaLoreAdafactor,
-        'swift_galore_adamw': SwiftGaLoreAdamW,
-        'gale_adamw': GALE_AdamW, 'gale_adamw_fused': GALE_AdamW, 'gale_adamw_fused_approx': GALE_AdamW,
-        'gale_adafactor': GALE_Adafactor, 'gale_adafactor_fused': GALE_Adafactor, 'gale_adafactor_fused_approx': GALE_Adafactor,
-        'gale_adamw8bit': GALE_AdamW8bit, 'gale_adamw8bit_fused': GALE_AdamW8bit, 'gale_adamw8bit_fused_approx': GALE_AdamW8bit,
-        'lion': Lion, 'gale_lion': GALE_Lion
-    }
-    optimizer_class = optimizer_classes[args.optimizer_base]
+    optimizer_class = _resolve_optimizer_class(args.optimizer_base)
     optimizer_kwargs = {'lr': args.learning_rate, 'weight_decay': args.weight_decay}
 
     # [narval port] the Adam kernel selector. ⛔ 'auto' passes nothing, so the default

@@ -388,11 +388,40 @@ echo; echo "--- constraints file ($CONSTRAINTS) ---"; cat "$CONSTRAINTS"
 #   whose entire content is "use adapters instead": it installs cleanly, provides
 #   no `adapters` module, and the import still fails.  A package that installs is
 #   not a package that imports — which is why the check below imports it.
+# ⛔⛔ galore_torch IS INSTALLED BUT DELIBERATELY NOT IMPORTED HERE.
+#   [narval 2026-09-08] `import bitsandbytes` dies with SIGILL on narval's EPYC
+#   7532 (no avx512f), and galore_torch imports it transitively. Both packages
+#   install perfectly and neither can run. They stay in requirements.txt and stay
+#   in the in-venv assertion below -- what changed is that src/train_glue.py no
+#   longer imports either at module scope (see _resolve_optimizer_class), so an
+#   arm using plain AdamW no longer depends on a package it never calls.
+#   ⇒ importing galore_torch HERE would re-impose exactly the dependency the
+#     runner just shed, and would fail this stage on a cluster where every arm we
+#     actually run is fine. The check must test WHAT THE JOB IMPORTS (Law 1).
+#   ⚠ Their usability is still REPORTED, immediately below -- non-fatally, because
+#     no arm in this program uses a GaLore or 8-bit optimizer.
 stage "requirements.txt (under constraints)" \
-      "import adapters, galore_torch, lion_pytorch, sklearn, scipy, pandas, filelock; \
+      "import adapters, lion_pytorch, sklearn, scipy, pandas, filelock; \
 print('  requirements leaf packages import OK')" \
       "adapters galore_torch lion_pytorch" \
       -- -q -r requirements.txt -c "$CONSTRAINTS"
+
+# --- 4c-bis. Do the CPU-fragile optimizers work on this host? REPORT, DO NOT FAIL.
+echo
+echo "--- optional optimizer backends (report only; no arm here uses them) ---"
+for m in galore_torch bitsandbytes; do
+    "$VPY" -c "import $m" >/dev/null 2>&1; rc=$?
+    if [ "$rc" -eq 0 ]; then
+        printf '  ✅ %-14s imports on this host\n' "$m"
+    elif [ "$rc" -gt 128 ]; then
+        printf '  ⚠ %-14s KILLED BY SIGNAL (exit %s) — installed, but does NOT run on this CPU\n' "$m" "$rc"
+        echo "       This does NOT block anything: src/train_glue.py imports these"
+        echo "       lazily, so only --optimizer galore_*/adam8bit would hit it."
+        echo "       Diagnose with: bash $LRS_STAGE_DIR/00e_diagnose_imports.sh"
+    else
+        printf '  ⚠ %-14s import failed (exit %s) — see above; also non-blocking\n' "$m" "$rc"
+    fi
+done
 
 # --- 4d. sentencepiece: gemma's tokenizer is SentencePiece-backed.  It is NOT in
 #     requirements.txt (the repo's history is RoBERTa/BPE), so it would have been
