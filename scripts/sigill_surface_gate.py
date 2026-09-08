@@ -182,11 +182,16 @@ def t_no_pipeline_stage_imports_them():
             txt = f.read_text()
             for m in re.finditer(r"^.*\b(import_module|import)\b.*$", txt, re.M):
                 line = m.group(0)
-                if "#" in line[:line.find("import")] if "import" in line else False:
+                stripped = line.strip()
+                # ⚠ A comment, or an `echo` that PRINTS a suggested command, is
+                #   text -- not an import this script performs. 01c now echoes a
+                #   `python -c 'import bitsandbytes'` remedy for the user to run,
+                #   and flagging that made a correct file look like a violation.
+                if stripped.startswith("#") or stripped.startswith("echo "):
                     continue
                 if re.search(r"(import\s+(galore_torch|bitsandbytes)|"
-                             r"from\s+galore_torch)", line) and not line.strip().startswith("#"):
-                    offenders.append(f"{f.relative_to(ROOT)}: {line.strip()[:90]}")
+                             r"from\s+galore_torch)", line):
+                    offenders.append(f"{f.relative_to(ROOT)}: {stripped[:90]}")
     check("⭐ no stage script imports galore_torch or bitsandbytes",
           not offenders, "\n".join(offenders))
     # And the runner itself.
@@ -261,13 +266,92 @@ def t_the_closing_gate_survives():
               died_by_signal(r2.returncode), f"rc={r2.returncode}")
 
 
+# ---------------------------------------------------------------------------
+def t_transitive_sigill_is_not_a_finding():
+    """⛔ THE FOURTH SITE, and the one that would have LIED.
+    01c imports the AUTHORS' vendored peft to prove their clone loads. That peft's
+    ia3/model.py does `import bitsandbytes`, so on narval the import dies by
+    SIGILL -- and the module list that was 'enumerated' as safe never covered
+    TRANSITIVE imports through third-party code.
+    Two distinct claims must be kept apart:
+      * 01c  : "the clone is broken"          vs "this CPU cannot run a dependency"
+      * 03   : "the comparator MOVED"         vs "the verifier never ran"
+    The second pair matters most: a signal produces no Python message, so it
+    matched none of 03's error patterns and would have been reported as a
+    BIT-IDENTITY MISMATCH -- a false scientific claim."""
+    print("\n--- ⭐ a TRANSITIVE signal death is an environment fact, not a finding ---")
+
+    # --- 01c: the receipt loop -------------------------------------------------
+    src01c = (ROOT / "sbatch/fir/01c_stage_repos.sh").read_text()
+    check("01c distinguishes signal death from an import error",
+          "-gt 128" in src01c and "KILLED BY SIGNAL" in src01c, "")
+    check("...and a signal does NOT fail the stage",
+          "CPU_UNRUNNABLE" in src01c, "")
+    check("...while an ordinary import error still DOES (rc=1 preserved)",
+          re.search(r"FAILED to import even after patching.*\n\s*rc=1", src01c) is not None,
+          src01c[src01c.find("FAILED to import even after"):][:200])
+    check("⭐ ...and it states what is consequently UNVERIFIED, not just that it skipped",
+          "UNVERIFIABLE ON THIS CLUSTER" in src01c and "UNCHECKED" in src01c, "")
+    check("...and why it is safe here specifically (stage 06 trains NO ADAPTER)",
+          "trains NO ADAPTER" in src01c, "")
+
+    # --- 03: the verifier classifier ------------------------------------------
+    src03 = (ROOT / "sbatch/fir/03_preflight.sh").read_text()
+    # ⛔ Order matters: the signal test must come BEFORE the message-pattern grep,
+    #   or a signal (which prints nothing) falls through to the MISMATCH branch.
+    i_sig = src03.find("$vrc -gt 128")
+    i_grep = src03.find('grep -qE "SyntaxError')
+    # ⚠ Anchor on the BRANCH, not on the comment that describes it: the phrase
+    #   "MISMATCH — it ran and the numbers differ" appears in the explanatory
+    #   comment ~90 lines EARLIER, so searching for it made this assertion compare
+    #   the wrong positions and fail against correct code.
+    i_mismatch = src03.find('echo "  ⛔ $v: MISMATCH')
+    check("⭐ 03 tests for a SIGNAL before it pattern-matches error text",
+          -1 < i_sig < i_grep < i_mismatch, f"sig={i_sig} grep={i_grep} mism={i_mismatch}")
+    check("⭐ ...so a signal can never reach the MISMATCH branch (the false headline)",
+          "b_cpu=\"$b_cpu $v\"" in src03 and "continue" in src03[i_sig:i_grep], "")
+    check("...and the CPU bucket is reported separately from ERROR and MISMATCH",
+          src03.count('b_cpu') >= 4 and "UNANSWERED" in src03, "")
+    check("⛔ CONTROL: a real MISMATCH still blocks (rc=1), so this did not soften it",
+          re.search(r"BIT-IDENTITY MISMATCH.*(\n.*){0,10}?rc=1", src03) is not None, "")
+    check("⛔ CONTROL: a harness ERROR still blocks (rc=1)",
+          re.search(r"VERIFIER\(S\) FAILED TO RUN.*(\n.*){0,8}?rc=1", src03) is not None, "")
+    check("⭐ ...and the non-blocking CPU case declares when it WOULD block",
+          "becomes blocking" in src03, "")
+
+    # --- the mechanism, reproduced for real -----------------------------------
+    loca = ROOT / "temp" / "LoCA" / "peft" / "src"
+    vpy = ROOT / "env" / "bin" / "python"
+    if not (loca.exists() and vpy.exists()):
+        check("SKIPPED: no LoCA clone / venv on this host to reproduce against", True, "")
+        return
+    with tempfile.TemporaryDirectory() as t:
+        _v, _s, lethal = make_sigill_env(t)
+        r = run(f'PYTHONPATH="{lethal}:{loca}" "{vpy}" -c '
+                '"import importlib; importlib.import_module(\'peft.tuners.loca.layer\')"')
+        check("⭐ REPRODUCED: importing the authors' peft transitively dies by signal",
+              died_by_signal(r.returncode), f"rc={r.returncode}")
+        check("⛔ CONTROL: ...and it imports fine WITHOUT the lethal stub, so the "
+              "clone itself is sound",
+              run(f'PYTHONPATH="{loca}" "{vpy}" -c '
+                  '"import importlib; importlib.import_module(\'peft.tuners.loca.layer\')"'
+                  ).returncode == 0, "")
+        # ⛔ And the runner must NOT be affected: installed peft 0.18.1 does not
+        #   eagerly import bitsandbytes (evidenced by narval's stage 01 passing).
+        r2 = run(f'PYTHONPATH="{lethal}:{ROOT}/src" "{vpy}" -c '
+                 '"import train_glue; print(\'RUNNER OK\')"')
+        check("⭐ CONTROL: the RUNNER is unaffected — installed peft does not pull it",
+              "RUNNER OK" in r2.stdout, r2.stdout + r2.stderr[-300:])
+
+
 def main():
     print("=" * 78)
     print("SIGILL SURFACE GATE — nothing executes a package it only needs to LOCATE")
     print("=" * 78)
     for t in (t_stub_really_sigills, t_assert_in_venv_survives,
               t_no_pipeline_stage_imports_them, t_entry_point_check_survives,
-              t_the_closing_gate_survives):
+              t_the_closing_gate_survives,
+              t_transitive_sigill_is_not_a_finding):
         t()
     print("\n" + "=" * 78)
     print(f"sigill_surface_gate: {len(_ok)} passed, {len(_bad)} FAILED")
