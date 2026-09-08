@@ -152,16 +152,30 @@ echo "./env exists     : $([ -d ./env ] && echo yes || echo no)"
 if [ -d ./env ]; then
     echo "./env python     : $(./env/bin/python -V 2>&1)"
     echo "--- key package versions in the existing venv ---"
-    ./env/bin/python - <<'PY' 2>&1 | head -20
-import importlib
+    # ⛔ REPORTING A VERSION MUST NOT EXECUTE THE PACKAGE. [narval 2026-09-08]
+    #   bitsandbytes SIGILLs on some Alliance CPUs and galore_torch imports it, so
+    #   an import-based version report DIES -- taking the whole probe with it, and
+    #   a probe that cannot survive the thing it is probing is worthless.
+    #   importlib.metadata reads the installed distribution's METADATA file; it
+    #   never runs the package. (The import name and the distribution name differ
+    #   for several of these, hence the map.)
+    ./env/bin/python - <<'PY' 2>&1 | head -24
+import importlib.util, importlib.metadata as md
+DIST = {"sklearn": "scikit-learn", "galore_torch": "galore-torch",
+        "lion_pytorch": "lion-pytorch"}
 for m in ["torch","triton","transformers","peft","datasets","accelerate",
           "evaluate","adapters","galore_torch","lion_pytorch","bitsandbytes",
           "sklearn","scipy","pandas","filelock"]:
     try:
-        mod = importlib.import_module(m)
-        print(f"  {m:14} {getattr(mod,'__version__','?')}")
-    except Exception as e:
-        print(f"  {m:14} MISSING ({type(e).__name__})")
+        present = importlib.util.find_spec(m) is not None
+    except Exception:
+        present = False
+    if not present:
+        print(f"  {m:14} MISSING"); continue
+    try:
+        print(f"  {m:14} {md.version(DIST.get(m, m))}")
+    except Exception:
+        print(f"  {m:14} installed (version unreadable)")
 PY
     echo "--- torch CUDA build (if importable) ---"
     ./env/bin/python -c "import torch;print('  torch',torch.__version__,'cuda',torch.version.cuda,'avail',torch.cuda.is_available())" 2>&1 | head -3

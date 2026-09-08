@@ -225,17 +225,37 @@ assert_in_venv() {   # assert_in_venv <label> "<mod> <mod> ..."
     local label="$1" mods="$2" vreal
     [ -n "$mods" ] || return 0
     vreal="$(readlink -f "$FIR_VENV_REAL")"
+    # ⛔⛔ A LOCATION QUESTION MUST NEVER EXECUTE THE MODULE.
+    #   [narval 2026-09-08] This function used importlib.import_module to find out
+    #   WHERE a package lives. `galore_torch` is in the list, it imports
+    #   bitsandbytes, and bitsandbytes SIGILLs on narval -- so the check that asks
+    #   "is it installed in the venv?" was KILLED BY the answer to a different
+    #   question ("does it run here?"), and the stage failed on a cluster where
+    #   every arm we run is fine.
+    #   ⚠⚠ THIS IS THE SECOND TIME THE SAME BUG WAS FIXED IN THIS FILE. The commit
+    #     before this one removed galore_torch from the stage's IMPORT check and
+    #     left it in THIS list, so the identical SIGILL reappeared one line over.
+    #     FIR_SETUP §I: "twice in the corrected version of a check that had already
+    #     fired." Patching call sites does not end a class of defect; removing the
+    #     capability does. Hence find_spec, which resolves a module's ORIGIN
+    #     WITHOUT RUNNING ITS CODE -- there is now no import here to go wrong.
+    #   ⚠ What this deliberately no longer detects: "installed, in the venv, but
+    #     raises on import." That is a DIFFERENT question and it is answered by the
+    #     stage's own import check, which imports exactly what the job imports.
     FIR_CHECK_MODS="$mods" FIR_CHECK_VENV="$vreal" "$VPY" - <<'PY' || {
-import importlib, os, sys
+import importlib.util, os, sys
 venv = os.path.realpath(os.environ["FIR_CHECK_VENV"])
 bad = []
 for m in os.environ["FIR_CHECK_MODS"].split():
     try:
-        mod = importlib.import_module(m)
+        spec = importlib.util.find_spec(m)
     except Exception as e:
-        print(f"  ⛔ {m}: import FAILED right after install: {type(e).__name__}: {str(e)[:200]}")
+        print(f"  ⛔ {m}: could not be located after install: {type(e).__name__}: {str(e)[:200]}")
         bad.append(m); continue
-    f = os.path.realpath(getattr(mod, "__file__", "") or "")
+    if spec is None:
+        print(f"  ⛔ {m}: NOT INSTALLED after a pip install that reported success")
+        bad.append(m); continue
+    f = os.path.realpath(spec.origin or "")
     if not f.startswith(venv + os.sep):
         print(f"  ⛔ {m} resolves OUTSIDE the venv -> {f or '<no __file__>'}")
         bad.append(m)
