@@ -13,7 +13,7 @@ Usage:
     env/bin/python scripts/fir_hp_run_cell.py --cell <id> --run-root <dir>
     env/bin/python scripts/fir_hp_run_cell.py --selftest
 """
-import argparse, os, subprocess, sys
+import argparse, os, subprocess, sys, tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
@@ -348,6 +348,95 @@ def selftest():
            and callable(getattr(_m, "cell_cmd", None))
            and callable(getattr(_m, "cell_env", None)),
            f"planner {_name!r} implements the parse/cmd/env interface run() needs")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # ⛔⛔ THE INVOCATION ITSELF. narval job 2689499_9, 2026-09-09.
+    #   run() calls  subprocess.run([python or sys.executable] + cell_cmd(c)),
+    #   so cell_cmd MUST begin with the SCRIPT. fir_baseline_plan began with
+    #   "env/bin/python", producing
+    #       env/bin/python env/bin/python -u src/train_glue.py ...
+    #   -- python handed its own ELF binary as source. The cell died in 1 second:
+    #       File ".../env/bin/python", line 1
+    #           ELF
+    #       SyntaxError: source code cannot contain null bytes
+    #
+    #   ⚠⚠ WHY NOTHING CAUGHT IT. fir_baseline_plan --selftest (104 checks), the
+    #     shell gates, and every --dry-run inspect the command as TEXT. They print
+    #     it, parse it, assert flags are present -- and it LOOKS right, because the
+    #     bug is not in the string but in how run() composes it. 1,500 cells of
+    #     stages 04/05 ran fine because their planners always conformed; stage 06
+    #     is the only one that had never executed a cell. FIR_SETUP Law 1: a check
+    #     must run what the job runs.
+    # ═══════════════════════════════════════════════════════════════════════
+    import shutil as _shutil
+    _INTERP = ("python", "python3", "python3.10", "python3.11", "env/bin/python")
+    for _name in ("hp", "final", "baseline"):
+        _m = _planner(_name)
+        _env0 = dict(os.environ)
+        if _name == "baseline":
+            os.environ["FIR_BASE_TASK"] = "mrpc"
+        try:
+            _c0 = _m.cells()[0]
+            _cmd0 = _m.cell_cmd(_c0)
+        finally:
+            os.environ.clear(); os.environ.update(_env0)
+        ck(_cmd0[0].endswith(".py"),
+           f"[invocation] {_name}: cell_cmd starts with a SCRIPT, not an interpreter "
+           f"(got {_cmd0[0]!r})")
+        ck(not any(os.path.basename(_cmd0[0]) == _i or _cmd0[0].endswith(_i)
+                   for _i in _INTERP),
+           f"[invocation] ⛔ CONTROL: {_name}: cell_cmd[0] is not any known interpreter")
+        ck(not any(a.endswith("/python") or a == "python" for a in _cmd0),
+           f"[invocation] ⛔ CONTROL: {_name}: no interpreter ANYWHERE in cell_cmd "
+           f"(a second one later is the same bug)")
+
+    # ⭐ AND THE END-TO-END CHECK: actually invoke run() with a stub interpreter
+    #   that records its argv. This is the check that would have caught it, because
+    #   it composes the command the way the job does instead of reading it.
+    _td = tempfile.mkdtemp()
+    _argv_f = os.path.join(_td, "argv.txt")
+    _stub = os.path.join(_td, "stub_python")
+    with open(_stub, "w") as _f:
+        _f.write("#!/bin/bash\nprintf '%s\\n' \"$@\" > " + _argv_f + "\nexit 0\n")
+    os.chmod(_stub, 0o755)
+    _env0 = dict(os.environ)
+    os.environ["FIR_BASE_TASK"] = "mrpc"
+    try:
+        _B = _planner("baseline")
+        _cid = _B.cell_id(_B.cells()[0])
+        _rr = os.path.join(_td, "rr")
+        _rc = run(_cid, _rr, python=_stub, planner="baseline")
+        _argv = open(_argv_f).read().splitlines() if os.path.exists(_argv_f) else []
+    finally:
+        os.environ.clear(); os.environ.update(_env0)
+    ck(bool(_argv), "[invocation] ⭐ the stub interpreter was actually invoked")
+    ck(_argv[:1] == ["src/train_glue.py"] if _argv else False,
+       f"[invocation] ⭐ the interpreter's FIRST argument is the script "
+       f"(got {_argv[:1]}) -- this is the check that would have caught 2689499_9")
+    ck(not any(a.endswith("/python") or a == "python" for a in _argv),
+       "[invocation] ⛔ CONTROL: no second interpreter reached the command line")
+    # ⚠ rc==3 is the CORRECT outcome here, and asserting rc==0 was my own error:
+    #   the stub prints nothing, so run() reaches verify_receipts and rejects it
+    #   ("exited 0 but did not train what it claims to"). What rc==3 proves is
+    #   precisely what this test is for -- the interpreter RAN and exited 0, so the
+    #   invocation was well-formed. Under the old cell_cmd the real interpreter
+    #   exited 1 with a SyntaxError before any receipt could exist.
+    ck(_rc == 3,
+       f"[invocation] ⛔ CONTROL: a silent stub gets past invocation and fails only "
+       f"on RECEIPTS (rc={_rc}, expected 3)")
+    ck(_rc != RC_NOT_IN_GRID,
+       "[invocation] ⛔ CONTROL: ...and it was not rejected at the planning step")
+
+    # ⛔ NEGATIVE CONTROL: the argv assertion must FAIL on the shape that broke.
+    #   Without this, "argv[0] is the script" could pass for a reason unrelated to
+    #   the bug, and a gate that cannot fail is not a gate (FIR_SETUP Law 7).
+    _broken = ["env/bin/python", "-u", "src/train_glue.py", "--task_name", "mrpc"]
+    ck(not _broken[0].endswith(".py"),
+       "[invocation] ⛔ CONTROL: the assertion REJECTS the exact pre-fix command "
+       "(env/bin/python first)")
+    ck(any(a.endswith("/python") for a in _broken),
+       "[invocation] ⛔ CONTROL: ...and the no-interpreter-anywhere check rejects it too")
+    _shutil.rmtree(_td, ignore_errors=True)
     ck(_planner("final") is _FP and _planner("hp") is H,
        "...and the two long-standing names still resolve to the same modules")
 

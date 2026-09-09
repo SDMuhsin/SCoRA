@@ -205,7 +205,23 @@ def cell_cmd(c, model=None):
     """⛔ NO adapter flags, NO --classifier_lr, NO --adapter_target_modules.
     `--optimizer adamw` with no suffix IS full fine-tuning (train_glue.py:686), and
     an absent --classifier_lr means ONE param group at --learning_rate (:2038)."""
-    return ["env/bin/python", "-u", "src/train_glue.py",
+    # ⛔⛔ THE FIRST ELEMENT IS THE SCRIPT, NEVER AN INTERPRETER.
+    #   fir_hp_run_cell.run() invokes this as
+    #       subprocess.run([python or sys.executable] + cell_cmd(...))
+    #   so it supplies the interpreter itself. This function used to return
+    #       ["env/bin/python", "-u", "src/train_glue.py", ...]
+    #   which produced `env/bin/python env/bin/python -u src/train_glue.py`, i.e.
+    #   python handed its OWN BINARY as a script -- narval job 2689499_9 died in 1s:
+    #       File ".../env/bin/python", line 1
+    #           ELF
+    #       SyntaxError: source code cannot contain null bytes
+    #   ⚠ fir_hp_plan and fir_final_plan have always returned "src/train_glue.py"
+    #     first and between them ran 1,500 cells. This planner is the only one that
+    #     never executed a cell, so it is the only one where the mismatch survived.
+    #   ⚠ `-u` went with it: the runner captures output and writes the log at the
+    #     end, so unbuffering changed nothing, and the two planners that produced
+    #     every banked cell do not pass it either.
+    return ["src/train_glue.py",
             "--model_name_or_path", model or MODEL,
             "--task_name", c["task"],
             "--dtype", "float32",
