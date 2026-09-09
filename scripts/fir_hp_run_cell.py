@@ -350,6 +350,43 @@ def selftest():
            f"planner {_name!r} implements the parse/cmd/env interface run() needs")
 
     # ═══════════════════════════════════════════════════════════════════════
+    # ⛔⛔ THE FULL-FT RECEIPT. narval job 2696771_9, 2026-09-09.
+    #   A stage-06 cell trained 20 epochs in 19m42s, scored acc 0.8578 / f1 0.9010,
+    #   wrote its CSV -- and was rejected with "NO trainable-params receipt".
+    #   `print_trainable_parameters()` is a PEFT method; full fine-tuning takes no
+    #   adapter branch, so the receipt was NEVER EMITTED and no full-FT cell could
+    #   ever be marked done. The verifier was right to fail closed; the runner was
+    #   not producing the evidence. src/train_glue.py now emits it, in PEFT's exact
+    #   wording, only when no adapter framework is attached.
+    #   ⚠ The fixture below is the line a REAL run printed (gemma-2b, mrpc), not a
+    #     hand-written approximation of it.
+    _FULLFT = ("09/09/2026 02:50:14 - INFO - __main__ - trainable params: "
+               "2,506,176,512 || all params: 2,506,176,512 || trainable%: 100.0000\n")
+    _okf, _notef = verify_receipts(_FULLFT, {"arm": "base", "task": "mrpc"})
+    ck(_okf, f"[full-FT] ⭐ the receipt a real full-FT run EMITS is accepted ({_notef})")
+    # stsb is REGRESSION: num_labels=1, so its head is 2,048 and its total differs.
+    _stsb = _FULLFT.replace("2,506,176,512", f"{BACKBONE + head_params('stsb'):,}")
+    ck(verify_receipts(_stsb, {"arm": "base", "task": "stsb"})[0],
+       "[full-FT] ...and stsb's own (regression head = 2,048) total is accepted too")
+    ck(not verify_receipts(_FULLFT, {"arm": "base", "task": "stsb"})[0],
+       "[full-FT] ⛔ CONTROL: mrpc's total is REJECTED for stsb -- the check is "
+       "task-aware, not a constant")
+    ck(not verify_receipts("", {"arm": "base", "task": "mrpc"})[0],
+       "[full-FT] ⛔ CONTROL: an EMPTY log is still rejected (this is what 2696771_9 hit)")
+    ck(not verify_receipts(_FULLFT.replace("all params: 2,506,176,512",
+                                           "all params: 2,600,000,000"),
+                           {"arm": "base", "task": "mrpc"})[0],
+       "[full-FT] ⛔ CONTROL: trainable != all is rejected (params stayed frozen)")
+    # Structural: the emit site exists and is guarded by the ABSENCE of the PEFT
+    # method, so an adapter run cannot print a second, conflicting receipt.
+    _tg = open(os.path.join(ROOT, "src", "train_glue.py")).read()
+    ck('if not hasattr(model, "print_trainable_parameters"):' in _tg,
+       "[full-FT] the emit site is guarded by the absence of the PEFT method")
+    ck(_tg.count("|| all params:") == 1,
+       f"[full-FT] ⛔ CONTROL: exactly ONE site emits this format "
+       f"(found {_tg.count('|| all params:')}) -- two would race the parser")
+
+    # ═══════════════════════════════════════════════════════════════════════
     # ⛔⛔ THE INVOCATION ITSELF. narval job 2689499_9, 2026-09-09.
     #   run() calls  subprocess.run([python or sys.executable] + cell_cmd(c)),
     #   so cell_cmd MUST begin with the SCRIPT. fir_baseline_plan began with

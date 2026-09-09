@@ -2033,6 +2033,28 @@ def run_single_seed(base_args: argparse.Namespace, seed: int):
 
     model.to(device)
 
+    # --- ⭐ THE FULL-FINE-TUNING RECEIPT -------------------------------------
+    # ⛔⛔ [narval job 2696771_9, 2026-09-09] A stage-06 cell trained for 19m42s,
+    #   reached acc 0.8578 / f1 0.9010, wrote its CSV -- and was REJECTED with
+    #     "NO trainable-params receipt -- cannot prove anything ran"
+    #   because `print_trainable_parameters()` is a PEFT METHOD. Every adapter
+    #   branch above calls it; full fine-tuning takes NONE of those branches, so a
+    #   full-FT run emitted no receipt at all and could never be marked done.
+    #   ⚠ The verifier was right to fail closed -- absence of evidence is not
+    #     evidence. The defect is that the evidence was never produced.
+    # ⚠ Emitted ONLY when no adapter ran, in PEFT's exact wording, so that:
+    #     (a) adapter runs are byte-identical to every banked cell, and
+    #     (b) one parser (fir_preflight_arms.parse_receipts) reads both.
+    #   The discriminator is the METHOD, not a flag: every adapter framework used
+    #   here (PEFT, AdapterHub, and the custom spectral/haar/bwht/coset wrappers)
+    #   attaches `print_trainable_parameters`; a plain HF model has none. So its
+    #   absence IS "no adapter ran", with nothing to keep in sync.
+    if not hasattr(model, "print_trainable_parameters"):
+        _tr = sum(p_.numel() for p_ in model.parameters() if p_.requires_grad)
+        _all = sum(p_.numel() for p_ in model.parameters())
+        logger.info(f"trainable params: {_tr:,} || all params: {_all:,} || "
+                    f"trainable%: {100.0 * _tr / max(_all, 1):.4f}")
+
     # --- Multiple-choice head must always train ---
     # Every adapter path here (PEFT with task_type=None, and the custom
     # spectral/haar/bwht/coset/sparseft/calib wrappers) freezes the whole base model,
