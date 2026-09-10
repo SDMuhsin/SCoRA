@@ -86,7 +86,7 @@ export FIR_HP_GRID="$GRID_NAME"
 #   knobs, so cells shared by two grids reuse their CSV and their `done` marker and
 #   cost nothing on the re-run. Do NOT split the root per grid.
 SWEEP_ROOT="$FIR_RUN_ROOT/hpsweep"
-mkdir -p "$SWEEP_ROOT"/{csv,logs,done,fail,started,plans}
+fir_require_run_root "$SWEEP_ROOT" || exit 1
 
 # ⛔⛔ THE CELL LIST IS A PER-SUBMISSION SNAPSHOT, NOT A SHARED FILE. [2026-08-28]
 #   It used to be ONE `$SWEEP_ROOT/cells.txt`, rewritten by every submit. Five

@@ -885,6 +885,88 @@ def t_fir_stage_imports_survive_without_gitignored_data():
     finally:
         shutil.rmtree(shim, ignore_errors=True)
 
+# --------------------------------------------------------------------------
+def t_run_root_is_never_created_unchecked():
+    """⭐ EVERY STAGE MUST CREATE ITS RUN ROOT THROUGH fir_require_run_root.
+
+    ⛔⛔ [narval 2026-09-10] /scratch is Lustre. Its mount died mid-session and
+      `mkdir -p "$SWEEP_ROOT"/{...}` -- UNCHECKED in all three of 04/05/06 --
+      returned "Cannot send after transport endpoint shutdown". The scripts
+      carried on ~80 lines and died on a redirect into a directory that was
+      never created. Six mkdir errors and a line number, for a CLUSTER OUTAGE
+      with nothing to do with this repo: the operator cannot tell "the
+      filesystem is down" from "you broke the pipeline".
+
+    ⭐ THE SHARED FUNCTION IS ONLY HALF THE FIX. Putting fir_require_run_root in
+      fir_env.sh does not stop a FOURTH stage from being written with a bare
+      mkdir -- that is exactly how fir_assert_env came to be called by three
+      stages that never loaded modules. This test is the other half: it is
+      structural, so a new stage cannot quietly opt out.
+    """
+    print("\n--- the run root is never created unchecked ---")
+    stages = [f for f in sorted(os.listdir(FIR))
+              if re.match(r"^\d\w*_.*\.sh$", f)]
+    pat = r'^\s*mkdir\s+-p\s+"?\$\{?(?:SWEEP_ROOT|FIR_RUN_ROOT)[^\n]*$'
+    users = []
+    for f in stages:
+        src = open(os.path.join(FIR, f)).read()
+        if "SWEEP_ROOT=" not in src:
+            continue
+        users.append(f)
+        bare = [b for b in re.findall(pat, src, re.M) if "||" not in b]
+        check(f"[{f}] no UNCHECKED mkdir of the run root", not bare, "\n".join(bare))
+        check(f"[{f}] creates its run root via fir_require_run_root",
+              "fir_require_run_root" in src, "not called")
+    check("found the stages that own a run root", len(users) >= 3, str(users))
+
+    bad = 'SWEEP_ROOT="$FIR_RUN_ROOT/x"\nmkdir -p "$SWEEP_ROOT"/{csv,logs}\n'
+    hit = [b for b in re.findall(pat, bad, re.M) if "||" not in b]
+    check("⛔ CONTROL: the detector fires on a bare unchecked mkdir", bool(hit), bad)
+
+    ok_dir = tempfile.mkdtemp()
+    r = sh(f'source "{ENV_SH}" >/dev/null 2>&1\n'
+           f'fir_require_run_root "{ok_dir}/runs"; echo "RC=$?"')
+    check("fir_require_run_root SUCCEEDS on a writable root", "RC=0" in r.stdout,
+          r.stdout + r.stderr)
+    check("...and is silent when it succeeds",
+          "CANNOT CREATE" not in r.stdout, r.stdout)
+    check("...and actually made the subdirectories",
+          all(os.path.isdir(os.path.join(ok_dir, "runs", d))
+              for d in ("csv", "logs", "done", "fail", "started", "plans")),
+          str(sorted(os.listdir(os.path.join(ok_dir, "runs")))
+              if os.path.isdir(os.path.join(ok_dir, "runs")) else "missing"))
+
+    lustre = ("mkdir: cannot create directory: "
+              "Cannot send after transport endpoint shutdown")
+    r2 = sh(f'source "{ENV_SH}" >/dev/null 2>&1\n'
+            f'mkdir() {{ echo "{lustre}" >&2; return 1; }}\n'
+            'fir_require_run_root /scratch/u/x/runs; echo "RC=$?"')
+    check("⛔ a dead Lustre mount FAILS the stage (rc=1)", "RC=1" in r2.stdout,
+          r2.stdout + r2.stderr)
+    check("⭐ ...and says it is a CLUSTER OUTAGE, not a repo defect",
+          "NOT A DEFECT IN THIS REPO" in r2.stdout, r2.stdout)
+    check("⭐ ...and tells the operator NOT to resubmit",
+          "DO NOT resubmit" in r2.stdout, r2.stdout)
+    check("⭐ ...and points at sacct, which does not live on that filesystem",
+          "sacct" in r2.stdout, r2.stdout)
+
+    r3 = sh(f'source "{ENV_SH}" >/dev/null 2>&1\n'
+            'mkdir() { echo "mkdir: cannot create directory: Permission denied" >&2; '
+            'return 1; }\n'
+            'fir_require_run_root /x/y; echo "RC=$?"')
+    check("⛔ CONTROL: a permission error also fails (rc=1)", "RC=1" in r3.stdout,
+          r3.stdout)
+    check("⛔ CONTROL: ...but is NOT called an outage",
+          "NOT A DEFECT IN THIS REPO" not in r3.stdout and
+          "PERMISSION PROBLEM" in r3.stdout, r3.stdout)
+    r4 = sh(f'source "{ENV_SH}" >/dev/null 2>&1\n'
+            'mkdir() { echo "mkdir: cannot create directory: Disk quota exceeded" >&2; '
+            'return 1; }\n'
+            'fir_require_run_root /x/y; echo "RC=$?"')
+    check("⛔ CONTROL: a quota error is reported as QUOTA, not an outage",
+          "RC=1" in r4.stdout and "QUOTA/SPACE" in r4.stdout and
+          "NOT A DEFECT IN THIS REPO" not in r4.stdout, r4.stdout)
+
 
 def main():
     for t in (t_syntax, t_nousersite_exported, t_assert_in_venv, t_stage_callsites,
@@ -896,7 +978,8 @@ def main():
               t_final_stage_plan_is_computable_for_every_task,
               t_fir_stage_imports_survive_without_gitignored_data,
               t_fir_stage_selftests_survive_without_gitignored_data,
-              t_a_failing_instrument_selftest_reports_WHY):
+              t_a_failing_instrument_selftest_reports_WHY,
+              t_run_root_is_never_created_unchecked):
         t()
     print(f"selftest: {_P[0]} passed, {_P[1]} failed")
     return 1 if _P[1] else 0

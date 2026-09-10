@@ -435,6 +435,67 @@ _fir_stage_num() {
     esac
 }
 
+# ===========================================================================
+# ⭐ THE RUN ROOT MUST EXIST BEFORE ANYTHING PLANS AGAINST IT.
+# ===========================================================================
+# ⛔⛔ AN UNCHECKED `mkdir -p` ON A NETWORK FILESYSTEM [narval 2026-09-10].
+#   /scratch is Lustre. When the mount dies the client returns
+#       mkdir: cannot create directory '/scratch': Cannot send after transport
+#       endpoint shutdown
+#   and stages 04/05/06 all ran `mkdir -p "$SWEEP_ROOT"/{...}` WITHOUT CHECKING
+#   IT. So the script carried on for another ~80 lines and died on a redirect
+#   into a directory that was never created:
+#       06_baseline.sh: line 184: .../plans/baseline-cola-...txt: Cannot send
+#       after transport endpoint shutdown
+#   Six mkdir errors and a line number, for a CLUSTER OUTAGE that has nothing to
+#   do with this repo. That is the Law 12 failure in its most expensive form: the
+#   operator cannot tell "the filesystem is down" from "you broke the pipeline",
+#   and the natural response to the latter is to ask someone to debug it.
+#
+# ⭐ FAIL AT THE POINT OF FAILURE, AND NAME THE CAUSE. This distinguishes an
+#   unreachable mount from a permission problem from a full quota, because the
+#   remedies could not be more different: WAIT, ask support, or delete files.
+fir_require_run_root() {           # fir_require_run_root <dir>
+    local root="$1"
+    mkdir -p "$root"/{csv,logs,done,fail,started,plans} 2>/tmp/.frr.$$ && {
+        rm -f /tmp/.frr.$$; return 0; }
+    local err; err="$(cat /tmp/.frr.$$ 2>/dev/null)"; rm -f /tmp/.frr.$$
+    echo "⛔⛔ CANNOT CREATE THE RUN ROOT: $root"
+    echo "    $err"
+    # ⛔ WHICH ANCESTOR IS THE PROBLEM. Walk up to the first path that stats.
+    local probe="$root" top=""
+    while [ "$probe" != "/" ] && [ -n "$probe" ]; do
+        if stat "$probe" >/dev/null 2>&1; then top="$probe"; break; fi
+        probe="$(dirname "$probe")"
+    done
+    echo "    deepest ancestor that responds: ${top:-<none, not even />}"
+    case "$err" in
+      *"transport endpoint"*|*"Transport endpoint"*|*"Stale file handle"*|*"No such device"*)
+        echo
+        echo "  ⭐ THIS IS A CLUSTER FILESYSTEM OUTAGE, NOT A DEFECT IN THIS REPO."
+        echo "     'transport endpoint shutdown' is a Lustre client whose mount has"
+        echo "     gone away. Nothing in this tree can create the directory, and"
+        echo "     re-running will fail identically until the mount returns."
+        echo "     ⛔ DO NOT resubmit, and do not change code in response to this."
+        echo "     check:  df -h $top ; ls -ld $(dirname "$root")"
+        echo "     status: https://status.alliancecan.ca/"
+        echo "     ⚠ JOBS ALREADY QUEUED may also fail on I/O. Their fate is in"
+        echo "       slurmdb, which does NOT live on this filesystem:"
+        echo "         sacct -X -u \$USER -S today --format=JobID,JobName%28,State,Elapsed,ExitCode"
+        ;;
+      *"Permission denied"*)
+        echo "  ⭐ A PERMISSION PROBLEM, not an outage. The mount is up."
+        ;;
+      *"Disk quota exceeded"*|*"No space left"*)
+        echo "  ⭐ QUOTA/SPACE, not an outage. Check:  diskusage_report"
+        ;;
+      *)
+        echo "  ⚠ Unrecognised cause -- report the exact text above, it is the receipt."
+        ;;
+    esac
+    return 1
+}
+
 fir_assert_env() {
     # ⛔⛔ THE ENVIRONMENT THIS GATE JUDGES MUST FIRST EXIST. [narval 2026-09-10]
     #   numpy / scipy / pandas / sklearn come from the scipy-stack MODULE through
