@@ -278,8 +278,35 @@ def canary_indices(stage="search"):
       27-29 GB peak. ⚠ ESTIMATE. That is exactly what the canary is for.
     ⛔ AND IT SIZES `--time` PER TASK: the per-task wall spans ~11x in stage 05."""
     cs = cells(stage=stage)
-    mid = LRS[len(LRS) // 2]
     out, seen = [], set()
+
+    # ⛔⛔ THE FINAL STAGE HAS NO LADDER TO BE CENTRAL IN [fixed 2026-09-10].
+    #   The rule below ("middle lr, larger batch") is the right rule for the SEARCH,
+    #   where there are six rungs and an edge one may legitimately collapse. In the
+    #   final stage every cell is at the CARRIED lr, which is whatever the sweep
+    #   returned -- here 1e-05, while LRS[len(LRS)//2] is 3e-05. So the filter
+    #   matched nothing and `canary_indices(stage="final")` returned [] FOR EVERY
+    #   TASK: six `--canary 1` submissions that would have queued zero cells and
+    #   reported no wall-clock, which is precisely the measurement the finals are
+    #   sized from.
+    #   ⚠ It stayed invisible because the selftest's canary checks all ran against
+    #     `cells(stage="search")`, and because the stage's login gate was failing
+    #     earlier (missing modules), so no run ever reached the planner. One defect
+    #     masking another is why the canary checks below now name the stage.
+    if stage == "final":
+        # ⛔ AND IT MUST NOT PICK THE CARRIED WINNER. That cell already has a done
+        #   marker from the search, so the job would skip it and "pass" in seconds
+        #   having measured nothing -- a canary that cannot fail. For the selection
+        #   task the canary is therefore the first seed that is NOT the search seed.
+        shared = {cell_id(c) for c in cells(task=SELECTION_TASK, stage="search")}
+        for i, c in enumerate(cs):
+            if c["task"] in seen or cell_id(c) in shared:
+                continue
+            out.append(i)
+            seen.add(c["task"])
+        return out
+
+    mid = LRS[len(LRS) // 2]
     for i, c in enumerate(cs):
         if c["task"] in seen:
             continue
@@ -533,6 +560,43 @@ def selftest():
     ck(len({cells()[i]["task"] for i in ci}) == len(ci), "canary cells are on DISTINCT tasks")
     ck(all(cells()[i]["lr"] not in (min(LRS), max(LRS)) for i in ci),
        "⛔ canary cells are CENTRAL in lr -- an edge rung may collapse and tell you nothing")
+
+    # ⛔⛔ AND THE SAME QUESTIONS FOR THE **FINAL** STAGE, which is the one that had
+    #   no coverage at all and returned [] for all six tasks. Every check below is
+    #   stage-named, so "the canary works" can never again mean "the search canary
+    #   works".
+    for _lr in LRS:
+        PROXY = (_lr, 32)
+        _fc = cells(stage="final")
+        _fi = canary_indices(stage="final")
+        _ft = {c["task"] for c in _fc}
+        ck(len(_fi) == len(_ft),
+           f"[final proxy={_lr:g}] canary picks ONE cell per task ({len(_fi)} of {len(_ft)})")
+        ck(len(_fi) > 0,
+           f"[final proxy={_lr:g}] ⛔ the final canary is NON-EMPTY -- an empty one "
+           f"submits nothing and measures no wall-clock")
+        ck(len({_fc[i]["task"] for i in _fi}) == len(_fi),
+           f"[final proxy={_lr:g}] final canary cells are on DISTINCT tasks")
+        ck(all(_fc[i]["lr"] == _lr and _fc[i]["batch"] == 32 for i in _fi),
+           f"[final proxy={_lr:g}] ⛔ every final canary cell is AT THE CARRIED "
+           f"operating point -- a canary at another lr times the wrong run")
+        # ⛔ never the cell the search already ran: it would skip and measure nothing
+        _shared = {cell_id(c) for c in cells(task=SELECTION_TASK, stage="search")}
+        ck(all(cell_id(_fc[i]) not in _shared for i in _fi),
+           f"[final proxy={_lr:g}] ⛔ no final canary cell already has a done marker "
+           f"from the search -- that canary could not fail")
+        _mr = [_fc[i] for i in _fi if _fc[i]["task"] == SELECTION_TASK]
+        ck(len(_mr) == 1 and _mr[0]["seed"] != SEARCH_SEED,
+           f"[final proxy={_lr:g}] ⛔ {SELECTION_TASK}'s canary steps off the search "
+           f"seed (got seed {_mr[0]['seed'] if _mr else None})")
+    # ⛔ CONTROL: force the empty state explicitly. Restoring `_saved` here made this
+    #   control assert against the LIVE proxy, so it passed off-cluster (no proxy
+    #   file) and failed on the cluster -- the control had a precondition it did not
+    #   set, which is the same shape of blindness as the check above it.
+    PROXY = ()
+    ck(canary_indices(stage="final") == [],
+       "⛔ CONTROL: with an EMPTY proxy the final canary is empty too -- nothing to size")
+    PROXY = _saved
 
     # one CSV per cell across the WHOLE plan
     # ⛔ ONE CSV PER *DISTINCT* CELL. The carried winner appears in both stages as
