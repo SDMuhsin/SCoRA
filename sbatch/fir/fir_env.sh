@@ -436,6 +436,29 @@ _fir_stage_num() {
 }
 
 fir_assert_env() {
+    # ⛔⛔ THE ENVIRONMENT THIS GATE JUDGES MUST FIRST EXIST. [narval 2026-09-10]
+    #   numpy / scipy / pandas / sklearn come from the scipy-stack MODULE through
+    #   --system-site-packages, NOT from the venv. Called without the modules
+    #   loaded, this function reports
+    #       IMPORT FAILED numpy: ModuleNotFoundError: No module named 'numpy'
+    #       floor imports: MISSING -> numpy, transformers, peft, datasets, ...
+    #   and a completely healthy environment is REFUSED. narval 2026-09-10: three
+    #   stage-06 canaries were refused this way.
+    #
+    #   ⚠⚠ IT HAD WORKED FOR DAYS BY ACCIDENT. `module load` persists for the life
+    #     of a LOGIN SHELL, so every earlier invocation inherited modules from an
+    #     01c/02/03b run in the same terminal. A fresh shell exposed it. State
+    #     carried in the operator's terminal is the worst shape of latent defect:
+    #     it makes the same command succeed and fail with no visible difference.
+    #
+    #   ⭐ FIXED HERE, NOT IN THE CALLERS. 04_hp_sweep, 05_final and 06_baseline all
+    #     called this without loading modules first; 01c and 02 happened to load
+    #     them for their own work. Adding a line to three callers leaves the fourth
+    #     to be written wrong. `module load` is additive and idempotent, so doing it
+    #     here is a no-op on a compute node that already loaded the GPU set.
+    module load $FIR_MODULES_CPU 2>/dev/null || {
+        echo "  ⛔ could not load the CPU modules ($FIR_MODULES_CPU)"; return 1; }
+
     local want="${1:-gpu}" stage="${2:-all}" rc=0
     local _have; _have="$(_fir_stage_num "$stage")"
     [ "$_have" -lt 0 ] && return 1

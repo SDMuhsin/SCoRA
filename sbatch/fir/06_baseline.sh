@@ -293,6 +293,8 @@ if $DRY; then
     echo "--- ⚠ DRY RUN: the login-node environment gate is SKIPPED ---"
 else
 echo "--- login-node gate ---"
+# ⚠ The modules are loaded by fir_assert_env itself -- ONE site, not a line every
+#   caller must remember (04, 05 and 06 all forgot it; see fir_env.sh).
 fir_assert_env cpu 02 || { echo "environment not sane — refusing to submit"; exit 1; }
 fi
 # ⛔⛔ PRINT THE FAILURE, DO NOT JUST NAME IT. [2026-08-30] this line swallowed the
