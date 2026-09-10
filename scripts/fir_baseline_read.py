@@ -106,8 +106,23 @@ def show(run_root):
     return recs, cells
 
 
-def pick(run_root, strict=True):
-    """The winner, with every reason it could be refused stated as a refusal."""
+def pick(run_root, strict=True, batch=None):
+    """The winner, with every reason it could be refused stated as a refusal.
+
+    ⭐ `batch` PINS the batch axis instead of searching it [user decision,
+    2026-09-10]. Batch is fixed a priori EVERYWHERE ELSE in this program --
+    stage 04's grid g2, r305 and r306 all run batch 32 and sweep only lr (and
+    scaling / classifier_lr). Stage 06 is the only sweep that carries a batch
+    axis, because the recipe it copies (Liu et al. 2019 Table 10) sweeps
+    {16, 32}. Its free winner was batch 16 by 0.0047 f1 over batch 32 at the
+    same lr -- a gap 4-8x SMALLER than this family's measured winner's curse of
+    0.02-0.04, on ONE seed. So the axis bought no signal and cost comparability:
+    the baseline row would have run at a different batch from all nine adapter
+    rows. Pinning it restores one batch across the whole table.
+
+    ⛔ The pin is RECORDED IN THE PROXY, not applied silently. A file that says
+    "winner" when a human constrained the search is a file that lies about its
+    own provenance."""
     recs = read_search(run_root)
     cells = H.cells(task=H.SELECTION_TASK, stage="search")
     problems = []
@@ -122,6 +137,15 @@ def pick(run_root, strict=True):
         problems.append(f"⛔ {len(bad_seed)} cell(s) are NOT at the search seed "
                         f"{H.SEARCH_SEED}: {bad_seed[:3]}")
     live = {c: r for c, r in recs.items() if not r["diverged"]}
+    if batch is not None:
+        # ⛔ FAIL CLOSED on a batch that is not a rung: silently selecting from an
+        #   empty subset would hand back "no cells" for a typo.
+        if batch not in H.BATCHES:
+            return None, [f"⛔ --batch {batch} is not a rung of the declared ladder "
+                          f"{H.BATCHES}"]
+        live = {c: r for c, r in live.items() if r["cell"]["batch"] == batch}
+        if not live:
+            return None, [f"⛔ no completed cell at batch {batch}"]
     if not live:
         problems.append("every cell read as NaN — nothing to select from")
     if problems and strict:
@@ -142,15 +166,21 @@ def pick(run_root, strict=True):
     edges = []
     if cell["lr"] in (min(H.LRS), max(H.LRS)):
         edges.append(f"lr {cell['lr']:g} is the {'lowest' if cell['lr'] == min(H.LRS) else 'highest'} rung")
-    if cell["batch"] in (min(H.BATCHES), max(H.BATCHES)):
+    # ⚠ A PINNED AXIS HAS NO EDGE, because it was not searched. Reporting "batch 32
+    #   is the largest rung" when batch was FIXED BY DECISION would invite the
+    #   reader to treat a declared constraint as a search finding -- and the edge
+    #   caveat exists to flag a box that may be in the wrong place, which says
+    #   nothing about an axis nobody moved.
+    if batch is None and cell["batch"] in (min(H.BATCHES), max(H.BATCHES)):
         edges.append(f"batch {cell['batch']} is the {'smallest' if cell['batch'] == min(H.BATCHES) else 'largest'} rung")
     best["edges"] = edges
+    best["batch_pinned"] = batch is not None
     best["cell_id"] = best_id
     return best, problems
 
 
-def write_proxy(run_root, force=False):
-    best, problems = pick(run_root, strict=True)
+def write_proxy(run_root, force=False, batch=None):
+    best, problems = pick(run_root, strict=True, batch=batch)
     if problems:
         print("⛔ REFUSING to write the proxy:")
         for p in problems:
@@ -177,6 +207,17 @@ def write_proxy(run_root, force=False):
         "cell_id": best["cell_id"], "best_epoch": best["best_epoch"],
         "n_cells": len(H.cells(task=H.SELECTION_TASK, stage="search")),
         "edges": best["edges"],
+        # ⭐ THE PROVENANCE OF THE CHOICE, not just the choice. Anyone reading this
+        #   file later must be able to tell a free maximum from a constrained one.
+        "batch_searched": batch is None,
+        "batch_pinned_reason": (None if batch is None else
+                                "[user decision 2026-09-10] batch is fixed a priori "
+                                "everywhere else in this program (stage 04 grid g2, "
+                                "r305, r306 all use batch 32 and sweep only lr); "
+                                "pinning it keeps ONE batch across every row of the "
+                                "table. The free winner was batch 16 by 0.0047 f1 at "
+                                "the same lr -- inside this family's 0.02-0.04 "
+                                "winner's curse, on one seed."),
         "written_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "host": socket.gethostname(), "run_root": run_root,
         "_comment": ("Written by scripts/fir_baseline_read.py from measured CSVs. "
@@ -293,6 +334,60 @@ def selftest():
         ck(best is not None and len(best["edges"]) == 2,
            "⛔ CONTROL: a winner at the corner of the box raises BOTH edge warnings")
 
+    # ═══════════════════════════════════════════════════════════════════════
+    # ⭐ THE PINNED-BATCH PATH [user decision 2026-09-10].
+    #   Built from a SYNTHETIC ladder whose free winner and pinned winner are
+    #   DIFFERENT cells, so "the pin was honoured" cannot pass by coincidence.
+    # ═══════════════════════════════════════════════════════════════════════
+    # ⚠ Reuse the fixture() above -- it writes the CSV SCHEMA read_search actually
+    #   parses (task_name/seed/metric/best_epoch/peak_mem_mib). My first version
+    #   hand-rolled a two-column CSV, every cell read as NaN, and the pin tests
+    #   failed for a reason that had nothing to do with pinning.
+    import tempfile as _tf
+    _rr = _tf.mkdtemp()
+    # bs16 is deliberately BETTER everywhere, so the free argmax is a bs16 cell and
+    # "the pin was honoured" cannot pass by coincidence.
+    _vals = [0.90 + (0.02 if c["batch"] == 16 else 0.0)
+             + (0.005 if c["lr"] == 1e-5 else 0.0) for c in cells]
+    fixture(_rr, cells, _vals)
+    _free, _p1 = pick(_rr)
+    _pin, _p2 = pick(_rr, batch=32)
+    ck(not _p1 and not _p2, f"[pin] the synthetic ladder reads cleanly ({_p1}{_p2})")
+    ck(_free and _free["cell"]["batch"] == 16,
+       "[pin] ⛔ CONTROL: the FREE winner is a bs16 cell (so the pin has work to do)")
+    ck(_pin and _pin["cell"]["batch"] == 32,
+       "[pin] ⭐ --batch 32 returns a bs32 cell, not the free maximum")
+    ck(_pin and _pin["cell"]["lr"] == 1e-5,
+       "[pin] ...and still maximises lr WITHIN the pinned row")
+    ck(_pin and _free and _pin["val"] < _free["val"],
+       "[pin] ⛔ CONTROL: the pinned winner scores LOWER than the free one -- the "
+       "constraint costs something, and the file must not hide that")
+    ck(_pin and not any("batch" in e for e in _pin["edges"]),
+       "[pin] ⭐ a PINNED axis raises no edge warning (it was never searched)")
+    ck(_free and any("batch" in e for e in _free["edges"]),
+       "[pin] ⛔ CONTROL: ...while the SEARCHED axis still does")
+    ck(pick(_rr, batch=8)[0] is None,
+       "[pin] ⛔ CONTROL: a batch that is not a rung FAILS CLOSED, not silently empty")
+    _op = proxy_path()
+    _bak = _op + ".selftest-bak"
+    _had = os.path.exists(_op)
+    if _had:
+        os.rename(_op, _bak)
+    try:
+        _rc = write_proxy(_rr, force=True, batch=32)
+        _pl = json.load(open(_op)) if os.path.exists(_op) else {}
+    finally:
+        if os.path.exists(_op):
+            os.remove(_op)
+        if _had:
+            os.rename(_bak, _op)
+    ck(_rc == 0, "[pin] write_proxy succeeds with a pinned batch")
+    ck(_pl.get("batch") == 32, "[pin] ⭐ the written proxy carries batch 32")
+    ck(_pl.get("batch_searched") is False,
+       "[pin] ⭐ ...and records that the axis was NOT searched")
+    ck(_pl.get("batch_pinned_reason") and "user decision" in _pl["batch_pinned_reason"],
+       "[pin] ⭐ ...and WHY, so a later reader cannot mistake it for a free maximum")
+
     for m in ok:
         print(f"  ✅ {m}")
     for m in bad:
@@ -306,6 +401,9 @@ def main():
     ap.add_argument("--run-root", default=None)
     ap.add_argument("--write-proxy", action="store_true")
     ap.add_argument("--force", action="store_true")
+    ap.add_argument("--batch", type=int, default=None,
+                    help="PIN the batch axis instead of searching it; the pin and "
+                         "its reason are recorded in the proxy")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
     if a.selftest:
@@ -313,16 +411,23 @@ def main():
     if not a.run_root:
         return print("--run-root is required (the stage-06 sweep root)") or 2
     show(a.run_root)
+    if a.batch is not None:
+        print(f"\n⭐ BATCH PINNED TO {a.batch} — this axis is NOT being searched.")
+        print( "   Batch is fixed a priori in every other sweep in this program")
+        print( "   (stage 04 grid g2, r305, r306 all use batch 32). The winner below")
+        print(f"   is the best cell AT batch {a.batch}, not the best cell overall.")
     if a.write_proxy:
-        return write_proxy(a.run_root, force=a.force)
-    best, probs = pick(a.run_root)
+        return write_proxy(a.run_root, force=a.force, batch=a.batch)
+    best, probs = pick(a.run_root, batch=a.batch)
     if probs:
         print("⚠ not ready to write a proxy:")
         for p in probs:
             print(f"   - {p}")
         return 1
-    print(f"WINNER: {best['cell_id']}   {best['metric']}={best['val']:.4f}")
-    print(f"  -> lr {best['cell']['lr']:g}  batch {best['cell']['batch']}")
+    _w = "WINNER AT THE PINNED BATCH" if best.get("batch_pinned") else "WINNER"
+    print(f"{_w}: {best['cell_id']}   {best['metric']}={best['val']:.4f}")
+    print(f"  -> lr {best['cell']['lr']:g}  batch {best['cell']['batch']}"
+          + ("  (batch PINNED, not searched)" if best.get("batch_pinned") else ""))
     if best["edges"]:
         print("  ⚠ ON AN EDGE: " + "; ".join(best["edges"]))
     print("\nwrite it with:  --write-proxy")
