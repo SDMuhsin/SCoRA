@@ -298,6 +298,15 @@ def show():
     ns = len(cells(stage='search'))
     nf = len(cells(stage='final'))
     print(f"  search cells   : {ns}     final cells: {nf}")
+    # ⭐ THE CARRY OVERLAPS THE SWEEP BY EXACTLY ONE CELL, and the operator must see
+    #   it, because it changes both the bill and how one column reads.
+    if PROXY:
+        _ov = {cell_id(c) for c in cells(task=SELECTION_TASK, stage="search")} & \
+              {cell_id(c) for c in cells(stage="final")}
+        for _d in sorted(_ov):
+            print(f"  ⭐ ALREADY RUN     : {_d}")
+            print( "     the sweep's winner IS a final cell (same task/lr/batch/epochs/seed),")
+            print(f"     so {nf-1} of the {nf} final cells are new -- the done marker skips it.")
     print(f"  task   epochs  steps(bs32)  warmup  head")
     for t in tasks():
         print(f"  {t:6} {EPOCHS[t]:6}  {steps(t,32,EPOCHS[t]):11}  "
@@ -318,6 +327,17 @@ def show():
     print( "    out-of-sample columns are what the comparison rests on.")
     print(f"  ⭐ It is still the right selection task: choosing {SELECTION_TASK} gives the")
     print( "    table ONE in-sample column instead of two.")
+    # ⛔ AND ONE CELL OF THAT COLUMN IS THE SELECTED MAXIMUM ITSELF.
+    if PROXY:
+        print(f"\n⛔ {SELECTION_TASK} seed {SEARCH_SEED} IS THE CELL THE PROXY WAS CHOSEN FROM.")
+        print(f"  It was the argmax over {len(cells(task=SELECTION_TASK, stage='search'))} "
+              f"sweep cells, so it carries this family's winner's curse (~0.02-0.04),")
+        print(f"  and it is 1 of {SELECTION_TASK}'s {len(SEEDS)} seeds -- biasing that ONE")
+        print( "  column's mean upward by roughly a fifth of the curse.")
+        print(f"  ⭐ This is NOT an asymmetry against the arms: stage 04 also searched at")
+        print(f"  seed {SEARCH_SEED} and stage 05 also reports seeds {SEEDS}, so every PEFT")
+        print( "  arm carries the same structure in the same column. Re-running the cell")
+        print( "  would NOT remove it -- a fixed seed reproduces its own number.")
 
 
 def selftest():
@@ -381,7 +401,84 @@ def selftest():
     # ids: unique, round-trip, and disjoint from stage 05's
     allc = [c for t in TASKS for st in ("search", "final") for c in cells(task=t, stage=st)]
     ids = [cell_id(c) for c in allc]
-    ck(len(ids) == len(set(ids)), f"{len(ids)} cell ids, all distinct")
+
+    # ⭐⭐ THE SEARCH WINNER IS ALSO A FINAL CELL, AND THAT IS NOT A COLLISION TO FIX.
+    #   [found 2026-09-10 by this very check, ON THE CLUSTER, and only there.]
+    #   The sweep runs mrpc x {lr} x {batch} at seed 42, epochs 20. The final stage
+    #   runs six tasks x five seeds at the CARRIED (lr, batch) -- and 42 is one of
+    #   those five. So the moment the proxy came back as (1e-05, 32), the cell
+    #   `mrpc-base-lr1em05-bs32-ep20-seed42` existed in BOTH stages. It is the same
+    #   task, lr, batch, epochs and seed, so it is not two cells that clash: it is
+    #   ONE run named once. The done-marker protocol then makes the final stage skip
+    #   it, which is correct -- re-running a fixed seed on the same hardware would
+    #   reproduce the number it already has.
+    #
+    #   ⛔ WHY THE OLD CHECK COULD NOT SEE THIS. It asserted global id uniqueness,
+    #     an invariant that only holds while PROXY is empty. Locally there is no
+    #     `baseline_proxy.json`, so `cells(stage="final")` returned [] and the check
+    #     compared 12 ids against 12. It went green for the entire development of
+    #     this stage and fired the first time it ran somewhere the proxy existed.
+    #     A check whose subject is created by a file only the cluster has is a
+    #     check that has not run (FIR_SETUP Law 11).
+    #
+    #   ⛔ WHAT IS ACTUALLY DANGEROUS, and is what is asserted below instead: a
+    #     repeated id whose two cells DIFFER. That would mean one CSV and one done
+    #     marker shared by two different protocols -- the final table would carry a
+    #     row trained under the search's settings with no way to tell from the file.
+    #     So duplicates are permitted ONLY when byte-identical, and only for the one
+    #     cell that the carry makes unavoidable.
+    # ⛔⛔ AND IT IS CHECKED UNDER A PROXY, NOT ONLY UNDER THE LIVE ONE. The reason
+    #   the old check survived development is that `allc` was built once, from
+    #   whatever PROXY happened to be loaded -- which off-cluster is always ().
+    #   So the assertions below run for EVERY ladder value as well as the live
+    #   state, and the duplicate case is therefore exercised on this laptop.
+    global PROXY
+    _live = PROXY
+
+    def _check_ids(tag):
+        _all = [c for t in TASKS for st in ("search", "final") for c in cells(task=t, stage=st)]
+        _ids = [cell_id(c) for c in _all]
+        _dups = sorted({i for i in _ids if _ids.count(i) > 1})
+        ck(len(set(_ids)) == len(_ids) - len(_dups),
+           f"[{tag}] {len(_ids)} cell ids, {len(_dups)} shared by both stages")
+        ck(len(_dups) <= 1,
+           f"[{tag}] ⛔ at most ONE cell can be shared by both stages (got {len(_dups)})")
+        # a carry ALWAYS produces exactly one overlap, because SEARCH_SEED is in SEEDS
+        ck(len(_dups) == (1 if PROXY else 0),
+           f"[{tag}] ⛔ a declared proxy overlaps in EXACTLY one cell, an empty one in none")
+        for d in _dups:
+            group = [c for c in _all if cell_id(c) == d]
+            ck(all(g == group[0] for g in group),
+               f"[{tag}] ⛔ the shared id {d} is ONE run, not two: every field identical")
+            ck(all(cell_cmd(g) == cell_cmd(group[0]) for g in group),
+               f"[{tag}] ⛔ the shared id {d} emits an IDENTICAL command from both stages")
+            ck(all(cell_env(g, "/tmp/x") == cell_env(group[0], "/tmp/x") for g in group),
+               f"[{tag}] ⛔ the shared id {d} emits an IDENTICAL env from both stages")
+            c0 = group[0]
+            ck(c0["task"] == SELECTION_TASK and c0["seed"] == SEARCH_SEED
+               and (c0["lr"], c0["batch"]) == tuple(PROXY),
+               f"[{tag}] ⛔ the only shareable id is the winner on {SELECTION_TASK} at "
+               f"seed {SEARCH_SEED} -- {d} is it")
+        return _dups
+
+    _check_ids("live")
+    # ⭐ every rung of the ladder, so the cluster's shape is covered from here
+    for _lr in LRS:
+        for _b in BATCHES:
+            PROXY = (_lr, _b)
+            _check_ids(f"proxy={_lr:g}/{_b}")
+    PROXY = _live
+    dups = _check_ids("live")
+    # ⛔ CONTROL: the permissive check above must still refuse a REAL clash.
+    _clash = [dict(allc[0]), dict(allc[0])]
+    _clash[1]["lr"] = [x for x in LRS if x != _clash[0]["lr"]][0]
+    _cids = [cell_id(c) for c in _clash]
+    ck(_cids[0] != _cids[1],
+       "⛔ CONTROL: two cells differing only in lr get DIFFERENT ids (the id carries lr)")
+    _same = [dict(allc[0]), dict(allc[0])]
+    _same[1]["epochs"] = _same[0]["epochs"] + 1
+    ck(_same[0] != _same[1] and cell_id(_same[0]) != cell_id(_same[1]),
+       "⛔ CONTROL: a differing-epochs twin is a DIFFERENT id, so it can never share a CSV")
     ck(all(parse_cell_id(i) is not None for i in ids[:20]), "cell ids round-trip")
     try:
         parse_cell_id("mrpc-fftm-q_o-final-ep20-seed42")
@@ -438,8 +535,12 @@ def selftest():
        "⛔ canary cells are CENTRAL in lr -- an edge rung may collapse and tell you nothing")
 
     # one CSV per cell across the WHOLE plan
+    # ⛔ ONE CSV PER *DISTINCT* CELL. The carried winner appears in both stages as
+    #   the same run, so the right count is distinct ids, not list length -- see the
+    #   duplicate block above for why this is safe and what would not be.
     seen = {cell_env(c, "/tmp/x")["GLUE_RESULTS_FILE"] for c in allc}
-    ck(len(seen) == len(allc), f"the {len(allc)} cells map to {len(seen)} distinct CSVs")
+    ck(len(seen) == len(set(ids)),
+       f"the {len(allc)} cells ({len(set(ids))} distinct) map to {len(seen)} distinct CSVs")
 
     for l in ok:
         print(f"  ✅ {l}")
