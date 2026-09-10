@@ -102,7 +102,7 @@ if [ "$GRID_NAME" = "all" ] && [ -z "$LOCAL_ONE" ] && ! $STATUS; then
     exit 1
 fi
 SWEEP_ROOT="$FIR_RUN_ROOT/final"
-mkdir -p "$SWEEP_ROOT"/{csv,logs,done,fail,started,plans}
+fir_require_run_root "$SWEEP_ROOT" || exit 1
 
 # ⛔⛔ THE CELL LIST IS A PER-SUBMISSION SNAPSHOT, NOT A SHARED FILE. [2026-08-28]
 #   It used to be ONE `$SWEEP_ROOT/cells.txt`, rewritten by every submit. Five
