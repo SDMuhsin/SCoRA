@@ -456,8 +456,24 @@ fir_assert_env() {
     #     them for their own work. Adding a line to three callers leaves the fourth
     #     to be written wrong. `module load` is additive and idempotent, so doing it
     #     here is a no-op on a compute node that already loaded the GPU set.
-    module load $FIR_MODULES_CPU 2>/dev/null || {
-        echo "  ⛔ could not load the CPU modules ($FIR_MODULES_CPU)"; return 1; }
+    #   ⚠ AND IT MUST NOT MAKE THIS FUNCTION UN-TESTABLE OFF-CLUSTER. The first
+    #     version of this fix ran `module load` unconditionally and refused when it
+    #     failed -- which on any machine WITHOUT Lmod (a laptop, CI) meant
+    #     fir_assert_env returned 1 before reaching a single real check, and
+    #     sigill_surface_gate's "the entry-point check reaches train_glue" went red.
+    #     Repairing a cluster-only blindness by creating a laptop-only blindness is
+    #     not progress; it is the same defect pointed the other way (Law 11).
+    #   ⭐ So: Lmod PRESENT and the load FAILS is fatal (that is the narval case this
+    #     exists for). Lmod ABSENT is not a cluster at all -- say so and carry on,
+    #     because the floor-import check below is the REAL receipt either way. It is
+    #     what actually catches a missing numpy; the module load is only the means.
+    if command -v module >/dev/null 2>&1; then
+        module load $FIR_MODULES_CPU 2>/dev/null || {
+            echo "  ⛔ could not load the CPU modules ($FIR_MODULES_CPU)"; return 1; }
+    else
+        echo "  (no Lmod on this host -- not a cluster; skipping the module load."
+        echo "   the floor-import check below is the receipt, and it still applies)"
+    fi
 
     local want="${1:-gpu}" stage="${2:-all}" rc=0
     local _have; _have="$(_fir_stage_num "$stage")"
