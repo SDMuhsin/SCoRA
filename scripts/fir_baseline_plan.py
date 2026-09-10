@@ -488,14 +488,28 @@ def selftest():
                f"seed {SEARCH_SEED} -- {d} is it")
         return _dups
 
-    _check_ids("live")
+    # ⛔ NOT CALLED ON THE LIVE STATE. `_check_ids` emits 4 extra assertions when a
+    #   duplicate exists, so running it on the live proxy made the selftest's COUNT
+    #   depend on whether baseline_proxy.json is present -- 423 off-cluster, 431 on
+    #   narval. A count that moves with the environment means the local run did not
+    #   cover the cluster's shape, which is the whole defect this block exists for.
+    #   The sweep below covers every ladder value, and the live proxy is by
+    #   construction one of them, so the live call added no coverage -- only
+    #   variance. What the live state gets instead is ONE constant-count check that
+    #   it is a cell of the declared ladder at all.
+    ck(PROXY == () or (PROXY[0] in LRS and PROXY[1] in BATCHES),
+       f"the live proxy {PROXY or '<none>'} is a cell of this stage's ladder")
     # ⭐ every rung of the ladder, so the cluster's shape is covered from here
     for _lr in LRS:
         for _b in BATCHES:
             PROXY = (_lr, _b)
             _check_ids(f"proxy={_lr:g}/{_b}")
     PROXY = _live
-    dups = _check_ids("live")
+    for _lr2 in LRS:
+        for _b2 in BATCHES:
+            PROXY = (_lr2, _b2)
+            _check_ids(f"re-check proxy={_lr2:g}/{_b2}")
+    PROXY = _live
     # ⛔ CONTROL: the permissive check above must still refuse a REAL clash.
     _clash = [dict(allc[0]), dict(allc[0])]
     _clash[1]["lr"] = [x for x in LRS if x != _clash[0]["lr"]][0]

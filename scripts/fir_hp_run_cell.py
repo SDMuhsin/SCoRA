@@ -31,6 +31,41 @@ PLANNERS = {"hp": "fir_hp_plan", "final": "fir_final_plan",
             "baseline": "fir_baseline_plan"}
 
 
+def _pinned_first_cell(m, label):
+    """⛔⛔ PIN THE PLANNER'S VIEW ON THE MODULE, NOT THROUGH os.environ.
+
+    [narval 2026-09-10] This selftest set os.environ["FIR_BASE_TASK"]="mrpc"
+    AFTER calling _planner(), which is `__import__` -- and a planner reads
+    TASK_NAME at IMPORT time. So the override never took effect. It only ever
+    worked because the ambient default happens to be "all"; the moment the
+    cluster ran the stage as FIR_BASE_TASK=rte (which is how every submission
+    is made) the baseline planner's search view was EMPTY and `cells()[0]`
+    raised IndexError -- an uncaught traceback, not a named check.
+
+    ⭐ Setting the attribute is immune to import order, so the test states the
+      view it needs instead of hoping the environment supplies it.
+    ⛔ AND IT NEVER INDEXES BLIND. An empty plan is a NAMED failure that says
+      which module and which view produced it; `cells()[0]` on an empty list
+      tells the operator nothing.
+    """
+    saved = {}
+    if hasattr(m, "TASK_NAME"):
+        saved["TASK_NAME"] = m.TASK_NAME
+        m.TASK_NAME = m.SELECTION_TASK if hasattr(m, "SELECTION_TASK") else "mrpc"
+    try:
+        cs = m.cells()
+        if not cs:
+            view = getattr(m, "TASK_NAME", "<no TASK_NAME>")
+            raise SystemExit(
+                f"FAIL CLOSED: {label} planner produced ZERO cells under view "
+                f"{view!r}. The test must PIN the view it needs; it must never "
+                f"depend on the FIR_BASE_TASK the operator happened to export.")
+        return cs[0]
+    finally:
+        for k, v in saved.items():
+            setattr(m, k, v)
+
+
 def _planner(name):
     if name not in PLANNERS:
         raise SystemExit(f"FAIL CLOSED: --planner must be one of {sorted(PLANNERS)}")
@@ -409,14 +444,8 @@ def selftest():
     _INTERP = ("python", "python3", "python3.10", "python3.11", "env/bin/python")
     for _name in ("hp", "final", "baseline"):
         _m = _planner(_name)
-        _env0 = dict(os.environ)
-        if _name == "baseline":
-            os.environ["FIR_BASE_TASK"] = "mrpc"
-        try:
-            _c0 = _m.cells()[0]
-            _cmd0 = _m.cell_cmd(_c0)
-        finally:
-            os.environ.clear(); os.environ.update(_env0)
+        _c0 = _pinned_first_cell(_m, _name)
+        _cmd0 = _m.cell_cmd(_c0)
         ck(_cmd0[0].endswith(".py"),
            f"[invocation] {_name}: cell_cmd starts with a SCRIPT, not an interpreter "
            f"(got {_cmd0[0]!r})")
@@ -436,16 +465,16 @@ def selftest():
     with open(_stub, "w") as _f:
         _f.write("#!/bin/bash\nprintf '%s\\n' \"$@\" > " + _argv_f + "\nexit 0\n")
     os.chmod(_stub, 0o755)
-    _env0 = dict(os.environ)
-    os.environ["FIR_BASE_TASK"] = "mrpc"
+    _B = _planner("baseline")
+    _saved_view = _B.TASK_NAME
+    _B.TASK_NAME = _B.SELECTION_TASK
     try:
-        _B = _planner("baseline")
-        _cid = _B.cell_id(_B.cells()[0])
+        _cid = _B.cell_id(_pinned_first_cell(_B, "baseline"))
         _rr = os.path.join(_td, "rr")
         _rc = run(_cid, _rr, python=_stub, planner="baseline")
         _argv = open(_argv_f).read().splitlines() if os.path.exists(_argv_f) else []
     finally:
-        os.environ.clear(); os.environ.update(_env0)
+        _B.TASK_NAME = _saved_view
     ck(bool(_argv), "[invocation] ⭐ the stub interpreter was actually invoked")
     ck(_argv[:1] == ["src/train_glue.py"] if _argv else False,
        f"[invocation] ⭐ the interpreter's FIRST argument is the script "
