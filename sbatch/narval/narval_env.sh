@@ -302,10 +302,11 @@ narval_warn_wall_clock() {
     #   ⛔ The shared default is 02:00:00, and [predicted] an sst2 cell is ~3.1 h and
     #     a qnli cell ~2.9 h. So the DEFAULT SILENTLY KILLS the two most expensive
     #     canaries. This warns before the submission rather than after the queue.
-    #   ⚠ IT IS A WARNING, NOT A BLOCK, AND THE NUMBER IS A PREDICTION. It is scaled
-    #     from ONE measured A40 cell across a GPU change, and this repo has been
-    #     wrong doing exactly that (a WaveFT cell predicted at 1.7x a FourierFT one;
-    #     [measured] 1.03x). ⭐ The canary's own MAX is what sizes the real array.
+    #   ⚠ IT IS A WARNING, NOT A BLOCK, AND THE NUMBER IS STILL A PREDICTION -- now
+    #     from rates MEASURED ON NARVAL (0.514 s/step, 0.0213 s/dev-example) rather
+    #     than scaled off an A40. That removes a 2x systematic error, not the
+    #     uncertainty: this repo predicted a WaveFT cell at 1.7x a FourierFT one and
+    #     measured 1.03x. ⭐ The canary's own MAX is what sizes the real array.
     #     narval's 7-day limit means over-asking costs queue priority, not a refusal.
     _want_s=$(env/bin/python - <<'PYW' 2>/dev/null || echo ""
 import os, sys
@@ -314,8 +315,23 @@ import fir_plan as FP, fir_baseline_plan as H
 t = os.environ.get("FIR_BASE_TASK", "")
 if t not in H.TASKS:
     raise SystemExit
-SEC_PER_EX_EPOCH = 121.26 / FP.sizes()["mrpc"]["train"]   # [measured] A40, fused+ckpt
-print(int(SEC_PER_EX_EPOCH * FP.sizes()[t]["train"] * H.EPOCHS[t]))
+# ⭐ MEASURED ON NARVAL, 2026-09-10, not scaled from the dev box.
+#   Receipt: mrpc bs32 20 epochs = 2,300 steps, train 1,182 s, whole cell 1,416 s
+#   (job 2712033, A100-SXM4-40GB, fused AdamW + gradient checkpointing, len 128).
+#     -> 0.514 s/step  and  (1416-1182-60)/(20*408) = 0.0213 s per dev example
+#   ⛔ The old model was `121.26 s/epoch on an A40` scaled by train examples, which
+#     (a) carried a number measured on a DIFFERENT GPU -- narval is 2.05x faster,
+#     so every prediction was ~2x too high and the warning fired on walls that were
+#     already generous (cola 01:30 and sst2/qnli 04:00 were all flagged), and
+#     (b) MODELLED NO EVALUATION AT ALL. stsb evaluates 1,500 dev examples x 15
+#     epochs = 22,500 -- more dev work than training steps -- so an eval-blind
+#     model is wrong in a task-dependent direction, not by a constant factor.
+S_PER_STEP = float(os.environ.get("LRS_S_PER_STEP", "0.514"))
+S_PER_DEV_EX = float(os.environ.get("LRS_S_PER_DEV_EX", "0.0213"))
+LOAD_S = 60
+sz, ep = FP.sizes()[t], H.EPOCHS[t]
+steps = H.steps(t, H.PROXY[1] if getattr(H, "PROXY", None) else 32, ep)
+print(int(steps * S_PER_STEP + ep * sz["eval"] * S_PER_DEV_EX + LOAD_S))
 PYW
 )
     if [ -n "${_want_s:-}" ]; then
@@ -326,7 +342,7 @@ PYW
         done
         _wall_s=$(echo "$_hhmmss" | awk -F: '{n=NF; s=0; for(i=1;i<=n;i++) s=s*60+$i; print s}')
         echo "--- wall-clock sanity for task '${FIR_BASE_TASK:-?}' ---"
-        printf "  requested --time %s = %s s ; [PREDICTED, A40] this cell ~%s s\n" \
+        printf "  requested --time %s = %s s ; [PREDICTED from NARVAL-measured rates] this cell ~%s s\n" \
                "$_hhmmss" "$_wall_s" "$_want_s"
         if [ "$_wall_s" -lt $((_want_s * 2)) ] 2>/dev/null; then
             echo "  ⚠⚠ THE WALL IS UNDER 2x THE PREDICTED COST."
