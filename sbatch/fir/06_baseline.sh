@@ -267,7 +267,14 @@ if $STATUS; then
     done
     echo "--- collected $n_c file(s) into $COLLECT (scp ./logs as usual) ---"
     echo
-    echo "read: (stage 06 has no dedicated reader yet -- csv/ holds one file per cell)"
+    # ⚠ This line said "stage 06 has no dedicated reader yet" long after
+    #   scripts/fir_baseline_read.py existed. A stale pointer sends the reader to
+    #   hand-parse csv/ and, worse, invites hand-picking the winner -- which is the
+    #   one step of this stage that must be mechanical.
+    echo "read the ladder (do NOT hand-pick the winner):"
+    echo "  FIR_BASE_TASK=$FIR_BASE_TASK LRS_STAGE_DIR=$LRS_STAGE_DIR \\"
+    echo "    $FIR_VENV/bin/python scripts/fir_baseline_read.py --run-root $SWEEP_ROOT"
+    echo "then, once it reads cleanly, freeze it:  ...same command... --write-proxy"
     exit 0
 fi
 
