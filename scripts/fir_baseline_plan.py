@@ -302,9 +302,22 @@ def show():
     for t in tasks():
         print(f"  {t:6} {EPOCHS[t]:6}  {steps(t,32,EPOCHS[t]):11}  "
               f"{warmup(t,32,EPOCHS[t]):6}")
-    print("\n⚠ MRPC is IN-SAMPLE for stage 05's PEFT arms (their HPs were selected on")
-    print("  it). This baseline is tuned per task, so MRPC is not in-sample FOR IT --")
-    print("  ⛔ but the column still cannot be read as a like-for-like comparison.")
+    # ⛔⛔ THIS CAVEAT WAS STALE AND POINTED THE WRONG WAY [corrected 2026-09-10].
+    #   It said "this baseline is tuned per task, so MRPC is not in-sample FOR IT",
+    #   which described the SUPERSEDED design (a sweep per task). The current design
+    #   sweeps MRPC ONLY and carries the winner unchanged to all six columns, so
+    #   MRPC is in-sample for the baseline TOO. The correction makes the warning
+    #   STRONGER, not weaker -- which is why a stale caveat is worse than none: it
+    #   understated the one thing a reader must not miss.
+    print(f"\n⛔⛔ {SELECTION_TASK.upper()} IS IN-SAMPLE ON BOTH SIDES OF THIS COMPARISON.")
+    print(f"  * stage 05's PEFT arms had their HPs selected on {SELECTION_TASK}.")
+    print(f"  * this baseline's HPs are selected on {SELECTION_TASK} too (one sweep,")
+    print(f"    carried unchanged to every column -- see --write-proxy).")
+    print(f"  ⇒ {SELECTION_TASK} is the ONE column where NEITHER side is held out, so it")
+    print( "    is the weakest evidence in the table, not the strongest. The")
+    print( "    out-of-sample columns are what the comparison rests on.")
+    print(f"  ⭐ It is still the right selection task: choosing {SELECTION_TASK} gives the")
+    print( "    table ONE in-sample column instead of two.")
 
 
 def selftest():
@@ -321,6 +334,26 @@ def selftest():
     ck(EPOCHS == {"rte": 20, "mrpc": 20, "stsb": 15, "cola": 12, "sst2": 5, "qnli": 3},
        "epochs are stage 05's own, per task -- the row must be comparable to it")
     ck(SEEDS == [42, 43, 44, 45, 46], "stage 05's seeds, unchanged")
+
+    # ⛔ THE IN-SAMPLE CAVEAT MUST DESCRIBE THE DESIGN THAT IS ACTUALLY RUNNING.
+    #   [2026-09-10] It claimed "this baseline is tuned per task", left over from
+    #   the superseded per-task-sweep design, and therefore told the reader MRPC was
+    #   NOT in-sample for the baseline -- the opposite of the truth under a single
+    #   carried proxy. A caveat that is wrong in the reassuring direction is worse
+    #   than no caveat.
+    import io as _io, contextlib as _cl
+    _buf = _io.StringIO()
+    with _cl.redirect_stdout(_buf):
+        show()
+    _sum = _buf.getvalue()
+    ck("tuned per task" not in _sum,
+       "[caveat] ⛔ the superseded 'tuned per task' claim is gone")
+    ck("IS IN-SAMPLE ON BOTH SIDES" in _sum,
+       "[caveat] ⭐ the summary says the selection task is in-sample on BOTH sides")
+    ck("NEITHER side is held out" in _sum,
+       "[caveat] ...and that it is the weakest column, not the strongest")
+    ck(SELECTION_TASK.upper() in _sum,
+       f"[caveat] ...and it names the actual selection task ({SELECTION_TASK})")
 
     for t in TASKS:
         c = {"arm": ARM, "task": t, "lr": 2e-5, "batch": 32,
