@@ -26,7 +26,7 @@ run on this CPU, unless running it IS the question being asked.
 
    Run:  python3 scripts/sigill_surface_gate.py
 """
-import os, re, subprocess, sys, tempfile, textwrap, pathlib
+import os, re, subprocess, sys, tempfile, textwrap, pathlib, importlib.util
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 _ok, _bad = [], []
@@ -148,16 +148,31 @@ def t_assert_in_venv_survives():
 
         # ⛔ BOTH DIRECTIONS: a genuinely absent package must still FAIL, or the
         #   fix has simply disabled the check.
+        # ⛔ THE "ABSENT" PACKAGE MUST BE ABSENT FROM THE *INTERPRETER*, NOT JUST THE
+        #   STUB DIR [fixed 2026-09-10]. This used to drop galore_torch from the stub
+        #   dir and assert the NOT INSTALLED branch. But the fake venv's bin/python
+        #   IS the real interpreter, so the repo venv's site-packages is still on
+        #   sys.path and find_spec located the REAL galore_torch -- assert_in_venv
+        #   correctly reported "resolves OUTSIDE the venv" (a different, also-correct
+        #   failure) and the message assertion went red on any machine that happens
+        #   to have the package installed. The check was asserting a message its own
+        #   fixture could not produce. A name nothing can provide fixes it, and the
+        #   outside-the-venv case has its own check below.
+        _ABSENT = "zzz_absent_pkg_for_gate"
         venv2, stub2, _l2 = make_sigill_env(tempfile.mkdtemp(),
                                             absent=("galore_torch",))
         body2 = (f'{fn}\nVPY="{venv2}/bin/python"\nFIR_VENV_REAL="{stub2}"\n'
-                 'assert_in_venv "requirements.txt" "adapters galore_torch lion_pytorch"\n'
+                 f'assert_in_venv "requirements.txt" "adapters {_ABSENT} lion_pytorch"\n'
                  'echo "RC=$?"')
         r2 = run(body2)
         check("⛔ CONTROL: a genuinely ABSENT package still FAILS the check",
               "RC=0" not in r2.stdout, r2.stdout + r2.stderr)
         check("...and says it is not installed, naming it",
-              "galore_torch" in r2.stdout and "NOT INSTALLED" in r2.stdout, r2.stdout)
+              _ABSENT in r2.stdout and "NOT INSTALLED" in r2.stdout, r2.stdout)
+        # ⛔ CONTROL: and the fixture really is absent everywhere, so the check above
+        #   cannot pass for the wrong reason on some other machine.
+        check("⛔ CONTROL: the fixture package is absent from the real interpreter too",
+              importlib.util.find_spec(_ABSENT) is None, _ABSENT)
 
         # ⛔ AND the shadowing case the check exists for: present, but OUTSIDE the venv.
         other = tempfile.mkdtemp()
