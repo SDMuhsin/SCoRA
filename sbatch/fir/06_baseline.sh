@@ -213,12 +213,45 @@ if $STATUS; then
     echo "cells: $TOTAL   done: $NDONE   failed: $NFAIL   remaining: $((TOTAL - NDONE))"
     [ "$NOTHER" -gt 0 ] && echo "  (+$NOTHER done markers from OTHER TASKS in this root -- not counted above)"
     if [ "$NDONE" -gt 0 ]; then
-        echo "--- measured per-cell wall-clock (seconds, EVERY grid in this root) ---"
-        cat "$SWEEP_ROOT"/done/* 2>/dev/null | sort -n | awk '
+        # ⛔⛔ THE STATISTIC MUST BE PER TASK, BECAUSE --time IS PER ARRAY.
+        #   [narval 2026-09-11] This printed ONE pooled summary over every cell in
+        #   the root and told the operator to "size --time from the MAX". With 12
+        #   mrpc search cells, one rte canary and one mrpc canary in the root, that
+        #   max was 1958 s -- an MRPC number. Sizing rte from it merely wastes
+        #   priority; sizing SST-2 from it is a HARD KILL at roughly a quarter of
+        #   the cell, and the loss is silent until --status shows a `started` with
+        #   no `done`. The per-task wall in this stage spans ~6x, which is the very
+        #   reason this stage submits one array per task.
+        #   ⚠ The pooled line is kept, because a cross-task view is how you notice
+        #     a node that is uniformly slow -- but it is labelled as NOT for sizing.
+        echo "--- measured per-cell wall-clock, PER TASK (seconds) ---"
+        for _t in $(ls "$SWEEP_ROOT/done" 2>/dev/null | sed 's/-.*//' | sort -u); do
+            # ⛔ `awk FNR==1`, NOT `cat`. A done marker with no trailing newline
+            #   makes `cat` CONCATENATE it with the next file -- two cells of 1518
+            #   and 1958 become 15181958, which then sizes --time. Today the writer
+            #   is `echo` so they all end in a newline, but a truncated or
+            #   hand-made marker must not be able to produce a nonsense wall.
+            #   awk ends a record at EOF, so it reads each file's first field
+            #   correctly either way.
+            awk 'FNR==1{print $1+0}' "$SWEEP_ROOT"/done/"$_t"-* 2>/dev/null | sort -n | awk -v t="$_t" '
+                {a[NR]=$1}
+                END {if (NR) {
+                     # ⭐ SUGGEST A WALL FROM THE MEASUREMENT: 2x the max, floored at
+                     #   30 min and rounded UP to the next 15 min. 2x is not padding
+                     #   for its own sake -- the SAME config at a different seed has
+                     #   been measured 25-38% apart on this cluster (node variation),
+                     #   and --time is a hard kill with no partial credit.
+                     w = a[NR] * 2; if (w < 1800) w = 1800
+                     w = int((w + 899) / 900) * 900
+                     printf "  %-5s n=%-3d min=%-6d median=%-6d max=%-6d  => --time %02d:%02d:%02d\n",
+                            t, NR, a[1], a[int((NR+1)/2)], a[NR],
+                            int(w/3600), int((w%3600)/60), w%60}}'
+        done
+        echo "  ⚠ size --time from THIS TASK'S MAX. A max from another task is not"
+        echo "    a measurement of this one -- the per-task wall here spans ~6x."
+        awk 'FNR==1{print $1+0}' "$SWEEP_ROOT"/done/* 2>/dev/null | sort -n | awk '
             {a[NR]=$1; s+=$1}
-            END {printf "  n=%d  min=%d  median=%d  max=%d  mean=%.0f\n",
-                        NR, a[1], a[int((NR+1)/2)], a[NR], s/NR}'
-        echo "  ⚠ size --time from the MAX, not the median: --time is a hard kill."
+            END {printf "  (pooled over ALL tasks -- for spotting a slow node, NOT for sizing: n=%d min=%d median=%d max=%d mean=%.0f)\n", NR, a[1], a[int((NR+1)/2)], a[NR], s/NR}'
     fi
     if [ "$NFAIL" -gt 0 ]; then
         echo "--- failures (exit != 0, or a receipt check that refused the cell) ---"
