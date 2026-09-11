@@ -967,6 +967,66 @@ def t_run_root_is_never_created_unchecked():
           "RC=1" in r4.stdout and "QUOTA/SPACE" in r4.stdout and
           "NOT A DEFECT IN THIS REPO" not in r4.stdout, r4.stdout)
 
+# --------------------------------------------------------------------------
+def t_baseline_status_sizes_per_task():
+    """⭐ 06's --status must report wall-clock PER TASK, because --time is per array.
+
+    ⛔⛔ [narval 2026-09-11] It printed ONE pooled summary over every cell in the
+      root and said "size --time from the MAX". The root legitimately holds 12
+      mrpc search cells plus one canary per task, so that max was an MRPC number
+      (1958 s). Sizing rte from it only wastes priority. Sizing SST-2 from it is a
+      HARD KILL at roughly a quarter of the cell -- and a killed cell writes no
+      fail marker, so it is invisible until --status shows a `started` with no
+      `done`. The per-task wall in this stage spans ~6x; that is the entire reason
+      the stage submits one array per task.
+    """
+    print("\n--- 06 --status sizes each task from its OWN cells ---")
+    tmp = tempfile.mkdtemp()
+    root = os.path.join(tmp, "runs", "baseline")
+    for d in ("csv", "logs", "done", "fail", "started", "plans"):
+        os.makedirs(os.path.join(root, d))
+    # a SHORT task and a LONG task in one root -- the shape that made this wrong
+    # ⛔ THE LAST ONE HAS NO TRAILING NEWLINE, ON PURPOSE. `cat` would glue it to
+    #   the next file and turn 1518 + 1958 into 15181958 -- a nonsense wall built
+    #   from two real cells. The marker writer uses `echo` today, so this is the
+    #   control that the reader cannot be broken by a truncated one.
+    for i, v in enumerate([1205, 1518]):
+        open(os.path.join(root, "done",
+                          f"mrpc-base-lr1em05-bs32-ep20-seed4{i}"), "w").write(f"{v}\n")
+    open(os.path.join(root, "done",
+                      "mrpc-base-lr1em05-bs32-ep20-seed42"), "w").write("1958")
+    open(os.path.join(root, "done",
+                      "sst2-base-lr1em05-bs32-ep5-seed42"), "w").write("8123\n")
+    r = sh('bash sbatch/fir/06_baseline.sh --status',
+           env={"FIR_SCRATCH_ROOT": tmp, "FIR_LOGGING": "1", "FIR_BASE_TASK": "all",
+                "FIR_COLLECT_DIR": os.path.join(tmp, "collected")})
+    out = r.stdout + r.stderr
+    check("06 --status runs", "run root:" in out, out[-600:])
+    check("⭐ a PER-TASK line exists for mrpc",
+          re.search(r"^\s*mrpc\s+n=3\b", out, re.M), out)
+    check("⭐ ...and for sst2", re.search(r"^\s*sst2\s+n=1\b", out, re.M), out)
+    check("⭐ each task's max is its OWN, not the pool's",
+          re.search(r"^\s*mrpc\s+.*max=1958", out, re.M)
+          and re.search(r"^\s*sst2\s+.*max=8123", out, re.M), out)
+
+    # ⛔ THE ASSERTION THAT MATTERS: the suggested wall for the LONG task must
+    #   exceed its own measurement, not the short task's.
+    m = re.search(r"^\s*sst2\s+.*=> --time (\d+):(\d+):(\d+)", out, re.M)
+    check("⭐ sst2 gets a suggested --time", m, out)
+    if m:
+        secs = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
+        check("⛔ sst2's suggested wall is >= 2x ITS OWN max (not mrpc's)",
+              secs >= 2 * 8123, f"{secs}s vs 2*8123={2*8123}s")
+    m2 = re.search(r"^\s*mrpc\s+.*=> --time (\d+):(\d+):(\d+)", out, re.M)
+    if m2:
+        secs2 = int(m2.group(1)) * 3600 + int(m2.group(2)) * 60 + int(m2.group(3))
+        check("⛔ CONTROL: ...and mrpc's is sized from mrpc, so it is much SMALLER",
+              secs2 < secs if m else False, f"mrpc={secs2}s")
+    check("⭐ the pooled line is explicitly NOT for sizing",
+          "NOT for sizing" in out, out)
+    check("⭐ ...and the warning names THIS TASK'S max",
+          "THIS TASK'S MAX" in out, out)
+
 
 def main():
     for t in (t_syntax, t_nousersite_exported, t_assert_in_venv, t_stage_callsites,
@@ -979,7 +1039,8 @@ def main():
               t_fir_stage_imports_survive_without_gitignored_data,
               t_fir_stage_selftests_survive_without_gitignored_data,
               t_a_failing_instrument_selftest_reports_WHY,
-              t_run_root_is_never_created_unchecked):
+              t_run_root_is_never_created_unchecked,
+              t_baseline_status_sizes_per_task):
         t()
     print(f"selftest: {_P[0]} passed, {_P[1]} failed")
     return 1 if _P[1] else 0
