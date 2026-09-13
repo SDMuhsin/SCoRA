@@ -1015,8 +1015,12 @@ def t_baseline_status_sizes_per_task():
     check("⭐ sst2 gets a suggested --time", m, out)
     if m:
         secs = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
-        check("⛔ sst2's suggested wall is >= 2x ITS OWN max (not mrpc's)",
-              secs >= 2 * 8123, f"{secs}s vs 2*8123={2*8123}s")
+        # ⛔ 3x, NOT 2x [raised 2026-09-13]. 2x killed nine cells on narval: a
+        #   canary runs ALONE and an array does not, so the canary is a LOWER BOUND
+        #   on the per-cell time the array sees, not an estimate of it. Pin the
+        #   multiplier, or a silent revert to 2x would pass this check.
+        check("⛔ sst2's suggested wall is >= 3x ITS OWN max (not mrpc's)",
+              secs >= 3 * 8123, f"{secs}s vs 3*8123={3*8123}s")
     m2 = re.search(r"^\s*mrpc\s+.*=> --time (\d+):(\d+):(\d+)", out, re.M)
     if m2:
         secs2 = int(m2.group(1)) * 3600 + int(m2.group(2)) * 60 + int(m2.group(3))
@@ -1026,6 +1030,13 @@ def t_baseline_status_sizes_per_task():
           "NOT for sizing" in out, out)
     check("⭐ ...and the warning names THIS TASK'S max",
           "THIS TASK'S MAX" in out, out)
+    # ⛔ AND IT MUST SAY THE SUGGESTION IS A FLOOR. Nine cells died because the
+    #   number was read as a forecast; a bare multiplier with no warning invites
+    #   exactly that reading again.
+    check("⭐ the suggestion is declared a FLOOR, not a forecast",
+          "FLOOR, NOT A FORECAST" in out, out)
+    check("⭐ ...and names the contention cause (a canary runs alone)",
+          "runs ALONE" in out and "--concurrent" in out, out)
 
 
 def main():

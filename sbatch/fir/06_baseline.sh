@@ -236,12 +236,31 @@ if $STATUS; then
             awk 'FNR==1{print $1+0}' "$SWEEP_ROOT"/done/"$_t"-* 2>/dev/null | sort -n | awk -v t="$_t" '
                 {a[NR]=$1}
                 END {if (NR) {
-                     # ⭐ SUGGEST A WALL FROM THE MEASUREMENT: 2x the max, floored at
-                     #   30 min and rounded UP to the next 15 min. 2x is not padding
-                     #   for its own sake -- the SAME config at a different seed has
-                     #   been measured 25-38% apart on this cluster (node variation),
-                     #   and --time is a hard kill with no partial credit.
-                     w = a[NR] * 2; if (w < 1800) w = 1800
+                     # ⭐ SUGGEST A WALL FROM THE MEASUREMENT: 3x the max, floored at
+                     #   30 min and rounded UP to the next 15 min.
+                     # ⛔⛔ IT WAS 2x, AND 2x KILLED NINE CELLS [narval 2026-09-13].
+                     #   cola/rte/stsb arrays were sized at 2.20x / 2.48x / 2.49x their
+                     #   canary and ALL of cola (4), ALL of rte (4) and one stsb cell
+                     #   hit the wall. The outcome was BIMODAL, which is the tell: every
+                     #   cell that finished ran at 0.73-0.96x its canary, every cell that
+                     #   died ran past 2.2x. A 25-38% spread cannot produce that; two
+                     #   regimes can.
+                     #   ⭐ THE CAUSE IS THAT A CANARY IS MEASURED ALONE AND AN ARRAY IS
+                     #     NOT. cola, rte and stsb were submitted within 33 minutes --
+                     #     12 concurrent cells -- and the three arrays that went in later
+                     #     and spread out (mrpc, sst2, qnli) completed at 0.73-0.96x.
+                     #     the surviving stsb three finished at 0.96x, almost certainly
+                     #     after cola and rte were killed and freed the cluster. So the
+                     #     canary measures the WRONG REGIME: it is a lower bound on the
+                     #     per-cell time an array will see, not an estimate of it.
+                     #   ⚠ 3x is NOT KNOWN TO BE ENOUGH. The killed cells were killed, so
+                     #     their true duration was never measured -- all we know is
+                     #     ">2.5x". 3x is the smallest multiplier consistent with the
+                     #     evidence, not a validated ceiling. The durable fix is to
+                     #     submit fewer cells at once, which is why the note below says
+                     #     so; --time is a hard kill with no partial credit, and a wall
+                     #     that is too generous costs only queue priority.
+                     w = a[NR] * 3; if (w < 1800) w = 1800
                      w = int((w + 899) / 900) * 900
                      printf "  %-5s n=%-3d min=%-6d median=%-6d max=%-6d  => --time %02d:%02d:%02d\n",
                             t, NR, a[1], a[int((NR+1)/2)], a[NR],
@@ -249,6 +268,11 @@ if $STATUS; then
         done
         echo "  ⚠ size --time from THIS TASK'S MAX. A max from another task is not"
         echo "    a measurement of this one -- the per-task wall here spans ~6x."
+        echo "  ⛔ AND THE SUGGESTION IS A FLOOR, NOT A FORECAST: a canary runs ALONE,"
+        echo "     an array does not. On 2026-09-13 nine cells sized at 2.2-2.5x their"
+        echo "     canary were killed at the wall while three arrays submitted later and"
+        echo "     spread out finished at 0.73-0.96x. If you submit several arrays at"
+        echo "     once, lower --concurrent or raise --time further."
         awk 'FNR==1{print $1+0}' "$SWEEP_ROOT"/done/* 2>/dev/null | sort -n | awk '
             {a[NR]=$1; s+=$1}
             END {printf "  (pooled over ALL tasks -- for spotting a slow node, NOT for sizing: n=%d min=%d median=%d max=%d mean=%.0f)\n", NR, a[1], a[int((NR+1)/2)], a[NR], s/NR}'

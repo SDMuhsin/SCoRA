@@ -27,3 +27,13 @@ hf_token*
 sbatch/*/measured.sh
 sbatch/*/measured_gpu.sh
 sbatch/*/baseline_proxy.json
+
+# ⛔ LOCAL STAGE-06 EXECUTION (2026-09-13). Nine narval cells were lost to the
+#   --time wall, so the remaining stage-06 cells were run on the local A40 box.
+#   env_stage06/ is a venv built to the narval PINS (torch 2.10.0 /
+#   transformers 4.51.3 / peft 0.18.1) so the local cells run the SAME model
+#   implementation as the cluster ones. runs_local*/ hold measured results.
+#   None of these belong in git: a venv is ~8 GB and results are data, not code.
+env_stage06/
+runs_local/
+runs_local_control/

@@ -224,8 +224,51 @@ def t_stage06_dry_run_end_to_end():
               "h100" not in out, out[-2000:])
         check("the run root comes from the MEASURED scratch", t in out, out[-2000:])
         check("the search stage plans 12 cells", "search cells   : 12" in out, out[-2000:])
-        check("...and the final stage plans ZERO until a proxy is written",
-              "final cells: 0" in out, out[-2000:])
+        # ⛔⛔ FORCE THE STATE; DO NOT DEPEND ON IT [fixed 2026-09-13].
+        #   This asserted "final cells: 0", which is only true while
+        #   sbatch/narval/baseline_proxy.json is ABSENT -- i.e. on a machine that has
+        #   never been handed the cluster's proxy. The file is gitignored, so it was
+        #   absent here for the whole life of the check. The day it was scp'd over to
+        #   run the stage locally, this went RED although nothing was wrong.
+        #   ⭐ Same class as the three stage-06 planner bugs: a check whose subject is
+        #     created by cluster-only state has not actually been run. The remedy is
+        #     the same -- construct BOTH states and assert BOTH directions, so the
+        #     result cannot depend on what happens to be sitting in the working tree.
+        _proxy = os.path.join(ROOT, "sbatch", "narval", "baseline_proxy.json")
+        _stash = _proxy + ".gate_stash"
+        _had = os.path.exists(_proxy)
+        try:
+            if _had:
+                os.replace(_proxy, _stash)
+            _r0 = sh("bash sbatch/narval/06_baseline.sh --dry-run",
+                     env={"NARVAL_MEASURED": m, "NARVAL_MEASURED_GPU": g,
+                          "FIR_BASE_TASK": "mrpc"})
+            _o0 = _r0.stdout + _r0.stderr
+            check("...and the final stage plans ZERO until a proxy is written",
+                  "final cells: 0" in _o0, _o0[-2000:])
+            # ⛔ CONTROL: and it plans the five seeds ONCE a proxy exists. Without
+            #   this the check above would also pass if the planner were broken and
+            #   emitted zero cells unconditionally.
+            with open(_proxy, "w") as _f:
+                _f.write('{"lr": 1e-05, "batch": 32, "selection_task": "mrpc", '
+                         '"search_seed": 42, "metric": "f1", "value": 0.9192, '
+                         '"cell_id": "mrpc-base-lr1em05-bs32-ep20-seed42", '
+                         '"best_epoch": 15, "n_cells": 12, "edges": [], '
+                         '"batch_searched": false}')
+            _r1 = sh("bash sbatch/narval/06_baseline.sh --dry-run",
+                     env={"NARVAL_MEASURED": m, "NARVAL_MEASURED_GPU": g,
+                          "FIR_BASE_TASK": "mrpc"})
+            _o1 = _r1.stdout + _r1.stderr
+            check("⛔ CONTROL: ...and FIVE once a proxy IS written (so the zero above "
+                  "means 'refused', not 'planner is broken')",
+                  "final cells: 5" in _o1, _o1[-2000:])
+        finally:
+            # ⛔ RESTORE THE REAL FILE WHATEVER HAPPENS. It is gitignored and was
+            #   scp'd from the cluster -- losing it costs a round trip.
+            if os.path.exists(_proxy):
+                os.remove(_proxy)
+            if _had:
+                os.replace(_stash, _proxy)
         # ⛔ and the memory gate must actually block a submission when it does not fit
         g2 = os.path.join(t, "gpu_small.sh")
         open(g2, "w").write('NARVAL_GPU_NAME="A100"\nNARVAL_GPU_MIB=20480\n'
