@@ -300,7 +300,7 @@ def report():
     met = {t: R310R.metric_of(t) for t in TASKS}
     print("\n[R.311-ablation] SCoRA (r, s) LADDER AT FIXED 6,144 PARAMS -- MULTI-TASK")
     print(f"  seeds {SEEDS} | rungs " +
-          " | ".join(f"{n}: r={r} s=t={s} ({r*(s+t)}/mod)" for n, r, s, _ in RUNGS))
+          " | ".join(f"{n}: r={r} s=t={s} ({r*2*s}/mod)" for n, r, s, _ in RUNGS))
     print("  ⭐ arm r1 is [R.310]'s shipped SCoRA column, re-read not re-run.\n")
     for t in TASKS:
         d = v.get(t, {})
