@@ -56,6 +56,7 @@ GATES = [
     ("scripts/r239_gate_subsample.py", "--max_train_samples on GLUE"),
     ("scripts/r248_sign_audit.py",    "sign-stability audit"),
     ("scratchpad/phaseR/r261_rescan.py", "near-floor re-scan"),
+    ("scripts/build_prl_tables.py",   "the letter's tables: arm set, five seeds per cell, the two headline gate outcomes"),
 ]
 # ⛔ The first version required a literal "selftest:" prefix and reported r236/r239 as
 # FAILING when both pass 19/19 and 7/7 -- they print the bare "N passed, M failed" form.
