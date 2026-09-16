@@ -331,12 +331,11 @@ def status():
 # SELFTEST
 # ============================================================================
 def selftest():
-    fails = []
+    fails, passes = [], []
 
     def ck(c, msg):
         print(("  ok   " if c else "  FAIL ") + msg)
-        if not c:
-            fails.append(msg)
+        (passes if c else fails).append(msg)
 
     print("[r312] selftest")
     S = R310.sizes()
@@ -429,7 +428,9 @@ def selftest():
     ck(wall < 24 * 3600,
        f"{sum(r[1] for r in rows)} cells, {tot/3600:.1f} GPU-h, ~{wall/3600:.1f} h wall at 3 workers")
 
-    print(f"[r312] selftest: {len(fails)} failure(s)")
+    # ⛔ the canonical form `scripts/run_all_gates.py` parses -- a gate whose
+    # report it cannot read is scored 0/1 FAILING, which is how one cries wolf.
+    print(f"[r312] selftest: {len(passes)} passed, {len(fails)} failed")
     return 1 if fails else 0
 
 

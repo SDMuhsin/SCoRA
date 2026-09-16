@@ -349,12 +349,11 @@ def status():
 # SELFTEST -- PROCESS §6: test the planner AND the reader before the spend.
 # ============================================================================
 def selftest():
-    fails = []
+    fails, passes = [], []
 
     def ck(c, msg):
         print(("  ok   " if c else "  FAIL ") + msg)
-        if not c:
-            fails.append(msg)
+        (passes if c else fails).append(msg)
 
     print("[r311ab] selftest")
 
@@ -479,7 +478,9 @@ def selftest():
     ck("scora2" not in {r[0] for r in RUNGS}, "scora2 (swept scaling) is OUT of scope, by design")
     ck("rte" not in TASKS, "RTE is NOT re-run ([R.122] stands)")
 
-    print(f"[r311ab] selftest: {len(fails)} failure(s)")
+    # ⛔ the canonical form `scripts/run_all_gates.py` parses -- a gate whose
+    # report it cannot read is scored 0/1 FAILING, which is how one cries wolf.
+    print(f"[r311ab] selftest: {len(passes)} passed, {len(fails)} failed")
     return 1 if fails else 0
 
 

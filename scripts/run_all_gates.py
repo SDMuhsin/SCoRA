@@ -34,6 +34,8 @@ GATES = [
     ("scripts/r308_timing.py",         "[R.308] measured module wall-clock + activation memory, sync-gated"),
     ("scripts/r309_hp_doc.py",         "[R.309] HP-search doc generator -- flags must match the run record"),
     ("scripts/r310_plan.py",           "[R.310] multi-task planner -- derived warmup, per-task protocol, both SCoRA rows"),
+    ("scripts/r311ab_plan.py",         "[R.311-abl] (r,s) ladder multi-task -- reuses [R.310]'s arm A, reproduces [R.122]'s RTE sign tests"),
+    ("scripts/r312_plan.py",           "[R.312] r/s confound-breaker -- independent r and s, degenerate-epoch instrument"),
     ("scripts/r310_read.py",           "[R.310] multi-task reader -- per-task PRIMARY metric and its metric-aware floor"),
     ("scripts/r310_reap.py",           "[R.310] stale-claim reaper -- never reap a LIVE claim (caused a duplicate run)"),
     ("scripts/fir_arms.py",            "[fir] the 9 arms, frozen so they survive the trip to the cluster"),
