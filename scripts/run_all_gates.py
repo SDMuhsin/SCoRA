@@ -57,6 +57,11 @@ GATES = [
     ("scripts/r248_sign_audit.py",    "sign-stability audit"),
     ("scratchpad/phaseR/r261_rescan.py", "near-floor re-scan"),
     ("scripts/build_prl_tables.py",   "the letter's tables: arm set, five seeds per cell, the two headline gate outcomes"),
+    ("scripts/r313_plan.py",         "[R.313] the basis control: arg strings differ in exactly --slr_basis"),
+    ("scripts/build_architecture_data.py",
+     "the architecture figure's data: the drawn support, the synthesis, the rank"),
+    ("scripts/architecture_figure_audit.py",
+     "the architecture figure's render: its frame, its mirror, its crops"),
 ]
 # ⛔ The first version required a literal "selftest:" prefix and reported r236/r239 as
 # FAILING when both pass 19/19 and 7/7 -- they print the bare "N passed, M failed" form.
