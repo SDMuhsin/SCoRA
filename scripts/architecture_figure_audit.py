@@ -61,7 +61,7 @@ CROPS = {
     "dw":        (4.90, 1.90, 7.30, 4.10),
     "gw":        (9.40, 1.90, 11.70, 4.10),
     "plus":      (4.50, 2.60, 5.40, 3.40),
-    "gamma":     (6.20, 2.50, 7.20, 3.50),
+    "gamma":     (6.20, 4.05, 7.20, 5.05),
     "bracket_l": (2.40, 1.80, 3.20, 4.20),
     "bracket_r": (6.70, 1.80, 7.50, 4.20),
     "state_u":   (14.30, 3.50, 15.90, 5.30),
@@ -380,17 +380,20 @@ def main() -> int:
     # The darkest cell any field draws is 109 of 255 and a rule is near
     # black, so a floor separates them.  The gamma disc is the one object
     # allowed inside, and it is masked out by radius, not by name.
-    for nm, (x0, y0, x1, y1), disc in (
-            ("update", (5.15, 2.10, 6.95, 3.90), (6.60, AXIS, 0.24)),
-            ("update gradient", (9.60, 2.10, 11.40, 3.90), None)):
+    # No exception any more.  The gamma disc used to live inside the update
+    # and the check had to mask a radius for it; it is now an inline gain on
+    # the trunk above the block, so EVERY field is unbroken and the gate is
+    # a flat assertion over all seven with nothing carved out of it.
+    for nm, (x0, y0, x1, y1) in (
+            ("update", (5.15, 2.10, 6.95, 3.90)),
+            ("update gradient", (9.60, 2.10, 11.40, 3.90)),
+            ("frozen weight", (2.85, 2.10, 4.65, 3.90)),
+            ("X", (0.45, 4.60, 2.25, 5.08)),
+            ("grad X", (0.45, 0.92, 2.25, 1.40)),
+            ("H", (7.65, 4.60, 9.45, 5.08)),
+            ("grad H", (7.65, 0.92, 9.45, 1.40))):
         f = img[Y(y1 - 0.04):Y(y0 + 0.04), X(x0 + 0.04):X(x1 - 0.04)]
-        keep = np.ones(f.shape, bool)
-        if disc is not None:
-            cx, cy, r = disc
-            gy, gx = np.mgrid[0:f.shape[0], 0:f.shape[1]]
-            keep = (((gx - (cx - x0 - 0.04) * PPC) ** 2
-                     + (gy - ((y1 - 0.04) - cy) * PPC) ** 2) > (r * PPC) ** 2)
-        lo = int(f[keep].min())
+        lo = int(f.min())
         ck(lo >= 95, f"the {nm} field's interior is all cells"
                      f" (darkest {lo}, a rule would be under 60)")
 
