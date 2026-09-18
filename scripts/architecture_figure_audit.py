@@ -39,7 +39,12 @@ DPI = 300
 PPC = DPI / 2.54
 COLUMN_PT = 522.0          # elsarticle 5p twocolumn \textwidth
 
+DRAW_DIM = 30              # d as DRAWN (the generator's D)
 AXIS = 3.00                # the mirror axis, in figure centimetres
+# Windows whose silhouette is a frame and not a datum.  Used twice: once to
+# CALIBRATE the map's y origin, once to CHECK the fold.
+GEOM = [(11.62, 11.86), (12.12, 12.36), (12.58, 12.70),
+        (12.75, 12.95), (13.55, 14.05)]
 LANE_X0, LANE_X1 = 11.60, 17.60   # the part of the figure that is mirrored
 
 # Regions a reviewer is asked to look at, in figure centimetres.
@@ -150,6 +155,42 @@ def main() -> int:
 
     ox = px0 - fx0 * PPC          # figure x = 0 lands here
     oy = py1 + 1 + fy0 * PPC      # figure y = 0 lands here
+
+    # --- calibrate that origin before anyone measures with it ------------
+    # \pgf@picminy is the PATH bounding box: it does not know about stroke
+    # width, so the ink spills half a rule past it by different amounts at
+    # the top and the bottom and the origin lands about a pixel out.  That
+    # is 0.0085 cm at 300 dpi -- negligible in a check that measures a
+    # DIFFERENCE, fatal in one that measures a SUM.  Three of four reviewers
+    # reported the mirror axis as 3.009 and concluded the lower lane was
+    # shifted; it is not, the map was, and they had no way to tell because
+    # the diagnostic they shared cannot separate the two.
+    #
+    # Calibrate on features whose true centre is known EXACTLY and does not
+    # depend on stroke width: each block frame is a rectangle drawn at
+    # y = 2.10 and 3.90, so however thick its rule, its ink is symmetric
+    # about y = 3.00.  Take the darkness-weighted centroid of one column of
+    # each -- subpixel, threshold-free -- and average.  A silhouette fold
+    # cannot do this job: it resolves the offset only to the nearest pixel,
+    # and its parity is ambiguous, so it answered 2 where the truth is 1.
+    def centroid_y(xc, y0, y1, o_y):
+        c = 255.0 - img[int(o_y - y1 * PPC):int(o_y - y0 * PPC),
+                        int(round(ox + xc * PPC))].astype(float)
+        r = np.arange(len(c))
+        return ((o_y - (int(o_y - y1 * PPC) + r)) / PPC * c).sum() / c.sum()
+
+    FRAMES = (2.85, 4.65, 5.15, 6.95, 9.60, 11.40)   # the three d-by-d blocks
+    seen = [centroid_y(xc, 2.02, 3.98, oy) for xc in FRAMES]
+    ck(float(np.ptp(seen)) < 0.004,
+       f"the six frame rules agree on the axis to {np.ptp(seen) * 10:.4f} mm")
+    dcal = (AXIS - float(np.mean(seen))) * PPC        # in pixels, fractional
+    # A large correction would mean the blocks really are misplaced, which
+    # is a defect and not a calibration.  Absorb rasterisation, nothing more.
+    ck(abs(dcal) <= 3,
+       f"the map's y origin is {dcal:+.2f} px out"
+       f" ({dcal / PPC * 10:+.3f} mm), corrected")
+    oy += dcal
+
     json.dump({"ox": ox, "oy": oy, "ppc": PPC, "dpi": DPI,
                "fig": [fx0, fy0, fx1, fy1]},
               open(os.path.join(OUTDIR, "map.json"), "w"), indent=1)
@@ -181,8 +222,6 @@ def main() -> int:
     # same reason: the count label above them is set upright in both lanes,
     # as every label is, so its silhouette cannot fold even when its box
     # is placed exactly.
-    GEOM = [(11.62, 11.86), (12.12, 12.36), (12.58, 12.70),
-            (12.75, 12.95), (13.55, 14.05)]
     yax = Y(AXIS)
     cols = []
     for gx0, gx1 in GEOM:
@@ -200,7 +239,7 @@ def main() -> int:
     errs = [np.abs((cols[:, 0] + d) - (cols[:, 1] - d)).mean() for d in offs]
     d0 = int(offs[int(np.argmin(errs))])
     dev = np.abs((cols[:, 0] + d0) - (cols[:, 1] - d0))
-    ck(abs(d0) <= 3, f"the fold sits {d0} px from the mapped axis")
+    ck(d0 == 0, f"the fold sits {d0} px from the CALIBRATED axis, want 0")
     # At 300 dpi one pixel is 0.0085 cm, and a rule whose true position is
     # a half pixel off the grid folds one pixel wrong everywhere, so the
     # tolerance is stated in pixels but meant in centimetres.
@@ -296,7 +335,7 @@ def main() -> int:
         return None if len(w) == 0 else Y(y1) + int(round(w.mean()))
 
     for sgn, nm in ((1, "u"), (-1, "v")):
-        yc = AXIS + sgn * 1.195
+        yc = AXIS + sgn * 1.175
         a = line_row(12.07, yc - 0.10, yc + 0.10)
         b = line_row(12.50, yc - 0.10, yc + 0.10)
         ck(a is not None and b is not None,
@@ -305,6 +344,22 @@ def main() -> int:
             ck(abs(a - b) <= 1,
                f"the {nm} lane's two gradient segments are collinear"
                f" ({abs(a - b)} px apart)")
+
+    # --- the wide edge is countable as d cells, not just s -------------
+    # Drawn as one flat fill with only the s lit cells bordered, a blind
+    # reader counted 5 lit against 5 at the narrow end and concluded the
+    # funnel maps s to s.  That is a ratio of one where the method's whole
+    # claim is s/d, and the caption asks the reader to count it here.  The
+    # separators are white rules, so they read far lighter than any cell:
+    # the count is the same at every threshold from 235 to 250.
+    for sgn, nm in ((1, "u"), (-1, "v")):
+        r0, r1 = sorted((Y(AXIS + sgn * 2.19), Y(AXIS + sgn * 0.41)))
+        col = img[r0:r1, X(12.64)]
+        light = (col > 240).astype(np.int8)
+        n = int((np.diff(np.concatenate(([0], light, [0]))) == 1).sum())
+        ck(n == DRAW_DIM - 1,
+           f"the {nm} funnel's wide edge shows {n} cell separators,"
+           f" want {DRAW_DIM - 1} for {DRAW_DIM} cells")
 
     # --- the five lit cells on each wide edge survive the travel lines ----
     # They are drawn after the lines for exactly this reason: drawn before,
@@ -317,6 +372,27 @@ def main() -> int:
         dark = (col < 200).astype(np.int8)
         n = int((np.diff(np.concatenate(([0], dark, [0]))) == 1).sum())
         ck(n == 5, f"the {nm} funnel's wide edge lights {n} cells, want 5")
+
+    # --- no foreign ink inside either generated field --------------------
+    # The two synthesis trunks used to run 7.45 mm DOWN THROUGH the update's
+    # interior and land their heads on the plaid, which is the one place the
+    # figure states that the update is rank one.  They now stop on its frame.
+    # The darkest cell any field draws is 109 of 255 and a rule is near
+    # black, so a floor separates them.  The gamma disc is the one object
+    # allowed inside, and it is masked out by radius, not by name.
+    for nm, (x0, y0, x1, y1), disc in (
+            ("update", (5.15, 2.10, 6.95, 3.90), (6.60, AXIS, 0.24)),
+            ("update gradient", (9.60, 2.10, 11.40, 3.90), None)):
+        f = img[Y(y1 - 0.04):Y(y0 + 0.04), X(x0 + 0.04):X(x1 - 0.04)]
+        keep = np.ones(f.shape, bool)
+        if disc is not None:
+            cx, cy, r = disc
+            gy, gx = np.mgrid[0:f.shape[0], 0:f.shape[1]]
+            keep = (((gx - (cx - x0 - 0.04) * PPC) ** 2
+                     + (gy - ((y1 - 0.04) - cy) * PPC) ** 2) > (r * PPC) ** 2)
+        lo = int(f[keep].min())
+        ck(lo >= 95, f"the {nm} field's interior is all cells"
+                     f" (darkest {lo}, a rule would be under 60)")
 
     # --- nothing is drawn outside the region the figure is planned in -----
     ck(fx0 > 0.30 and fx1 < 17.85, f"ink spans x {fx0:.2f} to {fx1:.2f} cm")
