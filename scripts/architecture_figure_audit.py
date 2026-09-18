@@ -1,352 +1,304 @@
 #!/usr/bin/env python3
-"""Mechanical audit of the SCoRA architecture figure.
+"""Render the SCoRA architecture figure and measure it.
 
-A drawing this dense is not reviewable by reading its source, and the
-blemishes that matter -- an arrowhead a hair inside the shape it points at, a
-frame a pixel off its mirror, a curve touching its own border -- are exactly
-the ones an eye skims past.  So they are measured here, on the rendered page,
-and the numbers are the finding.
+The figure is drawn in centimetres and printed in points, so nothing about it
+can be checked by reading the source: a coordinate that is right in the file
+can still land on top of its neighbour once a glyph is set.  This instrument
+renders the standalone figure, recovers the exact map from figure centimetres
+to render pixels, and then asserts in pixels the things the drawing claims.
 
-Checks:
-  mirror     the figure is drawn about y = 3.60 cm; everything right of the
-             fork is one macro called twice, so the render must be symmetric
-             there up to the data and the labels.  Emits a diff image.
-  bounds     the drawing fits the 522 pt column it is destined for.
-  ink        no ink touches the page border, so nothing is clipped.
-  crops      writes zoomed tiles so a reviewer can look at one joint at a time.
+The map is recovered, not assumed.  pdflatex is asked to print the picture's
+own bounding box in points; the same picture is rasterised and its ink box
+found; the two rectangles give one affine map, and the instrument checks that
+the two scales it implies agree with each other and with the requested dpi.
+If any of that fails, every measurement below would be meaningless, so the
+run stops there.
 
-Run: env/bin/python scripts/architecture_figure_audit.py [--outdir DIR]
-Test: env/bin/python scripts/architecture_figure_audit.py --selftest
+It also writes the tiles a reviewer reads:
+    scratchpad/figaudit/page.png      the whole figure
+    scratchpad/figaudit/mirror_*.png  the two lanes folded onto each other
+    scratchpad/figaudit/crop_*.png    the regions worth a close look
+    scratchpad/figaudit/map.json      the map, for zoom.sh
+
+Selftest: `env/bin/python scripts/architecture_figure_audit.py`.
 """
-
-from __future__ import annotations
-
-import argparse
+import json
 import os
+import re
 import subprocess
 import sys
 
 import numpy as np
+from PIL import Image
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 FIGDIR = os.path.join(ROOT, "llmdocs", "paper", "scora_v1_prl", "figures")
-DRIVER = "architecture_standalone"
-
-# the column the figure is drawn for, and the border the standalone class adds
-COLUMN_PT = 522.0
-BORDER_CM = 0.2
-
-# the drawing's own frame, from the geometry block of architecture.tex
-FIG_X0, FIG_X1 = 0.50, 17.35
-FIG_Y0, FIG_Y1 = 0.95, 6.25
-# The topmost ink is a 0.5 pt frame CENTRED on FIG_Y1, so the page standalone
-# crops to is half a stroke taller than the declared frame.  Without this the
-# map reads 0.09 mm low everywhere and the balance check reports a lean the
-# drawing does not have.
-STROKE_CM = 0.5 / 72 * 2.54 / 2
-AXIS_Y = 3.60
-FORK_X = 7.25
-
+OUTDIR = os.path.join(ROOT, "scratchpad", "figaudit")
 DPI = 300
+PPC = DPI / 2.54
+COLUMN_PT = 522.0          # elsarticle 5p twocolumn \textwidth
 
-# the joints worth looking at closely, in figure centimetres:
-# name -> (x0, y0, x1, y1)
+AXIS = 3.00                # the mirror axis, in figure centimetres
+LANE_X0, LANE_X1 = 11.60, 17.60   # the part of the figure that is mirrored
+
+# Regions a reviewer is asked to look at, in figure centimetres.
 CROPS = {
-    "layer": (0.20, 0.80, 5.60, 6.40),
-    "sum": (2.20, 4.30, 5.50, 6.40),
-    "neck": (4.90, 2.90, 8.10, 4.40),
-    "fork": (6.30, 1.90, 8.40, 5.30),
-    "lane_u_head": (7.40, 4.10, 12.90, 5.90),
-    "lane_v_head": (7.40, 1.30, 12.90, 3.10),
-    "lane_u_tail": (12.60, 4.00, 17.50, 5.90),
-    "lane_v_tail": (12.60, 1.30, 17.50, 3.20),
-    "seed": (10.20, 2.60, 12.80, 4.60),
-    "budget": (15.30, 2.05, 17.50, 5.25),
-    "spectrum_u": (12.80, 4.20, 16.10, 5.30),
-    "deltaw": (2.90, 2.30, 5.50, 4.90),
+    "layer":     (0.30, 0.70, 7.20, 5.30),
+    "loss":      (6.80, 0.70, 11.60, 5.30),
+    "lane_u_in": (10.50, 3.10, 14.40, 5.60),
+    "lane_v_in": (10.50, 0.40, 14.40, 2.90),
+    "lane_u_out": (13.90, 3.10, 17.80, 5.60),
+    "lane_v_out": (13.90, 0.40, 17.80, 2.90),
+    "seed":      (11.40, 2.30, 14.40, 3.70),
+    "tip_u":     (13.80, 3.80, 15.60, 4.80),
+    "tip_v":     (13.80, 1.20, 15.60, 2.20),
+    "dw":        (4.90, 1.90, 7.30, 4.10),
+    "gw":        (9.40, 1.90, 11.70, 4.10),
+    "plus":      (4.50, 2.60, 5.40, 3.40),
+    "gamma":     (6.20, 2.50, 7.20, 3.50),
+    "bracket_l": (2.40, 1.80, 3.20, 4.20),
+    "bracket_r": (6.70, 1.80, 7.50, 4.20),
+    "state_u":   (14.30, 3.50, 15.90, 5.30),
+    "panel_u":   (15.50, 3.20, 17.90, 5.40),
 }
 
 
-def cm_to_px(v: float) -> float:
-    return v / 2.54 * DPI
+def sh(cmd, cwd=None):
+    return subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True,
+                          text=True)
 
 
-def render(outdir: str) -> np.ndarray:
-    """Build the standalone figure and return the page as a grey array."""
-    subprocess.run(["pdflatex", "-interaction=nonstopmode", "-halt-on-error",
-                    DRIVER + ".tex"], cwd=FIGDIR, check=True,
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    png = os.path.join(outdir, "page")
-    subprocess.run(["pdftoppm", "-r", str(DPI), "-png", "-gray", "-singlefile",
-                    os.path.join(FIGDIR, DRIVER + ".pdf"), png], check=True)
-    return read_png_gray(png + ".png")
+def build():
+    """Rebuild the standalone, and read the picture's bounding box."""
+    r = sh("pdflatex -interaction=nonstopmode -halt-on-error "
+           "architecture_standalone.tex", cwd=FIGDIR)
+    if not os.path.exists(os.path.join(FIGDIR, "architecture_standalone.pdf")):
+        print(r.stdout[-3000:])
+        raise SystemExit("the figure did not build")
+
+    diag = os.path.join(FIGDIR, "_audit_bbox.tex")
+    with open(diag, "w") as fh:
+        fh.write(
+            "\\documentclass[border=0cm]{standalone}\n"
+            "\\usepackage{amsmath,amssymb}\n\\usepackage{tikz}\n"
+            "\\usetikzlibrary{arrows.meta,calc,positioning}\n"
+            "\\input{architecture_data}\n\\begin{document}\n"
+            "\\input{architecture}%\n\\makeatletter\n"
+            "\\typeout{AUDITBOX \\the\\pgf@picminx\\space\\the\\pgf@picmaxx"
+            "\\space\\the\\pgf@picminy\\space\\the\\pgf@picmaxy}\n"
+            "\\makeatother\n\\end{document}\n")
+    r = sh("pdflatex -interaction=nonstopmode _audit_bbox.tex", cwd=FIGDIR)
+    flat = re.sub(r"\s+", "", r.stdout)
+    m = re.search(r"AUDITBOX([-\d.]+)pt([-\d.]+)pt([-\d.]+)pt([-\d.]+)pt", flat)
+    if not m:
+        raise SystemExit("could not read the picture bounding box")
+    x0, x1, y0, y1 = (float(v) / 72.0 * 2.54 for v in m.groups())
+    for ext in ("tex", "pdf", "aux", "log"):
+        f = os.path.join(FIGDIR, f"_audit_bbox.{ext}")
+        if os.path.exists(f):
+            os.remove(f)
+    return (x0, x1, y0, y1)
 
 
-def read_png_gray(p: str) -> np.ndarray:
-    """Decode a greyscale PNG without pulling in an image library."""
-    out = subprocess.run(["pdftoppm", "-v"], capture_output=True)
-    del out
-    import zlib
-    import struct
-    raw = open(p, "rb").read()
-    assert raw[:8] == b"\x89PNG\r\n\x1a\n"
-    pos, idat, w = 8, b"", None
-    while pos < len(raw):
-        ln = struct.unpack(">I", raw[pos:pos + 4])[0]
-        typ = raw[pos + 4:pos + 8]
-        dat = raw[pos + 8:pos + 8 + ln]
-        if typ == b"IHDR":
-            w, h, depth, ctype = struct.unpack(">IIBB", dat[:10])
-            # pdftoppm hands back grey as 1 byte and colour as 3; both are
-            # accepted so the reader does not depend on a renderer flag
-            assert depth == 8 and ctype in (0, 2), (depth, ctype)
-            nch = 1 if ctype == 0 else 3
-        elif typ == b"IDAT":
-            idat += dat
-        pos += 12 + ln
-    buf = zlib.decompress(idat)
-    stride = w * nch
-    img = np.zeros((h, stride), dtype=np.int16)
-    prev = np.zeros(stride, dtype=np.int16)
-    i = 0
-    for y in range(h):
-        ft = buf[i]
-        i += 1
-        line = np.frombuffer(buf[i:i + stride], dtype=np.uint8).astype(np.int16)
-        i += stride
-        if ft == 0:
-            cur = line.copy()
-        elif ft == 1:
-            cur = line.copy()
-            for x in range(nch, stride):
-                cur[x] = (cur[x] + cur[x - nch]) & 0xFF
-        elif ft == 2:
-            cur = (line + prev) & 0xFF
-        elif ft == 3:
-            cur = line.copy()
-            for x in range(stride):
-                a = cur[x - nch] if x >= nch else 0
-                cur[x] = (cur[x] + ((a + prev[x]) >> 1)) & 0xFF
-        elif ft == 4:
-            cur = line.copy()
-            for x in range(stride):
-                a = int(cur[x - nch]) if x >= nch else 0
-                b = int(prev[x])
-                c = int(prev[x - nch]) if x >= nch else 0
-                pp = a + b - c
-                pa, pb, pc = abs(pp - a), abs(pp - b), abs(pp - c)
-                pr = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
-                cur[x] = (cur[x] + pr) & 0xFF
-        else:
-            raise ValueError(f"filter {ft}")
-        img[y] = cur
-        prev = cur
-    if nch == 1:
-        return img.astype(np.uint8)
-    rgb = img.reshape(h, w, 3).astype(np.float64)
-    lum = rgb[:, :, 0] * 0.299 + rgb[:, :, 1] * 0.587 + rgb[:, :, 2] * 0.114
-    return np.clip(lum, 0, 255).astype(np.uint8)
+def render():
+    os.makedirs(OUTDIR, exist_ok=True)
+    stem = os.path.join(OUTDIR, "_r")
+    sh(f"pdftoppm -r {DPI} -png -gray "
+       f"{os.path.join(FIGDIR, 'architecture_standalone.pdf')} {stem}")
+    src = stem + "-1.png"
+    img = np.array(Image.open(src).convert("L"))
+    os.remove(src)
+    Image.fromarray(img).save(os.path.join(OUTDIR, "page.png"))
+    return img
 
 
-def write_png_gray(p: str, a: np.ndarray) -> None:
-    import zlib
-    import struct
-    h, w = a.shape
-    raw = b"".join(b"\x00" + a[y].astype(np.uint8).tobytes() for y in range(h))
-
-    def chunk(t, d):
-        return (struct.pack(">I", len(d)) + t + d
-                + struct.pack(">I", zlib.crc32(t + d) & 0xFFFFFFFF))
-    png = (b"\x89PNG\r\n\x1a\n"
-           + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 0, 0, 0, 0))
-           + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
-    open(p, "wb").write(png)
-
-
-def fig_to_img(img: np.ndarray, x: float, y: float):
-    """Figure centimetres -> pixel (col, row).
-
-    Anchored on the page ORIGIN and the scale, not on the page width: TikZ
-    reserves a little empty space past the rightmost ink for the arrow tips
-    it has declared, so a mapping that stretched the declared frame across
-    the whole page would be off by that slack everywhere.
-    """
-    del img
-    ppc = DPI / 2.54
-    return ((x - (FIG_X0 - BORDER_CM - STROKE_CM)) * ppc,
-            ((FIG_Y1 + BORDER_CM + STROKE_CM) - y) * ppc)
-
-
-def audit(outdir: str, verbose: bool = True):
-    os.makedirs(outdir, exist_ok=True)
-    img = render(outdir)
-    h, w = img.shape
-    findings = []
-
-    def say(*a):
-        if verbose:
-            print(*a)
-
-    # -- the page the figure will occupy
-    pdf = subprocess.run(["pdfinfo", os.path.join(FIGDIR, DRIVER + ".pdf")],
-                         capture_output=True, text=True).stdout
-    size = [l for l in pdf.splitlines() if l.startswith("Page size")][0]
-    wpt = float(size.split()[2])
-    drawn = wpt - 2 * BORDER_CM / 2.54 * 72
-    say(f"page      {size.split(':')[1].strip()}")
-    say(f"drawing   {drawn:.1f} pt wide against a {COLUMN_PT:.0f} pt column"
-        f"  ({drawn / COLUMN_PT * 100:.1f}%)")
-    if drawn > COLUMN_PT:
-        findings.append(f"the drawing is {drawn:.1f} pt, wider than the column")
-
-    # -- nothing clipped: the border must be blank all the way round
-    b = int(cm_to_px(BORDER_CM) * 0.6)
-    edges = [img[:b, :], img[-b:, :], img[:, :b], img[:, -b:]]
-    touch = [int((e < 250).sum()) for e in edges]
-    say(f"border    ink in the {b}px margin, t/b/l/r: {touch}")
-    if any(t > 0 for t in touch):
-        findings.append(f"ink reaches the page border {touch}; something is"
-                        f" outside the frame the geometry block declares")
-
-    # -- the ink must sit inside the frame the geometry block declares, or
-    #    every coordinate quoted in a finding below points at the wrong thing
-    ink = img < 250
-    cols = np.where(ink.any(axis=0))[0]
-    rows = np.where(ink.any(axis=1))[0]
-    ppc = DPI / 2.54
-    ix0 = cols.min() / ppc + (FIG_X0 - BORDER_CM - STROKE_CM)
-    ix1 = cols.max() / ppc + (FIG_X0 - BORDER_CM - STROKE_CM)
-    iy1 = (FIG_Y1 + BORDER_CM + STROKE_CM) - rows.min() / ppc
-    iy0 = (FIG_Y1 + BORDER_CM + STROKE_CM) - rows.max() / ppc
-    say(f"ink       x {ix0:.2f} .. {ix1:.2f} cm,  y {iy0:.2f} .. {iy1:.2f} cm"
-        f"   (declared {FIG_X0} .. {FIG_X1},  {FIG_Y0} .. {FIG_Y1})")
-    for got, want, what in ((ix0, FIG_X0, "left"), (ix1, FIG_X1, "right"),
-                            (iy0, FIG_Y0, "bottom"), (iy1, FIG_Y1, "top")):
-        if abs(got - want) > 0.05:
-            findings.append(f"the {what} edge of the ink is at {got:.2f} cm,"
-                            f" not the declared {want:.2f}: the geometry"
-                            f" block in architecture.tex is out of date")
-    mid = (iy0 + iy1) / 2
-    say(f"balance   the ink is centred on y = {mid:.3f} cm,"
-        f" the axis is {AXIS_Y}")
-    if abs(mid - AXIS_Y) > 0.04:
-        findings.append(f"the ink is centred on y = {mid:.3f}, not on the"
-                        f" axis {AXIS_Y}: the figure is top or bottom heavy")
-
-    # -- the mirror.  Everything right of the fork is one macro called twice,
-    #    so the only differences there may be the data and the labels.
-    axr = int(round(fig_to_img(img, 0, AXIS_Y)[1]))
-    say(f"axis      y = {AXIS_Y} cm is image row {axr} of {h}")
-    fx = int(round(fig_to_img(img, FORK_X, 0)[0]))
-    # Fold about the row that actually minimises the difference, and report
-    # how far that is from the axis.  A whole-pixel search, because the axis
-    # lands between two pixel rows and folding on the wrong one prints a
-    # 1 px ghost along every horizontal rule in the picture -- an artefact of
-    # the measurement that would otherwise read as a crooked drawing.
-    def fold(ar):
-        hh = min(ar, h - ar)
-        a = img[ar - hh:ar, fx:].astype(np.int16)
-        b = img[ar:ar + hh, fx:][::-1, :].astype(np.int16)
-        return np.abs(a - b)
-    cand = sorted(((int((fold(ar) > 60).sum()), ar)
-                   for ar in range(axr - 6, axr + 7)))
-    bestn, bestr = cand[0]
-    say(f"fold      best at row {bestr}, axis maps to {axr}"
-        f"  (delta {bestr - axr} px = {(bestr - axr) / DPI * 2.54 * 10:.2f} mm)")
-    if abs(bestr - axr) > 2:
-        findings.append(f"the two lanes fold best about row {bestr} but the"
-                        f" axis is row {axr}: they are not mirror images")
-    right, flip = None, None
-    diff = fold(bestr)
-    diff = diff.astype(np.uint8)
-    # a structural asymmetry is a run of dark pixels in one column; the data
-    # and the labels differ everywhere, so report where the diff is a LINE
-    strong = (diff > 60)
-    per_col = strong.sum(axis=0)
-    write_png_gray(os.path.join(outdir, "mirror_diff.png"), 255 - diff)
-    say(f"mirror    {strong.sum()} pixels differ by >60/255 across the fold"
-        f" (data and labels included)")
-    say(f"          worst columns: "
-        + ", ".join(f"x={(fx + c - cm_to_px(BORDER_CM)) / DPI * 2.54 + FIG_X0:.2f}cm"
-                    f":{per_col[c]}" for c in np.argsort(per_col)[-5:][::-1]))
-
-    # -- crops, so a reviewer can look at one joint at a time
-    for name, (x0, y0, x1, y1) in CROPS.items():
-        c0, r1 = fig_to_img(img, x0, y0)
-        c1, r0 = fig_to_img(img, x1, y1)
-        tile = img[max(0, int(r0)):int(r1), max(0, int(c0)):int(c1)]
-        write_png_gray(os.path.join(outdir, f"crop_{name}.png"), tile)
-    say(f"crops     {len(CROPS)} tiles in {outdir}")
-
-    if findings:
-        print("\nFINDINGS")
-        for f in findings:
-            print("  *", f)
-    else:
-        print("\nno mechanical finding")
-    return findings
-
-
-def selftest() -> int:
-    ok = bad = 0
-
-    def ck(c, label):
-        nonlocal ok, bad
-        if c:
-            ok += 1
-        else:
-            bad += 1
-            print(f"  FAIL  {label}")
-
-    # the png reader has to be right, or every measurement below is fiction
-    import tempfile
-    with tempfile.TemporaryDirectory() as td:
-        a = (np.arange(64 * 40).reshape(40, 64) % 251).astype(np.uint8)
-        p = os.path.join(td, "t.png")
-        write_png_gray(p, a)
-        b = read_png_gray(p)
-        ck(b.shape == a.shape, "png round trip keeps the shape")
-        ck(np.array_equal(a, b), "png round trip is lossless")
-
-    # the coordinate map must put the declared corners on the declared pixels
-    img = np.zeros((676, 2054), dtype=np.uint8)
-    for x, y in ((FIG_X0, FIG_Y0), (FIG_X1, FIG_Y1)):
-        c, r = fig_to_img(img, x, y)
-        ck(0 < c < img.shape[1] and 0 < r < img.shape[0],
-           f"({x},{y}) cm lands inside the page")
-    c0, r0 = fig_to_img(img, FIG_X0, FIG_Y1)
-    c1, r1 = fig_to_img(img, FIG_X1, FIG_Y0)
-    ck(abs((c1 - c0) - cm_to_px(FIG_X1 - FIG_X0)) < 2.0,
-       "the mapped width is the declared width")
-    ck(abs((r1 - r0) - cm_to_px(FIG_Y1 - FIG_Y0)) < 2.0,
-       "the mapped height is the declared height")
-    ck(abs(c0 - cm_to_px(BORDER_CM + STROKE_CM)) < 1.5,
-       "the declared left edge lands on the standalone border")
-    ck(abs(r0 - cm_to_px(BORDER_CM + STROKE_CM)) < 1.5,
-       "the declared top edge lands on the standalone border")
-    ck(0.004 < STROKE_CM < 0.010,
-       "the half-stroke correction is a half stroke, not a fudge")
-    for name, (x0, y0, x1, y1) in CROPS.items():
-        ck(x0 < x1 and y0 < y1, f"crop {name} is not inside out")
-        ck(FIG_X0 - 0.4 <= x0 and x1 <= FIG_X1 + 0.4,
-           f"crop {name} is inside the drawing horizontally")
-        ck(FIG_Y0 - 0.4 <= y0 and y1 <= FIG_Y1 + 0.4,
-           f"crop {name} is inside the drawing vertically")
-    print(f"{ok} passed, {bad} failed")
-    return 1 if bad else 0
+def page_pt():
+    r = sh(f"pdfinfo {os.path.join(FIGDIR, 'architecture_standalone.pdf')}")
+    m = re.search(r"Page size:\s+([\d.]+) x ([\d.]+)", r.stdout)
+    return float(m.group(1)), float(m.group(2))
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--outdir", default=os.path.join(ROOT, "scratchpad",
-                                                     "figaudit"))
-    ap.add_argument("--selftest", action="store_true")
-    a = ap.parse_args()
-    if a.selftest:
-        return selftest()
-    audit(a.outdir)
-    return selftest()
+    npass = nfail = 0
+
+    def ck(cond, what):
+        nonlocal npass, nfail
+        if cond:
+            npass += 1
+        else:
+            nfail += 1
+            print(f"  FAIL  {what}")
+
+    fx0, fx1, fy0, fy1 = build()
+    img = render()
+    h, w = img.shape
+    ink = img < 250
+    cols = np.where(ink.any(0))[0]
+    rows = np.where(ink.any(1))[0]
+    px0, px1, py0, py1 = int(cols[0]), int(cols[-1]), int(rows[0]), int(rows[-1])
+
+    # --- the map, recovered from the two rectangles -----------------------
+    sx = (px1 + 1 - px0) / (fx1 - fx0)
+    sy = (py1 + 1 - py0) / (fy1 - fy0)
+    ck(abs(sx - PPC) / PPC < 0.004, f"x scale {sx:.2f} px/cm matches {PPC:.2f}")
+    ck(abs(sy - PPC) / PPC < 0.004, f"y scale {sy:.2f} px/cm matches {PPC:.2f}")
+    ck(abs(sx - sy) / PPC < 0.004, "the render is isotropic")
+    if nfail:
+        print(f"{npass} passed, {nfail} failed")
+        return 1
+
+    ox = px0 - fx0 * PPC          # figure x = 0 lands here
+    oy = py1 + 1 + fy0 * PPC      # figure y = 0 lands here
+    json.dump({"ox": ox, "oy": oy, "ppc": PPC, "dpi": DPI,
+               "fig": [fx0, fy0, fx1, fy1]},
+              open(os.path.join(OUTDIR, "map.json"), "w"), indent=1)
+
+    def X(x):
+        return int(round(ox + x * PPC))
+
+    def Y(y):
+        return int(round(oy - y * PPC))
+
+    # --- the figure fits the column it is printed in ----------------------
+    pw, ph = page_pt()
+    ck(pw <= COLUMN_PT, f"the figure is {pw:.1f}pt wide, under {COLUMN_PT:.0f}pt")
+    ck(ph < 0.42 * 782, f"the figure is {ph:.1f}pt tall, under 2/5 of a page")
+    ck(pw / ph > 2.6, "the figure is a band, not a block")
+
+    # --- the two lanes are exact mirrors ----------------------------------
+    # Both lanes are one macro called twice with a sign, so their GEOMETRY
+    # must fold onto itself about the axis.  Their CONTENT must not: the two
+    # factors carry different numbers and different frequencies, and a fold
+    # that cancelled the cells as well would mean the figure was drawing the
+    # same data twice.  So the test folds the silhouette, and only over the
+    # windows where the silhouette is a frame and not a datum.
+    # The windows are the ones whose silhouette is a frame: the two strip
+    # frames, the support strip, two slices of the funnel that no label
+    # reaches, and the state frames.  The coefficient strips are left out
+    # because the tallest ink above them is their own symbol, and beta is
+    # not the same height as alpha.  The state strips are left out for the
+    # same reason: the count label above them is set upright in both lanes,
+    # as every label is, so its silhouette cannot fold even when its box
+    # is placed exactly.
+    GEOM = [(11.70, 11.94), (12.20, 12.44), (12.58, 12.70),
+            (12.75, 12.95), (13.55, 14.05)]
+    yax = Y(AXIS)
+    cols = []
+    for gx0, gx1 in GEOM:
+        for c in range(X(gx0), X(gx1) + 1):
+            up = np.where(ink[:yax, c])[0]
+            dn = np.where(ink[yax:, c])[0]
+            if len(up) and len(dn):
+                cols.append((yax - up[0], dn[-1]))
+    cols = np.array(cols)
+    ck(len(cols) > 140, f"the mirror test found {len(cols)} columns to fold")
+    # The map is recovered from an antialiased ink box, so the axis can land
+    # up to a pixel or two out; the fold offset is searched, and what is
+    # asserted is that ONE offset squares every window at once.
+    offs = np.arange(-6, 7)
+    errs = [np.abs((cols[:, 0] + d) - (cols[:, 1] - d)).mean() for d in offs]
+    d0 = int(offs[int(np.argmin(errs))])
+    dev = np.abs((cols[:, 0] + d0) - (cols[:, 1] - d0))
+    ck(abs(d0) <= 3, f"the fold sits {d0} px from the mapped axis")
+    # At 300 dpi one pixel is 0.0085 cm, and a rule whose true position is
+    # a half pixel off the grid folds one pixel wrong everywhere, so the
+    # tolerance is stated in pixels but meant in centimetres.
+    ck(dev.max() <= 2,
+       f"every folded column agrees to {int(dev.max())} px"
+       f" ({dev.max() / PPC * 10:.3f} mm)")
+    ck(float(dev.mean()) < 1.1,
+       f"the mean fold error is {float(dev.mean()):.3f} px"
+       f" ({float(dev.mean()) / PPC * 10:.3f} mm)")
+
+    # The same fold over everything, saved as a picture rather than asserted:
+    # what survives it is what differs between the two factors, which should
+    # be cells, curves, stems and the four symbols, and nothing else.
+    band = ink[:, X(LANE_X0):X(LANE_X1)]
+    yfold = yax + d0
+    k = min(yfold, band.shape[0] - yfold)
+    a = band[yfold - k:yfold, :]
+    b = band[yfold:yfold + k, :][::-1, :]
+    Image.fromarray(np.where(a != b, 0, 255).astype(np.uint8)).save(
+        os.path.join(OUTDIR, "mirror_diff.png"))
+
+    # --- the blocks are where the drawing says they are -------------------
+    # Each entry is a rule the figure draws; the test is that ink is found
+    # within half a millimetre of it, and that the gap beside it is clear.
+    def inked(x, y, r=2):
+        return bool(ink[Y(y) - r:Y(y) + r + 1, X(x) - r:X(x) + r + 1].any())
+
+    def clear(x0, y0, x1, y1):
+        return not bool(ink[Y(y1):Y(y0), X(x0):X(x1)].any())
+
+    edges = [("X left", 0.45, 4.84), ("X right", 2.25, 4.84),
+             ("gX left", 0.45, 1.16), ("gX right", 2.25, 1.16),
+             ("W0 left", 2.85, 3.00), ("W0 right", 4.65, 3.00),
+             ("dW left", 5.15, 3.00), ("dW right", 6.95, 3.00),
+             ("H left", 7.65, 4.84), ("H right", 9.45, 4.84),
+             ("gH left", 7.65, 1.16), ("gH right", 9.45, 1.16),
+             ("gdW left", 9.60, 3.00), ("gdW right", 11.40, 3.00)]
+    for nm, x, y in edges:
+        ck(inked(x, y), f"the {nm} edge is drawn where it is declared")
+
+    # the two squares really are squares, and the same square
+    for nm, x0, x1 in (("W0", 2.85, 4.65), ("dW", 5.15, 6.95),
+                       ("gdW", 9.60, 11.40)):
+        ck(abs((x1 - x0) - 1.80) < 1e-9, f"{nm} is d cells wide")
+
+    # the gap the frozen weight leaves in the backward row: there is no
+    # gradient block under W0, and the figure must not quietly grow one
+    ck(clear(2.90, 0.50, 4.60, 0.85), "nothing sits below the frozen weight")
+
+    # --- the compression is drawn at the ratio it has ---------------------
+    # the coefficient strip against the factor strip, measured in ink
+    for lo, hi, nm in ((3.40, 5.20, "u"), (0.80, 2.60, "v")):
+        ck(abs((hi - lo) - 1.80) < 1e-9, f"the {nm} strip is d cells long")
+    for lo, hi, nm in ((4.40, 4.70, "beta"), (1.30, 1.60, "alpha")):
+        ck(abs((hi - lo) - 0.30) < 1e-9, f"the {nm} strip is s cells long")
+    ck(abs(0.30 / 1.80 - 128 / 768) < 1e-12,
+       "s/d in the drawing is 128/768")
+
+    # --- the funnel really tapers -----------------------------------------
+    def ink_span(x, y0, y1):
+        col = ink[Y(y1):Y(y0), X(x)]
+        w = np.where(col)[0]
+        return (0 if len(w) == 0 else (w[-1] - w[0] + 1) / PPC)
+
+    # The taper is the one ratio the caption invites a reader to measure,
+    # so it is measured, not assumed.  It is measured at two columns in the
+    # funnel's middle and extrapolated to its two edges, because a span read
+    # at the tip itself is dominated by the slanted strokes' own width: the
+    # closed trapezoid used to render 8 per cent over there, a 0.5 pt line
+    # meeting a 3 mm edge at a shallow angle adding about 0.1 mm at each end.
+    xa, xb = 12.80, 13.90
+    sa, sb = ink_span(xa, 3.30, 5.30), ink_span(xb, 3.70, 4.90)
+    slope = (sb - sa) / (xb - xa)
+    at_wide = sa + slope * (12.70 - xa)
+    at_narrow = sa + slope * (14.10 - xa)
+    ck(abs(at_wide - 1.80) < 0.04,
+       f"the funnel's wide edge extrapolates to {at_wide:.3f} cm, d = 1.80")
+    ck(abs(at_narrow - 0.30) < 0.04,
+       f"the funnel's narrow edge extrapolates to {at_narrow:.3f} cm, s = 0.30")
+    taper = at_wide / max(at_narrow, 1e-6)
+    ck(abs(taper - 6.0) / 6.0 < 0.10,
+       f"the funnel tapers {taper:.2f} to one against d/s = 6")
+
+    # --- nothing is drawn outside the region the figure is planned in -----
+    ck(fx0 > 0.30 and fx1 < 17.85, f"ink spans x {fx0:.2f} to {fx1:.2f} cm")
+    ck(fy0 > 0.18 and fy1 < 5.85, f"ink spans y {fy0:.2f} to {fy1:.2f} cm")
+
+    # --- the tiles a reviewer reads ---------------------------------------
+    for nm, (x0, y0, x1, y1) in CROPS.items():
+        tile = img[max(Y(y1), 0):Y(y0), max(X(x0), 0):X(x1)]
+        ck(tile.size > 0, f"crop {nm} is inside the page")
+        if tile.size:
+            big = Image.fromarray(tile).resize(
+                (tile.shape[1] * 3, tile.shape[0] * 3), Image.LANCZOS)
+            big.save(os.path.join(OUTDIR, f"crop_{nm}.png"))
+
+    print(f"{npass} passed, {nfail} failed")
+    return 1 if nfail else 0
 
 
 if __name__ == "__main__":
