@@ -181,7 +181,7 @@ def main() -> int:
     # same reason: the count label above them is set upright in both lanes,
     # as every label is, so its silhouette cannot fold even when its box
     # is placed exactly.
-    GEOM = [(11.70, 11.94), (12.20, 12.44), (12.58, 12.70),
+    GEOM = [(11.62, 11.86), (12.12, 12.36), (12.58, 12.70),
             (12.75, 12.95), (13.55, 14.05)]
     yax = Y(AXIS)
     cols = []
