@@ -284,6 +284,40 @@ def main() -> int:
     ck(abs(taper - 6.0) / 6.0 < 0.10,
        f"the funnel tapers {taper:.2f} to one against d/s = 6")
 
+    # --- the gradient's two segments are one line ------------------------
+    # In each lane the gradient line stops at the factor strip's near edge
+    # and resumes on its far edge, because it passes BEHIND the factor: no
+    # orthogonal route around it exists once the two trunks that feed the
+    # two strips are forbidden to cross.  The occlusion only reads as
+    # occlusion if the two segments are collinear, so that is measured.
+    def line_row(x, y0, y1):
+        col = ink[Y(y1):Y(y0), X(x)]
+        w = np.where(col)[0]
+        return None if len(w) == 0 else Y(y1) + int(round(w.mean()))
+
+    for sgn, nm in ((1, "u"), (-1, "v")):
+        yc = AXIS + sgn * 1.195
+        a = line_row(12.07, yc - 0.10, yc + 0.10)
+        b = line_row(12.50, yc - 0.10, yc + 0.10)
+        ck(a is not None and b is not None,
+           f"the {nm} lane's gradient line is drawn both sides of the factor")
+        if a is not None and b is not None:
+            ck(abs(a - b) <= 1,
+               f"the {nm} lane's two gradient segments are collinear"
+               f" ({abs(a - b)} px apart)")
+
+    # --- the five lit cells on each wide edge survive the travel lines ----
+    # They are drawn after the lines for exactly this reason: drawn before,
+    # two of the five fused with a line and a blind reader counted six.
+    for sgn, nm in ((1, "u"), (-1, "v")):
+        # inset past the strip's own frame, which is darker than an unlit
+        # cell and would count as a sixth and seventh run
+        r0, r1 = sorted((Y(AXIS + sgn * 2.16), Y(AXIS + sgn * 0.44)))
+        col = img[r0:r1, X(12.64)]
+        dark = (col < 200).astype(np.int8)
+        n = int((np.diff(np.concatenate(([0], dark, [0]))) == 1).sum())
+        ck(n == 5, f"the {nm} funnel's wide edge lights {n} cells, want 5")
+
     # --- nothing is drawn outside the region the figure is planned in -----
     ck(fx0 > 0.30 and fx1 < 17.85, f"ink spans x {fx0:.2f} to {fx1:.2f} cm")
     ck(fy0 > 0.18 and fy1 < 5.85, f"ink spans y {fy0:.2f} to {fy1:.2f} cm")
