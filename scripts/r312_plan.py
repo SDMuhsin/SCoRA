@@ -35,6 +35,26 @@ THE PROBLEM [R.311-ablation] COULD NOT SOLVE
   pearson<=0, BoolQ acc<=0.6217).  Accuracy (the repo's max-over-30-epochs
   number) is the SECONDARY outcome and is reported beside it.
 
+⭐ 2026-09-19 -- THE STS-B COLUMN IS COMPLETED, AND NOTHING ELSE MOVES
+  `[user, 2026-09-19]` asked for the paper's blank ablation cells to be filled.
+  The ONLY edit is that every arm's `tasks` list now carries `stsb`: +20 cells.
+  The arms, the (r, s) grid, the primary outcome, the CONTRASTS and the
+  predictions are untouched -- they were frozen at `bef2cbd` and already SCORED
+  in `R312_reach_rank_confound_verdict.md`, so completing cells of a design
+  whose rule is already read adds no researcher degree of freedom.
+
+⛔⛔ 2026-09-19 -- BoolQ IS EXCLUDED BY AUTHOR DECISION, AND THE REASON IS HERE
+  `[user, 2026-09-19]`: *"Please be strategic, if a task is known to be unstable
+  don't use it."*  BoolQ is that task in this study -- 1/5 seeds already unstable
+  at the SHIPPED 6,144, 9/10 at 12,288 -- and it is also 3,905 s/cell against
+  CoLA's 653, i.e. ~70% of the spend for the axis that is already characterised.
+  ⛔ It is therefore NOT filled, and `tab:ablation`'s BoolQ blanks REMAIN.
+  ⛔ The expected direction was recorded BEFORE any cell, in
+  `R314_scale_ablation_prereg.md` §1: those cells were expected to be
+  CATASTROPHIC.  ⇒ The omission is an author scope decision whose expected
+  result is on the record, NOT a silent selection on the outcome.  Any caption
+  covering this table must keep saying that a blank cell was not run.
+
 ⛔ THE STANDING PROHIBITION, and why this does not violate it
   [R.45 §4] closed the SLR budget thread: "no third attempt by tuning another
   constant -- that would be sweeping."  [R.59 §5] repeats it.  NOTHING here is
@@ -65,10 +85,10 @@ ARMS = [
     ("D",  2, 256, ["cola", "stsb"],          "24,576  both  x2   (2x2 factorial corner)"),
     ("E",  1, 512, ["cola", "stsb"],          "24,576  reach x4   <- iso-budget vs F"),
     ("F",  4, 128, ["cola", "stsb"],          "24,576  rank  x4   <- iso-budget vs E"),
-    ("G160", 1, 160, ["cola"],                "7,680   s-boundary"),
-    ("G192", 1, 192, ["cola"],                "9,216   s-boundary"),
-    ("G224", 1, 224, ["cola"],                "10,752  s-boundary"),
-    ("H",  4, 256, ["cola"],                  "49,152  does RANK rescue s=256? (8x budget)"),
+    ("G160", 1, 160, ["cola", "stsb"],        "7,680   s-boundary"),
+    ("G192", 1, 192, ["cola", "stsb"],        "9,216   s-boundary"),
+    ("G224", 1, 224, ["cola", "stsb"],        "10,752  s-boundary"),
+    ("H",  4, 256, ["cola", "stsb"],          "49,152  does RANK rescue s=256? (8x budget)"),
 ]
 PIVOT = "A"
 NEW_ARMS = [a for a, _r, _s, _t, _d in ARMS if a != PIVOT]
@@ -298,6 +318,13 @@ def report():
 
 
 def cost_table(workers=3):
+    """(rows, total GPU-s, REMAINING wall-s at `workers`).
+
+    ⭐ Since the 2026-09-19 completion the design's total cost is historical --
+    most of it is already on disk.  The number that decides whether to launch is
+    what is LEFT, so that is what the wall estimate and the selftest gate use.
+    A row is (task, planned cells, cells still to run, s/cell, remaining GPU-s).
+    """
     import csv as _csv, glob as _glob
     sec = {}
     for t in TASKS:
@@ -307,11 +334,15 @@ def cost_table(workers=3):
             if rows:
                 ts.append(float(rows[-1]["total_training_time_sec"]))
         sec[t] = statistics.median(ts)
-    rows, tot = [], 0.0
+    have = R310R.load(os.path.join(D, "csv"))
+    rows, tot, left = [], 0.0, 0.0
     for t in TASKS:
         n = sum(len(SEEDS) for a in NEW_ARMS if t in spec(a)["tasks"])
-        rows.append((t, n, sec[t], n * sec[t])); tot += n * sec[t]
-    return rows, tot, tot / workers
+        todo = sum(1 for a in NEW_ARMS if t in spec(a)["tasks"]
+                   for sd in SEEDS if label_for(t, a, sd) not in have)
+        rows.append((t, n, todo, sec[t], todo * sec[t]))
+        tot += n * sec[t]; left += todo * sec[t]
+    return rows, tot, left / workers
 
 
 def status():
@@ -426,7 +457,8 @@ def selftest():
     # -- 8. cost fits the limit ---------------------------------------------
     rows, tot, wall = cost_table(3)
     ck(wall < 24 * 3600,
-       f"{sum(r[1] for r in rows)} cells, {tot/3600:.1f} GPU-h, ~{wall/3600:.1f} h wall at 3 workers")
+       f"{sum(r[2] for r in rows)} of {sum(r[1] for r in rows)} cells still to run; "
+       f"design {tot/3600:.1f} GPU-h, ~{wall/3600:.1f} h wall REMAINING at 3 workers")
 
     # ⛔ the canonical form `scripts/run_all_gates.py` parses -- a gate whose
     # report it cannot read is scored 0/1 FAILING, which is how one cries wolf.
@@ -448,10 +480,11 @@ def main():
     if a.tasks: print(" ".join(TASKS)); return
     if a.cost:
         rows, tot, wall = cost_table(3)
-        print(f"{'task':>6} | cells | s/cell | GPU-h")
-        for t, n, s, c in rows:
-            print(f"{t:>6} | {n:5d} | {s:6.0f} | {c/3600:6.2f}")
-        print(f"TOTAL {tot/3600:.2f} GPU-h; ~{wall/3600:.2f} h wall at 3 workers")
+        print(f"{'task':>6} | cells |  left | s/cell | GPU-h left")
+        for t, n, todo, sc, c in rows:
+            print(f"{t:>6} | {n:5d} | {todo:5d} | {sc:6.0f} | {c/3600:10.2f}")
+        print(f"DESIGN {tot/3600:.2f} GPU-h total; ~{wall/3600:.2f} h wall REMAINING "
+              f"at 3 workers")
         return
     if a.plan:
         for name, r, s, ts, role in ARMS:

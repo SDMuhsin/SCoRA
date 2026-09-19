@@ -58,6 +58,7 @@ GATES = [
     ("scratchpad/phaseR/r261_rescan.py", "near-floor re-scan"),
     ("scripts/build_prl_tables.py",   "the letter's tables: arm set, five seeds per cell, the two headline gate outcomes"),
     ("scripts/r313_plan.py",         "[R.313] the basis control: arg strings differ in exactly --slr_basis"),
+    ("scripts/r314_plan.py",         "[R.314] the scale ladder: one flag per rung, and the frozen predictions scored mechanically"),
     ("scripts/build_architecture_data.py",
      "the architecture figure's data: the drawn support, the synthesis, the rank"),
     ("scripts/architecture_figure_audit.py",
