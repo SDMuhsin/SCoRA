@@ -47,12 +47,32 @@ TARGETS = "q_proj,o_proj"
 DATASET = ("wikitext", "wikitext-2-raw-v1")
 BLOCK = 512
 MICRO_BS = 4
-ACCUM = 4                      # total batch 16 blocks = 8,192 tokens
+ACCUM = 4                      # total batch 16 blocks = 8,192 tokens -- UNCHANGED by the
+                               # micro-batch choice, which is a COMPUTE layout only.
+                               # ⚠ 4x4 not 8x2: [measured] fp32 throughput is the same to
+                               # 1%, and 8 peaks at 38.1 GiB against 4's 27.2 on a SHARED
+                               # 46 GiB card that another user is already holding ~4 GiB of.
 SEEDS = [42, 43, 44, 45, 46]   # the banked convention; the 5/5 gate needs all five
 WARMUP_RATIO = 0.05983         # [R.310]'s own RTE-derived ratio, carried as a ratio
 WEIGHT_DECAY = 0.01
-DTYPE = "float32"
-TF32 = True                    # [measured] 2.02x, and it moves the eval ppl by <1e-6 rel
+DTYPE = "float32"              # MASTER weights and optimizer state stay fp32
+# ⛔ TF32 IS OFF, AND THE 2.02x THAT ARGUED FOR IT IS RETRACTED.  [measured] a standalone
+#   probe showed 2.02x; the SAME toggle on the real training path gives 1.00x, twice
+#   (scratchpad/path_timing.py, and the first pilot ran at the fp32 rate with the flag
+#   set and logged as enabled).  The probe was measuring something else.
+TF32 = False
+# ⭐⭐ COMPUTE precision: EXACT fp32, by `[USER DECISION, 2026-09-21]`.
+#   The alternative was costed and declined: [measured, scratchpad/precision_probe.py]
+#   autocast-bf16 (fp32 master weights, half COMPUTE) is 3.15x at micro-batch 4 and
+#   3.38x at 8 and would have brought the study from ~100 GPU-h to ~30, at the price of
+#   a 0.084% shift in the frozen backbone's perplexity (9.96731 -> 9.97573).
+#   ⇒ The user chose the ~100 GPU-h exact-fp32 protocol with FULL scope.
+#   ⭐ What that buys, and it is worth stating in the write-up: this study's arithmetic
+#     is IDENTICAL to the gemma-2b stage-05 table's, so the two remain directly
+#     comparable, and no perplexity in [R.315] carries a precision caveat.
+#   ⚠ train_clm still SUPPORTS --mixed_precision (it inherits train_glue's flag and
+#     honours it); the study simply does not use it. "no" is the shipped path.
+MIXED_PRECISION = "no"
 
 # ⭐ Set by the pilot, which is why the pilot ran first.  Both are CALIBRATION
 # decisions (PROCESS.md 1.1 permits calibration to inform design, labelled as such).
@@ -80,7 +100,8 @@ def _f(x):
 
 
 def common_flags(epochs, seeds, name, cell_dir="scratchpad/clm"):
-    f = ["--model_name_or_path", MODEL, "--dtype", DTYPE]
+    f = ["--model_name_or_path", MODEL, "--dtype", DTYPE,
+         "--mixed_precision", MIXED_PRECISION]
     if TF32:
         f.append("--tf32")
     f += ["--adapter_target_modules", TARGETS,
@@ -277,9 +298,17 @@ def selftest():
     check("G6b the targets are the decoder pair", f"--adapter_target_modules {TARGETS}" in cmd)
 
     # G7 dtype/tf32 are explicit on every cell -- train_clm fails closed without dtype.
-    check("G7 every cell passes --dtype and --tf32",
-          all("--dtype" in cell_cmd(c) and "--tf32" in cell_cmd(c)
+    check("G7 every cell passes --dtype and an explicit --mixed_precision",
+          all("--dtype" in cell_cmd(c) and "--mixed_precision" in cell_cmd(c)
               for st in ("stage0", "halfA", "halfB") for c in cells(st)))
+    check("G7b the compute precision is the SAME on every cell of the study "
+          "(a per-arm precision would disqualify the comparison)",
+          len({cell_cmd(c)[cell_cmd(c).index("--mixed_precision") + 1]
+               for st in ("stage0", "halfA", "halfB") for c in cells(st)}) == 1)
+    check("G7c master weights stay fp32 (--dtype float32), never a half-precision CAST",
+          DTYPE == "float32")
+    check("G7d the total batch is 16 blocks regardless of the micro-batch layout",
+          MICRO_BS * ACCUM == 16)
 
     # G8 five seeds on every STUDY cell (the 5/5 gate cannot be run on four).
     check("G8 halfA and halfB cells carry all five seeds",

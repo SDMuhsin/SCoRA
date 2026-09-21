@@ -13,7 +13,11 @@
 set -u
 cd "$(dirname "$0")/.."
 PY=env/bin/python
-COMMON="--model_name_or_path google/gemma-2b --dtype float32 --tf32 \
+# ⛔ The protocol here is r315_plan's, so the pilot calibrates the study that will run,
+#    not a different one: EXACT fp32 [USER DECISION 2026-09-21] -- no --mixed_precision,
+#    and NO --tf32 (its 2.02x was retracted: 1.00x on the real path, measured twice).
+#    Micro-batch 4 x accum 4 = a 16-block total batch, 27.2 GiB peak on a shared card.
+COMMON="--model_name_or_path google/gemma-2b --dtype float32 \
  --adapter_target_modules q_proj,o_proj --block_size 512 \
  --per_device_train_batch_size 4 --gradient_accumulation_steps 4 \
  --num_train_epochs 3 --warmup_ratio 0.05983 --weight_decay 0.01 \

@@ -586,13 +586,35 @@ def run_single_seed(args, seed: int, train_blocks, eval_blocks, tokenizer) -> Di
     logger.info("[seed %d] steps/epoch=%d total=%d warmup=%d lr=%g arm=%s",
                 seed, steps_per_epoch, max_train_steps, warmup, args.learning_rate, args.arm)
 
+    # --- Mixed precision, inherited from train_glue's own flag and its semantics ---
+    # ⭐ NOT the same knob as --dtype: this keeps fp32 MASTER WEIGHTS and fp32 optimizer
+    #   state and casts only the COMPUTE.  `[FP16_BASELINE.md, measured]` casting the
+    #   model instead makes half-precision training collapse, so the two must not be
+    #   confused.  ⛔ fp16 needs a loss scaler and `torch.amp.GradScaler` is the spelling
+    #   that exists on both torch builds this repo runs on.
+    amp_enabled = args.mixed_precision != "no"
+    if amp_enabled:
+        if device.type != "cuda":
+            raise SystemExit(f"--mixed_precision {args.mixed_precision} requires CUDA.")
+        if args.dtype != "float32":
+            raise SystemExit(
+                f"--mixed_precision {args.mixed_precision} needs fp32 master weights but "
+                f"--dtype is {args.dtype!r}. A cast plus autocast is neither.")
+    amp_dtype = torch.float16 if args.mixed_precision == "fp16" else torch.bfloat16
+    scaler = torch.amp.GradScaler("cuda", enabled=(args.mixed_precision == "fp16"))
+    if amp_enabled:
+        logger.info("[amp] mixed_precision=%s autocast=%s master weights=fp32",
+                    args.mixed_precision, amp_dtype)
+
     @torch.no_grad()
     def evaluate_ppl() -> Dict[str, float]:
         model.eval()
         nll, ntok = 0.0, 0
         for (batch,) in eval_loader:
             batch = batch.to(device, non_blocking=True)
-            out = model(input_ids=batch, labels=batch)
+            with torch.autocast(device_type=device.type, dtype=amp_dtype,
+                                enabled=amp_enabled):
+                out = model(input_ids=batch, labels=batch)
             # HF shifts internally: each block of B tokens contributes B-1 predictions.
             k = batch.shape[0] * (batch.shape[1] - 1)
             nll += float(out.loss) * k
@@ -613,17 +635,25 @@ def run_single_seed(args, seed: int, train_blocks, eval_blocks, tokenizer) -> Di
         model.train()
         for step, (batch,) in enumerate(train_loader):
             batch = batch.to(device, non_blocking=True)
-            out = model(input_ids=batch, labels=batch)
+            with torch.autocast(device_type=device.type, dtype=amp_dtype,
+                                enabled=amp_enabled):
+                out = model(input_ids=batch, labels=batch)
             loss = out.loss
             if args.gradient_accumulation_steps > 1:
                 loss = loss / args.gradient_accumulation_steps
-            loss.backward()
+            scaler.scale(loss).backward()
             if ((step + 1) % args.gradient_accumulation_steps == 0
                     or step == len(train_loader) - 1):
+                # ⛔ UNSCALE BEFORE CLIPPING, or the clip threshold is wrong by the
+                #   scale factor -- silently, and that factor moves whenever the scaler
+                #   backs off (train_glue carries the same note).
+                if scaler.is_enabled():
+                    scaler.unscale_(optimizer)
                 if args.grad_clipping > 0.0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clipping)
                 t = time.perf_counter()
-                optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
                 step_times.append(time.perf_counter() - t)
                 lr_scheduler.step()
                 optimizer.zero_grad()
@@ -665,7 +695,8 @@ def run_single_seed(args, seed: int, train_blocks, eval_blocks, tokenizer) -> Di
         "max_train_steps": max_train_steps, "num_warmup_steps": warmup,
         "warmup_ratio": args.warmup_ratio if args.warmup_ratio is not None else "",
         "lr_scheduler_type": str(args.lr_scheduler_type), "dtype": args.dtype,
-        "tf32": bool(args.tf32), "bos_per_block": args.bos_per_block,
+        "tf32": bool(args.tf32), "mixed_precision": args.mixed_precision,
+        "bos_per_block": args.bos_per_block,
         "bos_id": _bos_id if _bos_id is not None else "",
         "adapter_target_modules": args.adapter_target_modules or "default",
         "n_eval_tokens": init["n_eval_tokens"], "n_train_blocks": len(train_blocks),
