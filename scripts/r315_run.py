@@ -47,6 +47,35 @@ def is_done(c):
     return all(os.path.exists(m) for m in markers(c))
 
 
+def gpu_tenants():
+    """(n_procs, total_MiB, our_MiB) on cuda:0, sampled NOW.
+
+    ⛔ `PROCESS.md 6`: record the concurrent job count per cell WHILE IT RUNS, not
+    afterwards -- `[R.103b]`'s comparator ran at 2 jobs and its test arm at 4, which is
+    knowable only from a contemporaneous log.  This box is SHARED: [observed 2026-09-21]
+    a second tenant appeared mid-Stage-0 and our step time went 5.1 s -> 7.3 s (+43%),
+    so any wall-clock read off these logs without the tenant count beside it is
+    uninterpretable.
+    ⚠ It counts OTHER USERS' processes too, which is the point here -- unlike the
+      job-counting recipes in `PROCESS.md 6`, whose failure mode was over-counting our
+      own shells.  This reads the driver's own view of the card, not a pgrep pattern.
+    """
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-compute-apps=pid,used_memory",
+             "--format=csv,noheader,nounits"], text=True).strip()
+    except Exception:
+        return (-1, -1, -1)
+    rows = [r for r in out.splitlines() if r.strip()]
+    tot = 0
+    for r in rows:
+        try:
+            tot += int(r.split(",")[1])
+        except (IndexError, ValueError):
+            pass
+    return (len(rows), tot, -1)
+
+
 def run_cell(c, dry=False):
     cid = P.cell_id(c)
     cmd = [os.path.join(ROOT, "env", "bin", "python") if x == "env/bin/python" else x
@@ -58,16 +87,20 @@ def run_cell(c, dry=False):
     os.makedirs(LOG_DIR, exist_ok=True)
     env = dict(os.environ, CUDA_VISIBLE_DEVICES="0")
     t0 = time.time()
-    print(f"[{time.strftime('%H:%M:%S')}] START {cid}  -> {os.path.relpath(log, ROOT)}",
-          flush=True)
+    n0, mem0, _ = gpu_tenants()
+    print(f"[{time.strftime('%H:%M:%S')}] START {cid}  -> {os.path.relpath(log, ROOT)} "
+          f"| gpu tenants at start: {n0} procs, {mem0} MiB", flush=True)
     with open(log, "a") as fh:
         fh.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} {' '.join(cmd)}\n")
         fh.flush()
         rc = subprocess.call(cmd, stdout=fh, stderr=subprocess.STDOUT, cwd=ROOT, env=env)
     dt = (time.time() - t0) / 60.0
+    n1, mem1, _ = gpu_tenants()
     ok = (rc == 0 and is_done(c))
     print(f"[{time.strftime('%H:%M:%S')}] {'DONE ' if ok else 'FAILED'} {cid} "
-          f"({dt:.1f} min, rc={rc})", flush=True)
+          f"({dt:.1f} min, rc={rc}) | gpu tenants start={n0} end={n1}"
+          f"{'  ⚠ CHANGED MID-CELL -- wall clock not comparable' if n0 != n1 else ''}",
+          flush=True)
     if not ok:
         open(os.path.join(CELL_DIR, cid + ".log.failed"), "a").close()
     return 0 if ok else 1
@@ -159,6 +192,12 @@ def _selftest():
     c = P.cells("halfB")[2]
     check("G5b and for a comparator arm", os.path.basename(markers(c)[0])
           == f"{P.cell_id(c)}_{c['arm']}_seed42.done")
+
+    # G7 -- the tenant sampler returns a shape the log can print, even off-GPU.
+    n, mem, _ = gpu_tenants()
+    check("G7 the GPU-tenant sampler returns (n, MiB) or the (-1,-1) 'unavailable' form",
+          (isinstance(n, int) and isinstance(mem, int)
+           and ((n >= 0 and mem >= 0) or (n == -1 and mem == -1))), f"{(n, mem)}")
 
     # G6 -- every planned cell id is unique, so no two cells share markers.
     ids = [P.cell_id(c) for st in ("stage0", "halfA", "halfB") for c in P.cells(st)]
