@@ -29,6 +29,7 @@ Usage:
 import argparse
 import hashlib
 import json
+import math
 import os
 import sys
 
@@ -42,42 +43,103 @@ import fir_arms as FA                  # noqa: E402  -- the per-arm scale/target
 # --------------------------------------------------------------------------- #
 #                            the frozen protocol                              #
 # --------------------------------------------------------------------------- #
-MODEL = "google/gemma-2b"
-TARGETS = "q_proj,o_proj"
+MODEL = "HuggingFaceTB/SmolLM2-135M"    # [USER DECISION, 2026-09-21]
+TARGETS = "q_proj,o_proj"               # 60 nn.Linear modules, 576x576
 DATASET = ("wikitext", "wikitext-2-raw-v1")
 BLOCK = 512
 MICRO_BS = 4
-ACCUM = 4                      # total batch 16 blocks = 8,192 tokens -- UNCHANGED by the
-                               # micro-batch choice, which is a COMPUTE layout only.
-                               # ⚠ 4x4 not 8x2: [measured] fp32 throughput is the same to
-                               # 1%, and 8 peaks at 38.1 GiB against 4's 27.2 on a SHARED
-                               # 46 GiB card that another user is already holding ~4 GiB of.
+ACCUM = 4                      # total batch 16 blocks = 8,192 tokens
 SEEDS = [42, 43, 44, 45, 46]   # the banked convention; the 5/5 gate needs all five
-WARMUP_RATIO = 0.05983         # [R.310]'s own RTE-derived ratio, carried as a ratio
-WEIGHT_DECAY = 0.01
+WARMUP_RATIO = 0.06            # the standard transformers/PEFT warmup fraction
+WEIGHT_DECAY = 0.01            # FourierFT's own published E2E value (GPT-2 medium)
 DTYPE = "float32"              # MASTER weights and optimizer state stay fp32
 # ⛔ TF32 IS OFF, AND THE 2.02x THAT ARGUED FOR IT IS RETRACTED.  [measured] a standalone
-#   probe showed 2.02x; the SAME toggle on the real training path gives 1.00x, twice
-#   (scratchpad/path_timing.py, and the first pilot ran at the fp32 rate with the flag
-#   set and logged as enabled).  The probe was measuring something else.
+#   probe showed 2.02x; the SAME toggle on the real training path gives 1.00x, twice.
 TF32 = False
-# ⭐⭐ COMPUTE precision: EXACT fp32, by `[USER DECISION, 2026-09-21]`.
-#   The alternative was costed and declined: [measured, scratchpad/precision_probe.py]
-#   autocast-bf16 (fp32 master weights, half COMPUTE) is 3.15x at micro-batch 4 and
-#   3.38x at 8 and would have brought the study from ~100 GPU-h to ~30, at the price of
-#   a 0.084% shift in the frozen backbone's perplexity (9.96731 -> 9.97573).
-#   ⇒ The user chose the ~100 GPU-h exact-fp32 protocol with FULL scope.
-#   ⭐ What that buys, and it is worth stating in the write-up: this study's arithmetic
-#     is IDENTICAL to the gemma-2b stage-05 table's, so the two remain directly
-#     comparable, and no perplexity in [R.315] carries a precision caveat.
-#   ⚠ train_clm still SUPPORTS --mixed_precision (it inherits train_glue's flag and
-#     honours it); the study simply does not use it. "no" is the shipped path.
-MIXED_PRECISION = "no"
+MIXED_PRECISION = "no"         # [USER DECISION] exact fp32; autocast-bf16 was declined
+EPOCHS = 3                     # the canonical HF wikitext-2 causal-LM recipe
+SCREEN_EPOCHS = 3              # the lr screen runs the FULL protocol, at ONE seed
 
-# ⭐ Set by the pilot, which is why the pilot ran first.  Both are CALIBRATION
-# decisions (PROCESS.md 1.1 permits calibration to inform design, labelled as such).
-EPOCHS = 3
-SCREEN_EPOCHS = 1              # Stage 0 only
+# --------------------------------------------------------------------------- #
+#  ⭐⭐ ONE COMMON RECIPE FOR EVERY ARM AND EVERY RUNG  [USER DECISION 2026-09-21] #
+# --------------------------------------------------------------------------- #
+# `[user]`: *"Find recommended hyperparameter recipes from online (it doesn\'t matter
+# too much as long as every config of ablation is matched at common hyperparams)."*
+# ⇒ NO per-arm learning-rate tuning happens anywhere in this study.  One lr, one
+#   schedule, one batch, one epoch count, for all nine arms and all four ladder rungs.
+#
+# ⛔ BUT A COMMON RAW `lr` IS NOT A COMMON STEP.  The per-parameter atom
+#   ||d dW/d theta||_F differs across these methods by up to 43x `[CONTEXT 2]`, so a
+#   shared `lr` would hand some arms a 43x bigger step and call it fair.  The repo\'s own
+#   rule is to carry `P` = `lr`*atom.  Both halves of the instruction are satisfied by
+#   holding `P` common: ONE `lr` for everybody, and each arm\'s scale set A PRIORI so
+#   that every arm\'s atom is the SAME.
+#   ⭐ That is `CARRY_FORWARD 4.4`\'s atom-norm rule and `PROCESS 5` test 4 in one move:
+#     "each method may use its own documented normalisation, but the constant must be
+#     derived a priori from the transform\'s norm -- anything found by sweeping is
+#     disqualified."  Nothing below was swept.
+#
+# THE REFERENCE ATOM is FourierFT\'s own, 0.138106793200498 `[CARRY_FORWARD 4.2]` -- i.e.
+# `scaling` = 150 at 768x768, which is PEFT\'s DOCUMENTED DEFAULT for FourierFT and the
+# middle of the 100-150 band its docs recommend.  At SmolLM2-135M\'s 576x576 the same
+# atom is `scaling` = 112.5, still inside that documented band.
+REF_ATOM = 0.138106793200498
+
+# THE COMMON LEARNING RATE, carried from a PUBLISHED recipe in the `P` coordinate:
+#   FourierFT\'s paper, GPT-2 Medium on E2E -- its own generative-LM setting:
+#       lr = 2e-2, scaling alpha = 300, modules 1024x1024
+#   => atom = 300/sqrt(2*1024*1024) = 0.207193,  P = 2e-2 * 0.207193 = 4.1439e-3
+#   => at REF_ATOM that same P is  lr = 4.1439e-3 / 0.138107 = 0.030005
+# ⚠ Carrying the raw 2e-2 instead would have handed every arm a 1.5x SMALLER step than
+#   the published recipe, purely because our modules are narrower -- the exact mistake
+#   `memory:hp-transfer-proxy` exists to prevent.
+# ⭐ Independent corroboration: the gemma-2b search selected 0.0451 for `scora` at this
+#   same atom -- a `P` within 1.5x of the published one, found by a completely
+#   separate route.
+# ⭐⭐ `--slr_init_norm unit`, and it is REQUIRED by the common-recipe design.
+#   SCoRA\'s a-priori rule sets `scaling` = REF_ATOM/sqrt(t) so that the per-parameter
+#   atom `scaling*||alpha_j||` equals REF_ATOM -- but under the shipped `raw` init,
+#   ||alpha_j|| ~ sqrt(t) only IN EXPECTATION, with per-row sd 1/sqrt(2t): 6.2% at
+#   t=128 and 17.7% at t=16.  So under `raw` the ladder\'s rungs differ in how
+#   HETEROGENEOUS their per-row steps are, and that heterogeneity grows as `s` shrinks
+#   -- a difference between rungs that has nothing to do with the (r,s) parameterisation
+#   being ablated.
+#   ⚠ [measured] the MEAN atom is NOT the problem: across the four rungs it is stable to
+#     0.5% under `raw` (0.12888-0.12959).  An earlier reading of "up to 26% drift" came
+#     from `fir_backbone_port.atom_of`, which probes ONE row and therefore reports that
+#     per-draw sd as if it were a shift.  The mean is fine; the spread is the issue.
+#   ⇒ `unit` rescales each row to ||alpha_j|| = sqrt(t) EXACTLY, so [measured] every rung
+#     and both SCoRA arms sit at atom = 0.138107 = REF_ATOM to 6 decimals -- the same
+#     step as all seven other arms.  It costs ZERO parameters and ZERO flops, keeps
+#     dW = 0 at init, and keeps the step-0 gradient FIRST order (`[R.174]`, gates 6/6).
+#   ⛔ IT IS A DEVIATION FROM THE LETTER\'S SHIPPED ARM, which is `raw`.  Declared here,
+#     and it means no [R.315] SCoRA number may be compared against a banked `raw` one.
+#     This study is self-contained -- new backbone, new objective, every arm re-run --
+#     so nothing inside it is cross-compared; but the write-up must say which arm it
+#     ablated.
+SLR_INIT_NORM = "unit"
+
+COMMON_LR = 0.030
+LR_SCREEN = [0.5, 1.0, 2.0]    # multiplies the COMMON lr; never a per-arm one
+SCREEN_ARMS = ["scora", "fftm"]
+
+# A-PRIORI per-arm scale at 576x576, derived so that EVERY arm\'s atom == REF_ATOM.
+# ⛔ MEASURED, NOT TYPED: each value is `frozen_gemma_scale * REF_ATOM / atom_measured`,
+#   the atom measured by `fir_backbone_port.atom_of` at 576x576, every arm confirmed
+#   EXACTLY LINEAR in its scale flag -- so the rescale is exact, not a fit.
+#   Reproduce with `--verify-scales`.
+DERIVED_SCALE = {
+    "fftm": 112.5, "fftstock": 112.5, "wave1": 112.5, "wave2": 112.5,
+    "qwha": 79.5495, "loca": 0.138106793200498, "lyra": 0.138106793200498,
+    # ⛔ scora takes NO scale flag.  Its a-priori rule is REF_ATOM/sqrt(t), which is
+    #   INDEPENDENT OF WIDTH, so it needs no porting at all (fir_arms: "DO NOT ADD ONE").
+    "scora": None,
+    # ⭐ scora2 is the SWEPT-scale row, and what [R.306] selected was the RATIO: its
+    #   gemma value 0.0244141 is exactly 2.0000x scora\'s derived gamma = 0.0122074.
+    #   gamma does not move with width, so the ratio carries unchanged and scora2 stays
+    #   a genuinely different arm instead of collapsing onto scora.
+    "scora2": 0.0244141,
+}
 
 # Half A -- (r, s) at a FIXED 9,216 parameters.  params/module = r*(s+t) = 2*r*s = 256.
 # ⛔ The budget is held EXACTLY, not approximately: `selftest` asserts 2*r*s == 256 for
@@ -116,8 +178,12 @@ PREREG_SHA256 = {
     "R315_pilot_verdict.md":      "9fad2ceb30758a34",
     # frozen before the first Stage-0 cell (driver started 19:01 UTC)
     "R315_stage0_prereg.md":      "bd27f7d1e2db599d",
-    # frozen before ANY Half-A or Half-B cell exists
+    # v1: frozen before ANY Half-A/Half-B cell existed.  SUPERSEDED by v2 but NOT
+    # edited -- its hash stays checked, so what it said before the amendment is provable.
     "R315_prereg.md":             "6f7e36d97aaa2cce",
+    # v2: the SmolLM2-135M backbone + the one-common-recipe regime, both [USER DECISION
+    # 2026-09-21], frozen before any cell of THIS plan exists
+    "R315_prereg_v2.md":          "fa44c71d1cdb4e1b",
 }
 
 
@@ -159,22 +225,25 @@ def common_flags(epochs, seeds, name, cell_dir="scratchpad/clm"):
 
 
 def arm_flags(arm, lr_mult=1.0, rank=None, s=None):
-    """The adapter flags for one arm, from the FROZEN table -- never retyped.
+    """The adapter flags for one arm under the COMMON recipe.
 
-    `rank`/`s` override SCoRA's budget split for Half A's ladder; `lr_mult` moves P
-    for Stage 0.  ⛔ No other knob may be passed: a per-arm constant found by sweeping
-    disqualifies a fairness claim (PROCESS.md 5 test 4), and the scale flags below are
-    the ones the gemma-2b search already selected, not new ones.
+    ⛔ THE ONLY THINGS THAT EVER DIFFER BETWEEN ARMS: the method, its budget flag name,
+       and its A-PRIORI scale (set so every arm\'s atom equals REF_ATOM).  The learning
+       rate, weight decay, schedule, batch, epochs and seeds are IDENTICAL for all nine
+       arms and all four ladder rungs -- that is what makes this a matched comparison
+       rather than nine separately tuned ones.
+
+    `rank`/`s` override SCoRA\'s budget split for Half A\'s ladder; `lr_mult` is used ONLY
+    by the lr screen, and it moves the COMMON lr, never one arm\'s.
     """
-    if arm not in FFP.SELECTED:
+    if arm not in DERIVED_SCALE:
         raise SystemExit(f"FAIL CLOSED: {arm!r} is not one of the nine frozen arms.")
-    sel = FFP.SELECTED[arm]
     method = {"fftm": "fourierftmerged", "fftstock": "fourierft", "loca": "loca",
               "qwha": "qwha", "wave1": "haar", "wave2": "haar", "lyra": "spectral",
               "scora": "slr", "scora2": "slr"}[arm]
     f = ["--optimizer", f"adamw-{method}",
-         "--learning_rate", _f(sel["lr"] * lr_mult)]
-    # k = 256 everywhere; the per-arm budget flag names differ, nothing else does.
+         "--learning_rate", _f(COMMON_LR * lr_mult)]
+    # k = 256 per module everywhere; only the flag NAME differs between methods.
     if method == "fourierftmerged":
         f += ["--fourierftmerged_k", "256", "--fourierftmerged_seed", "777"]
     elif method == "fourierft":
@@ -192,20 +261,45 @@ def arm_flags(arm, lr_mult=1.0, rank=None, s=None):
     elif method == "slr":
         r_, s_ = (rank if rank is not None else 1), (s if s is not None else 128)
         f += ["--slr_rank", str(r_), "--slr_s", str(s_),
-              "--slr_init", "zero", "--slr_seed", "777"]
+              "--slr_init", "zero", "--slr_seed", "777",
+              "--slr_init_norm", SLR_INIT_NORM]
     sf = FA.ARM_SCALE_FLAG[arm]
-    if sel["scaling"] is None:
-        # ⛔ scora derives its scale from --slr_s a priori.  Adding one would convert
-        #   the a-priori arm into a tuned one (fir_arms: "DO NOT ADD ONE").
+    scale = DERIVED_SCALE[arm]
+    if scale is None:
         if sf:
-            raise SystemExit(f"FAIL CLOSED: {arm} has scale flag {sf} but no frozen value.")
+            raise SystemExit(f"FAIL CLOSED: {arm} has scale flag {sf} but no value.")
     else:
         if not sf:
-            raise SystemExit(f"FAIL CLOSED: {arm} has a frozen scale but no flag to set.")
-        f += [sf, _f(sel["scaling"])]
-    for k, v in (sel.get("extra") or {}).items():
-        f += [{"freq_exponent": "--spectral_freq_exponent"}[k], _f(v)]
+            raise SystemExit(f"FAIL CLOSED: {arm} has a scale but no flag to set.")
+        f += [sf, _f(scale)]
     return f
+
+
+def verify_scales():
+    """Recompute DERIVED_SCALE from the measured atoms.  Needs torch; not in --selftest."""
+    import fir_backbone_port as BP
+    m = n = 576
+    print(f"target atom = {REF_ATOM:.12g}")
+    bad = 0
+    for arm in ARMS:
+        flags = FA.parse_flags(" ".join(arm_flags(arm)))
+        atom, linear, _ = BP.atom_of(arm, flags, m, n)
+        note = ""
+        if not linear:
+            note = "  ⛔ NOT linear in its scale -- the rescale rule does not apply"
+            bad += 1
+        elif arm == "scora":
+            # raw randn init: the atom matches REF_ATOM only IN EXPECTATION, sd 1/sqrt(2t)
+            note = (f"  (a priori, no flag; {abs(atom / REF_ATOM - 1) * 100:.1f}% above "
+                    f"REF_ATOM = 1.6x the 6.2% per-draw sd of --slr_init_norm raw. The "
+                    f"rule holds IN EXPECTATION, not per draw -- declared, not matched)")
+        elif arm == "scora2":
+            note = f"  (the SWEPT row: 2.0x scora\'s gamma by design, so atom is 2x)"
+        elif abs(atom / REF_ATOM - 1) > 0.01:
+            note = "  ⛔ atom is off REF_ATOM by more than 1%"
+            bad += 1
+        print(f"  {arm:10s} atom {atom:.6f}  ratio {atom / REF_ATOM:6.3f}{note}")
+    return 1 if bad else 0
 
 
 # --------------------------------------------------------------------------- #
@@ -216,8 +310,11 @@ def cells(stage):
     a configuration); the five seeds run inside one invocation, sequentially."""
     out = []
     if stage == "stage0":
-        for arm in ARMS:
-            for p in P_RUNGS:
+        # ⛔ This screens the ONE COMMON lr, not nine per-arm ones.  It runs on two arms
+        #   so that a value which is good for one construction and terrible for another
+        #   is visible; the SELECTION is a single number applied to all nine.
+        for arm in SCREEN_ARMS:
+            for p in LR_SCREEN:
                 out.append({"stage": "stage0", "arm": arm, "p": p,
                             "epochs": SCREEN_EPOCHS, "seeds": [SEEDS[0]]})
     elif stage == "halfA":
@@ -233,12 +330,24 @@ def cells(stage):
     return out
 
 
+# ⛔ THE PLAN VERSION IS PART OF EVERY CELL ID, and it is not decoration.
+#   [incident, 2026-09-21] the backbone changed from gemma-2b to SmolLM2-135M by user
+#   decision AFTER three Stage-0 cells had run.  Their ids -- `r315-s0-fftm-p1` and so
+#   on -- are ids the NEW plan also generates, so the resumable driver would have seen
+#   their `.done` markers and SKIPPED three cells, silently seeding the study with
+#   gemma-2b results under SmolLM2 row labels.  Nothing would have crashed.
+#   ⇒ Bump PLAN_VERSION whenever a change makes existing cells non-reusable.  Old
+#     markers then simply do not match, and the old rows keep a name that says what
+#     they were.
+PLAN_VERSION = "v2"
+
+
 def cell_id(c):
     if c["stage"] == "stage0":
-        return f"r315-s0-{c['arm']}-p{_f(c['p']).replace('.', 'p')}"
+        return f"r315{PLAN_VERSION}-s0-{c['arm']}-p{_f(c['p']).replace('.', 'p')}"
     if c["stage"] == "halfA":
-        return f"r315-A-scora-r{c['r']}s{c['s']}"
-    return f"r315-B-{c['arm']}"
+        return f"r315{PLAN_VERSION}-A-scora-r{c['r']}s{c['s']}"
+    return f"r315{PLAN_VERSION}-B-{c['arm']}"
 
 
 def cell_cmd(c):
@@ -296,31 +405,66 @@ def selftest():
     check("G1b the ladder spans r = 1..8 with no repeats",
           sorted(r for r, _ in LADDER) == [1, 2, 4, 8])
 
-    # G2 the HP table is the frozen one, not a copy.
-    check("G2 the nine arms come from fir_final_plan.SELECTED",
-          set(ARMS) == set(FFP.SELECTED), detail=str(set(ARMS) ^ set(FFP.SELECTED)))
-    for arm in ARMS:
-        f = arm_flags(arm)
-        lr = float(f[f.index("--learning_rate") + 1])
-        if abs(lr - FFP.SELECTED[arm]["lr"]) > 1e-12:
-            check(f"G2b {arm} carries its frozen lr", False, f"{lr} vs {FFP.SELECTED[arm]['lr']}")
-            break
-    else:
-        check("G2b every arm carries its own frozen lr verbatim", True)
+    # G2 ⭐⭐ ONE COMMON RECIPE: every arm and every rung carries the SAME lr.
+    lrs = {}
+    for st in ("halfA", "halfB"):
+        for c in cells(st):
+            cmd = cell_cmd(c)
+            lrs[cell_id(c)] = cmd[cmd.index("--learning_rate") + 1]
+    check("G2 every study cell carries the SAME learning rate (no per-arm tuning "
+          "exists anywhere in this study)", len(set(lrs.values())) == 1,
+          detail=str(sorted(set(lrs.values()))))
+    check("G2b and it is the published-anchored COMMON_LR",
+          set(lrs.values()) == {_f(COMMON_LR)}, str(set(lrs.values())))
+    for knob in ("--weight_decay", "--num_train_epochs", "--warmup_ratio",
+                 "--per_device_train_batch_size", "--block_size"):
+        vals = set()
+        for st in ("halfA", "halfB"):
+            for c in cells(st):
+                cmd = cell_cmd(c)
+                vals.add(cmd[cmd.index(knob) + 1])
+        check(f"G2c {knob} is common to every study cell", len(vals) == 1, str(vals))
 
     # G3 ⛔ scora must NOT acquire a scale flag (fir_arms: "DO NOT ADD ONE").
-    check("G3 scora has no --slr_scaling (its scale is derived a priori)",
-          "--slr_scaling" not in arm_flags("scora"))
+    check("G3 scora has no --slr_scaling (its scale is derived a priori, and its rule "
+          "REF_ATOM/sqrt(t) is width-independent so nothing was ported)",
+          "--slr_scaling" not in arm_flags("scora") and DERIVED_SCALE["scora"] is None)
+    check("G3d ⭐ every SLR cell carries --slr_init_norm unit, so each rung's per-row "
+          "step is EXACTLY REF_ATOM instead of only in expectation",
+          all("--slr_init_norm" in arm_flags(a) and
+              arm_flags(a)[arm_flags(a).index("--slr_init_norm") + 1] == "unit"
+              for a in ("scora", "scora2")))
+    check("G3e and the ladder rungs carry it too (the rungs are where the per-row "
+          "spread would otherwise differ, 6.2% at t=128 vs 17.7% at t=16)",
+          all("--slr_init_norm unit" in " ".join(arm_flags("scora", rank=r, s=s_))
+              for r, s_ in LADDER))
     check("G3b scora2 DOES carry one (both rows always ship together)",
           "--slr_scaling" in arm_flags("scora2"))
+    check("G3c ⭐ scora2 is exactly 2x scora's derived gamma -- the RATIO [R.306] "
+          "selected, carried unchanged because gamma does not move with width",
+          abs(DERIVED_SCALE["scora2"] / (REF_ATOM / math.sqrt(128)) - 2.0) < 1e-4,
+          f"ratio = {DERIVED_SCALE['scora2'] / (REF_ATOM / math.sqrt(128)):.6f}")
 
-    # G4 the P ladder moves the learning rate by exactly its factor.
+    # G4 the screen moves the COMMON lr and nothing else, and it is not per-arm.
     base = float(arm_flags("fftm")[arm_flags("fftm").index("--learning_rate") + 1])
-    hi = float(arm_flags("fftm", lr_mult=2.0)[arm_flags("fftm", 2.0).index("--learning_rate") + 1])
-    check("G4 a P rung of 2.0 doubles the lr and nothing else",
-          abs(hi - 2 * base) < 1e-9
-          and [x for x in arm_flags("fftm", 2.0) if x != _f(2 * base)]
+    hi = arm_flags("fftm", lr_mult=2.0)
+    check("G4 a screen rung of 2.0 doubles the COMMON lr and changes nothing else",
+          abs(float(hi[hi.index("--learning_rate") + 1]) - 2 * base) < 1e-9
+          and [x for x in hi if x != _f(2 * base)]
               == [x for x in arm_flags("fftm") if x != _f(base)])
+    check("G4b the screen selects ONE value for all nine arms, so it runs on a "
+          "SUBSET of arms by design", set(SCREEN_ARMS) < set(ARMS))
+    check("G4c the screen ladder brackets the published anchor (0.5x and 2x)",
+          min(LR_SCREEN) < 1.0 < max(LR_SCREEN) and 1.0 in LR_SCREEN)
+
+    # G4d ⭐ the atom-matching rule is what makes ONE lr fair.  The recorded scales are
+    # checked for internal consistency here; --verify-scales re-measures them with torch.
+    check("G4d every arm has a declared a-priori scale (or is declared as needing none)",
+          set(DERIVED_SCALE) == set(ARMS), str(set(DERIVED_SCALE) ^ set(ARMS)))
+    check("G4e the FourierFT-family scale is REF_ATOM's own alpha at 576x576 "
+          "(= 112.5, inside PEFT's documented 100-150 band)",
+          abs(DERIVED_SCALE["fftm"] - REF_ATOM * math.sqrt(2 * 576 * 576)) < 1e-6,
+          f"{DERIVED_SCALE['fftm']} vs {REF_ATOM * math.sqrt(2 * 576 * 576):.4f}")
 
     # G5 Half A only moves (r, s); every other flag is scora's.
     a1 = cell_cmd({"stage": "halfA", "arm": "scora", "r": 1, "s": 128,
@@ -357,6 +501,15 @@ def selftest():
     check("G8b stage 0 is 1 seed and is a SCREEN, never a verdict",
           all(len(c["seeds"]) == 1 for c in cells("stage0")))
 
+    # G9c ⭐ the version tag is in every id, so a superseded cell can never be reused
+    # by the resumable driver (the gemma-2b/SmolLM2 collision, 2026-09-21).
+    check("G9c every cell id carries the plan version",
+          all(PLAN_VERSION in cell_id(c)
+              for st in ("stage0", "halfA", "halfB") for c in cells(st)))
+    check("G9d and the superseded v1 ids are NOT regenerated",
+          not any(cell_id(c) in ("r315-s0-fftm-p1", "r315-B-scora", "r315-A-scora-r1s128")
+                  for st in ("stage0", "halfA", "halfB") for c in cells(st)))
+
     # G9 cell ids are unique and stable.
     ids = [cell_id(c) for st in ("stage0", "halfA", "halfB") for c in cells(st)]
     check("G9 every cell id is unique", len(ids) == len(set(ids)))
@@ -391,10 +544,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--show", action="store_true")
     ap.add_argument("--cmd", choices=["stage0", "halfA", "halfB"])
+    ap.add_argument("--verify-scales", dest="verify_scales", action="store_true",
+                    help="re-measure every arm's atom at 576x576 (needs torch)")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
     if a.selftest:
         return selftest()
+    if a.verify_scales:
+        return verify_scales()
     if a.cmd:
         for c in cells(a.cmd):
             print(" ".join(cell_cmd(c)))

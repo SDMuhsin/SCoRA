@@ -38,6 +38,8 @@ from transformers import GemmaConfig, GemmaForCausalLM   # noqa: E402
 import train_clm as TC                          # noqa: E402
 import r315_plan as P                           # noqa: E402
 
+# ⚠ The tiny stand-in mirrors the STUDY's architecture family (llama-shaped decoder,
+#   nn.Linear q_proj/o_proj), not its size: this gate is about WIRING, not perplexity.
 TINY = dict(vocab_size=256, hidden_size=128, intermediate_size=256,
             num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=1,
             head_dim=32, max_position_embeddings=64)
@@ -62,7 +64,7 @@ def tiny_model():
 def build(arm, **over):
     """Parse the planner's own flags for `arm`, then attach exactly as a run would."""
     flags = P.arm_flags(arm, **over)
-    args = TC.parse_args(["--model_name_or_path", "google/gemma-2b", "--dtype", "float32",
+    args = TC.parse_args(["--model_name_or_path", P.MODEL, "--dtype", "float32",
                           "--adapter_target_modules", P.TARGETS] + flags)
     model = TC.attach_adapter(tiny_model(), args)
     return model, args
