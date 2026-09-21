@@ -59,6 +59,14 @@ GATES = [
     ("scripts/build_prl_tables.py",   "the letter's tables: arm set, five seeds per cell, the two headline gate outcomes"),
     ("scripts/r313_plan.py",         "[R.313] the basis control: arg strings differ in exactly --slr_basis"),
     ("scripts/r314_plan.py",         "[R.314] the scale ladder: one flag per rung, and the frozen predictions scored mechanically"),
+    ("src/train_clm.py",            "[clm] the causal-LM trainer: ADAPTER-ONLY receipt, and the adapter "
+                                    "construction machine-diffed against train_glue.py"),
+    ("src/verify_clm_arms.py",      "[clm] receipts: all nine arms attach to a DECODER, adapter-only, matched "
+                                    "budget, and every one IGNITES at step 0"),
+    ("scripts/r315_plan.py",        "[R.315] the head-free ablation plan: iso-budget (r,s) ladder, frozen HPs, "
+                                    "one flag per rung"),
+    ("scripts/clm_read.py",         "[clm] the causal-LM reader: coverage before ranking, paired 5/5 sign "
+                                    "test, lower-perplexity orientation"),
     ("scripts/build_architecture_data.py",
      "the architecture figure's data: the drawn support, the synthesis, the rank"),
     ("scripts/architecture_figure_audit.py",
