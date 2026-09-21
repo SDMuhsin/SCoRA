@@ -275,6 +275,46 @@ def arm_flags(arm, lr_mult=1.0, rank=None, s=None):
     return f
 
 
+def screen_verdict(rows):
+    """Apply Stage 0's FROZEN selection rule to the screen's rows.  Mechanical, so the
+    reader cannot drift from `R315_prereg_v2.md` 2.
+
+    `rows` = {(arm, mult): ppl}.  Returns a dict with the selection and its reasons.
+
+    The rule, verbatim from the prereg:
+      * winner = the rung minimising the SUM of the two screen arms' perplexities;
+      * ties within 0.2% of the ANCHOR (1x) go to the anchor;
+      * an EDGE winner (0.5x or 2x) triggers one extension, and if the extension wins
+        again the recipe is reported as UNBRACKETED;
+      * the selected value is ONE number applied to all nine arms and all four rungs.
+    """
+    mults = sorted({m for _a, m in rows})
+    missing = [(a, m) for a in SCREEN_ARMS for m in LR_SCREEN if (a, m) not in rows]
+    if missing:
+        return {"complete": False, "missing": missing,
+                "verdict": f"INCOMPLETE -- {len(missing)} screen cell(s) absent; "
+                           f"PROCESS 1.4 forbids selecting on a partial screen"}
+    totals = {m: sum(rows[(a, m)] for a in SCREEN_ARMS) for m in mults}
+    best = min(totals, key=lambda m: totals[m])
+    anchor_total = totals[1.0]
+    tie = abs(totals[best] - anchor_total) / anchor_total <= 0.002
+    selected = 1.0 if tie else best
+    at_edge = selected in (min(mults), max(mults)) and selected != 1.0
+    return {
+        "complete": True, "totals": totals, "argmin": best,
+        "selected_mult": selected, "selected_lr": COMMON_LR * selected,
+        "tie_with_anchor": tie,
+        "rel_gap_to_anchor": (totals[best] - anchor_total) / anchor_total,
+        "at_edge": at_edge,
+        "verdict": (
+            f"SELECTED lr = {COMMON_LR * selected:.6g} ({selected}x the published anchor)"
+            + ("; the argmin was within 0.2% of the anchor, so the TIE RULE kept the "
+               "anchor" if tie else "")
+            + ("; ⛔ WINNER IS AT A LADDER EDGE -- the prereg requires one extension rung "
+               "in that direction before this is used" if at_edge else "")),
+    }
+
+
 def verify_scales():
     """Recompute DERIVED_SCALE from the measured atoms.  Needs torch; not in --selftest."""
     import fir_backbone_port as BP
@@ -500,6 +540,33 @@ def selftest():
           all(c["seeds"] == SEEDS for st in ("halfA", "halfB") for c in cells(st)))
     check("G8b stage 0 is 1 seed and is a SCREEN, never a verdict",
           all(len(c["seeds"]) == 1 for c in cells("stage0")))
+
+    # G12 ⭐ the screen's selection rule, exercised on fixtures BEFORE the screen is read
+    # (PROCESS.md 6: test the reader before the spend).
+    def _rows(sc, ff):
+        return {("scora", m): sc[i] for i, m in enumerate(LR_SCREEN)} | \
+               {("fftm", m): ff[i] for i, m in enumerate(LR_SCREEN)}
+    v = screen_verdict(_rows([20.0, 17.0, 19.0], [21.0, 18.0, 20.0]))
+    check("G12 a clear interior winner selects the anchor",
+          v["selected_mult"] == 1.0 and not v["at_edge"], v["verdict"])
+    v = screen_verdict(_rows([17.0, 20.0, 21.0], [18.0, 21.0, 22.0]))
+    check("G12b a 0.5x winner is selected AND flagged as an edge needing an extension",
+          v["selected_mult"] == 0.5 and v["at_edge"], v["verdict"])
+    v = screen_verdict(_rows([20.0, 17.00, 16.99], [21.0, 18.00, 17.99]))
+    check("G12c ⭐ a winner within 0.2% of the anchor loses to the TIE RULE -- a one-seed "
+          "screen cannot resolve less", v["selected_mult"] == 1.0 and v["tie_with_anchor"],
+          v["verdict"])
+    v = screen_verdict(_rows([20.0, 17.0, 15.0], [21.0, 18.0, 16.0]))
+    check("G12d a 2x winner outside the tie band IS taken, and flagged as an edge",
+          v["selected_mult"] == 2.0 and v["at_edge"], v["verdict"])
+    partial = {("scora", m): 17.0 for m in LR_SCREEN}
+    v = screen_verdict(partial)
+    check("G12e ⛔ a partial screen selects NOTHING (PROCESS.md 1.4)",
+          not v["complete"] and "INCOMPLETE" in v["verdict"])
+    # the two arms are summed, so an arm that hates a rung can veto it
+    v = screen_verdict(_rows([17.0, 17.5, 17.6], [30.0, 18.0, 18.1]))
+    check("G12f ⭐ the rule is the SUM, so a rung one arm cannot train at is not chosen "
+          "just because the other arm likes it", v["selected_mult"] == 1.0, v["verdict"])
 
     # G9c ⭐ the version tag is in every id, so a superseded cell can never be reused
     # by the resumable driver (the gemma-2b/SmolLM2 collision, 2026-09-21).
