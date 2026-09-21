@@ -65,6 +65,8 @@ GATES = [
                                     "budget, and every one IGNITES at step 0"),
     ("scripts/r315_plan.py",        "[R.315] the head-free ablation plan: iso-budget (r,s) ladder, frozen HPs, "
                                     "one flag per rung"),
+    ("scripts/r315_run.py",         "[R.315] the driver: resumable markers, a partial cell is never done, and a "
+                                    "stale .failed never skips one"),
     ("scripts/clm_read.py",         "[clm] the causal-LM reader: coverage before ranking, paired 5/5 sign "
                                     "test, lower-perplexity orientation"),
     ("scripts/build_architecture_data.py",
