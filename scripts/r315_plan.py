@@ -94,6 +94,47 @@ ARMS = FA.ARM_ORDER
 P_RUNGS = [0.5, 1.0, 2.0]
 
 
+# --------------------------------------------------------------------------- #
+#          ⭐⭐ THE FREEZE.  llmdocs/ IS GITIGNORED, SO A COMMIT FREEZES NOTHING #
+# --------------------------------------------------------------------------- #
+# `PROCESS.md 4`: "git diff is not evidence when a file is untracked -- and llmdocs/
+# and scratchpad/ are both gitignored here."  Every prereg in this repo lives in
+# llmdocs, so "hash-frozen at <commit>" has always meant the PLANNER was committed,
+# never the document.  That leaves the one thing `PROCESS.md 1.1` actually forbids --
+# editing a rule after the first number lands -- undetectable.
+#
+# ⇒ The sha256 prefix of each frozen document is recorded HERE, in a TRACKED file,
+#   before its stage ran.  `--selftest` recomputes them, so editing a frozen document
+#   turns the whole gate suite RED instead of passing silently.
+#   ⚠ A hash is not a timestamp: it proves the text has not changed since the freeze,
+#     not when the freeze happened.  The commit that introduced each hash is the date,
+#     and the cells' own mtimes are the independent check.
+PREREG_SHA256 = {
+    # frozen 13:55 UTC, while the pilot ran and before ANY epoch number existed
+    "R315_pilot_reading_rule.md": "157a0e55040eb66a",
+    # the pilot scored against that rule; R3 fired
+    "R315_pilot_verdict.md":      "9fad2ceb30758a34",
+    # frozen before the first Stage-0 cell (driver started 19:01 UTC)
+    "R315_stage0_prereg.md":      "bd27f7d1e2db599d",
+    # frozen before ANY Half-A or Half-B cell exists
+    "R315_prereg.md":             "6f7e36d97aaa2cce",
+}
+
+
+def prereg_hashes():
+    """(name -> (recorded, actual)) for every frozen document."""
+    import hashlib
+    out = {}
+    for name, want in PREREG_SHA256.items():
+        path = os.path.join(ROOT, "llmdocs", name)
+        if not os.path.exists(path):
+            out[name] = (want, None)
+            continue
+        with open(path, "rb") as fh:
+            out[name] = (want, hashlib.sha256(fh.read()).hexdigest()[:16])
+    return out
+
+
 def _f(x):
     """A flag value, never in scientific notation (argparse takes it, humans read it)."""
     return f"{x:.10g}"
@@ -320,6 +361,15 @@ def selftest():
     ids = [cell_id(c) for st in ("stage0", "halfA", "halfB") for c in cells(st)]
     check("G9 every cell id is unique", len(ids) == len(set(ids)))
     check("G9b the digest is stable across calls", digest() == digest())
+
+    # G11 ⭐⭐ the frozen documents are UNCHANGED since their stage was launched.
+    for name, (want, got) in prereg_hashes().items():
+        if got is None:
+            check(f"G11 {name} exists", False, "MISSING -- a frozen prereg cannot vanish")
+        else:
+            check(f"G11 {name} unchanged since freeze ({want})", want == got,
+                  f"recorded {want}, actual {got} -- a frozen rule was EDITED "
+                  f"(PROCESS.md 1.1), or the hash was not updated at freeze time")
 
     # G10 an unknown arm or stage fails closed rather than planning something plausible.
     try:
