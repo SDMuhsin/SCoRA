@@ -220,6 +220,8 @@ PREREG_SHA256 = {
     # v1: frozen before ANY Half-A/Half-B cell existed.  SUPERSEDED by v2 but NOT
     # edited -- its hash stays checked, so what it said before the amendment is provable.
     "R315_prereg.md":             "6f7e36d97aaa2cce",
+    # Half A's verdict: the ladder is strictly monotone and PA4 passes
+    "R315_halfA_verdict.md":      "1d204e72c43e1f8e",
     # Stage 0's verdict: the recipe is UNBRACKETED, with the fairness limitation that
     # creates for PB1 recorded BEFORE any Half-A or Half-B cell ran
     "R315_stage0_verdict.md":     "d2c8844dd53a8ab9",
