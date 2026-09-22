@@ -16,6 +16,11 @@ WHAT IT ENFORCES, and why each rule is here:
 * **The budget-binds flag.**  The reported number is the MIN over epochs; if the argmin
   is the LAST epoch the run was still improving and the number is a LOWER BOUND on what
   the arm can do.  Printed per cell, never silently dropped.
+* ⛔⛔ **The UNBRACKETED-recipe label.**  `[R.315]`'s Stage 0 ended with its screen still
+  improving at the top rung, so the selected learning rate is **not bracketed** and one
+  arm (`fftm`) is further from its own optimum than the other (`scora`).  The reader
+  prints that on every study row, because a Half-B comparison read without it would look
+  like a clean attribution when `PROCESS 5` test 4's fairness standard is not fully met.
 * **The degenerate column is NOT the GLUE one.**  `degen_frac_vs_init` counts epochs no
   better than the FROZEN BACKBONE's own perplexity (`train_clm.degenerate_epochs`).  It
   is printed under that name so it can never be quoted as GLUE's floor statistic.
@@ -126,6 +131,22 @@ def main(argv=None):
               f"{r['ppl_median']:10.4f} {r['ppl_spread']:8.4f} {r['ppl_sd']:7.4f} "
               f"{r['ppl_init']:8.4f} {100 * r['rel_drop_median']:6.2f} "
               f"{r['degen_frac']:6.2f} {r['n_trainable']:8d} {'; '.join(flags)}")
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import r315_plan as _P
+        if getattr(_P, "STAGE0_UNBRACKETED", False) and any(
+                str(r["name"]).startswith("r315") and "-s0-" not in str(r["name"])
+                for r in rows):
+            print(f"\n⛔ UNBRACKETED RECIPE: every row above ran at lr = {_P.STUDY_LR:g}, "
+                  f"selected by a screen that was STILL IMPROVING at its top rung.\n"
+                  f"   [measured] per-doubling gain at the top of the ladder was 68% of "
+                  f"initial for fftm vs 29% for scora, and the scora-fftm gap narrowed "
+                  f"monotonically 2.760 -> 1.898 across it.\n"
+                  f"   ⇒ The step favours scora. A scora-over-fftm win here is a real "
+                  f"measurement at a matched step, NOT a clean attribution.")
+    except Exception:
+        pass
+
     if a.pair:
         w, n, v = sign_test(df, a.pair[0], a.pair[1], a.name)
         print(f"\nsign test (lower perplexity wins, one-sided, paired by seed): {v}")

@@ -124,6 +124,35 @@ SLR_INIT_NORM = "unit"
 #   The prereg's edge rule therefore fires and ONE extension rung is owed at 4.0x.
 STAGE0_EDGE = 2.0
 
+# --------------------------------------------------------------------------- #
+#   ⛔⛔ STAGE 0'S OUTCOME: THE RECIPE IS UNBRACKETED, AND WHY THAT IS A LIMIT   #
+# --------------------------------------------------------------------------- #
+# [measured 2026-09-22, 8/8 screen cells] both screen arms improve MONOTONICALLY over the
+# full 8x ladder, with zero degenerate epochs anywhere:
+#     fftm   19.9174  19.2621  18.7067  18.2643      (0.5x 1x 2x 4x)
+#     scora  17.1575  16.7182  16.4940  16.3659
+# The extension at 4x won again, so by the prereg's own rule the recipe is UNBRACKETED,
+# is USED, and every row carries that label.
+SELECTED_LR_MULT = 4.0
+STUDY_LR = 0.12                # = COMMON_LR * SELECTED_LR_MULT
+STAGE0_UNBRACKETED = True
+#
+# ⛔⛔ THE LIMITATION THIS CREATES, AND IT BEARS DIRECTLY ON PB1.  The two arms are not
+#   equally far from their own optima at the selected step.  Per-doubling gain:
+#       fftm   +0.6553  +0.5554  +0.4424   last/first = 0.68  <- still climbing
+#       scora  +0.4393  +0.2242  +0.1281   last/first = 0.29  <- near saturation
+#   and the gap narrows monotonically with the step: 2.760, 2.544, 2.213, 1.898.
+#   ⇒ A COMMON lr selected by the SUM sits nearer SCoRA's optimum than FourierFT's, so
+#     Half B is run at a step that FAVOURS SCoRA, and the measured gap would keep
+#     shrinking if the ladder continued.
+#   ⇒ **A PB1 pass is therefore NOT a clean attribution to the parameterisation.** It is
+#     a real measurement at a declared, matched step -- and `PROCESS 5` test 4's fairness
+#     standard is not fully met, because one arm's optimum is outside the screened range.
+#   ⚠ This is reported, not repaired: extending the ladder until it brackets would be
+#     editing a frozen rule after seeing data (`PROCESS 1.1`). The rule allowed ONE
+#     extension; it was mis-set for a monotone regime, and that is recorded as a mis-set
+#     threshold rather than quietly re-interpreted.
+
 COMMON_LR = 0.030
 LR_SCREEN = [0.5, 1.0, 2.0]    # multiplies the COMMON lr; never a per-arm one
 # ⛔ The prereg's EDGE RULE: an edge winner gets ONE extension rung in its direction, the
@@ -191,6 +220,9 @@ PREREG_SHA256 = {
     # v1: frozen before ANY Half-A/Half-B cell existed.  SUPERSEDED by v2 but NOT
     # edited -- its hash stays checked, so what it said before the amendment is provable.
     "R315_prereg.md":             "6f7e36d97aaa2cce",
+    # Stage 0's verdict: the recipe is UNBRACKETED, with the fairness limitation that
+    # creates for PB1 recorded BEFORE any Half-A or Half-B cell ran
+    "R315_stage0_verdict.md":     "d2c8844dd53a8ab9",
     # v2: the SmolLM2-135M backbone + the one-common-recipe regime, both [USER DECISION
     # 2026-09-21], frozen before any cell of THIS plan exists
     "R315_prereg_v2.md":          "fa44c71d1cdb4e1b",
@@ -234,7 +266,7 @@ def common_flags(epochs, seeds, name, cell_dir="scratchpad/clm"):
     return f
 
 
-def arm_flags(arm, lr_mult=1.0, rank=None, s=None):
+def arm_flags(arm, lr=None, rank=None, s=None):
     """The adapter flags for one arm under the COMMON recipe.
 
     ⛔ THE ONLY THINGS THAT EVER DIFFER BETWEEN ARMS: the method, its budget flag name,
@@ -243,8 +275,8 @@ def arm_flags(arm, lr_mult=1.0, rank=None, s=None):
        arms and all four ladder rungs -- that is what makes this a matched comparison
        rather than nine separately tuned ones.
 
-    `rank`/`s` override SCoRA\'s budget split for Half A\'s ladder; `lr_mult` is used ONLY
-    by the lr screen, and it moves the COMMON lr, never one arm\'s.
+    `rank`/`s` override SCoRA\'s budget split for Half A\'s ladder.  `lr` is passed ONLY by
+    the screen; every STUDY cell takes STUDY_LR, the single value Stage 0 selected.
     """
     if arm not in DERIVED_SCALE:
         raise SystemExit(f"FAIL CLOSED: {arm!r} is not one of the nine frozen arms.")
@@ -252,7 +284,7 @@ def arm_flags(arm, lr_mult=1.0, rank=None, s=None):
               "qwha": "qwha", "wave1": "haar", "wave2": "haar", "lyra": "spectral",
               "scora": "slr", "scora2": "slr"}[arm]
     f = ["--optimizer", f"adamw-{method}",
-         "--learning_rate", _f(COMMON_LR * lr_mult)]
+         "--learning_rate", _f(STUDY_LR if lr is None else lr)]
     # k = 256 per module everywhere; only the flag NAME differs between methods.
     if method == "fourierftmerged":
         f += ["--fourierftmerged_k", "256", "--fourierftmerged_seed", "777"]
@@ -424,7 +456,7 @@ def cell_cmd(c):
     if c["stage"] == "halfA":
         f += arm_flags("scora", rank=c["r"], s=c["s"])
     elif c["stage"] in ("stage0", "stage0ext"):
-        f += arm_flags(c["arm"], lr_mult=c["p"])
+        f += arm_flags(c["arm"], lr=COMMON_LR * c["p"])
     else:
         f += arm_flags(c["arm"])
     return f
@@ -481,8 +513,10 @@ def selftest():
     check("G2 every study cell carries the SAME learning rate (no per-arm tuning "
           "exists anywhere in this study)", len(set(lrs.values())) == 1,
           detail=str(sorted(set(lrs.values()))))
-    check("G2b and it is the published-anchored COMMON_LR",
-          set(lrs.values()) == {_f(COMMON_LR)}, str(set(lrs.values())))
+    check("G2b and it is STUDY_LR, the single value Stage 0 selected",
+          set(lrs.values()) == {_f(STUDY_LR)}, str(set(lrs.values())))
+    check("G2b2 STUDY_LR is exactly the selected multiple of the published anchor",
+          abs(STUDY_LR - COMMON_LR * SELECTED_LR_MULT) < 1e-12)
     for knob in ("--weight_decay", "--num_train_epochs", "--warmup_ratio",
                  "--per_device_train_batch_size", "--block_size"):
         vals = set()
@@ -513,16 +547,17 @@ def selftest():
           f"ratio = {DERIVED_SCALE['scora2'] / (REF_ATOM / math.sqrt(128)):.6f}")
 
     # G4 the screen moves the COMMON lr and nothing else, and it is not per-arm.
-    base = float(arm_flags("fftm")[arm_flags("fftm").index("--learning_rate") + 1])
-    hi = arm_flags("fftm", lr_mult=2.0)
-    check("G4 a screen rung of 2.0 doubles the COMMON lr and changes nothing else",
-          abs(float(hi[hi.index("--learning_rate") + 1]) - 2 * base) < 1e-9
-          and [x for x in hi if x != _f(2 * base)]
-              == [x for x in arm_flags("fftm") if x != _f(base)])
+    lo = arm_flags("fftm", lr=COMMON_LR)
+    hi = arm_flags("fftm", lr=2 * COMMON_LR)
+    check("G4 a screen rung changes the lr and NOTHING else",
+          [x for x in hi if x != _f(2 * COMMON_LR)]
+          == [x for x in lo if x != _f(COMMON_LR)])
     check("G4b the screen selects ONE value for all nine arms, so it runs on a "
           "SUBSET of arms by design", set(SCREEN_ARMS) < set(ARMS))
     check("G4c the screen ladder brackets the published anchor (0.5x and 2x)",
           min(LR_SCREEN) < 1.0 < max(LR_SCREEN) and 1.0 in LR_SCREEN)
+    check("G4c2 ⛔ the recipe is recorded as UNBRACKETED, so no reader can print a "
+          "Half-B row without that label", STAGE0_UNBRACKETED is True)
 
     # G4d ⭐ the atom-matching rule is what makes ONE lr fair.  The recorded scales are
     # checked for internal consistency here; --verify-scales re-measures them with torch.
