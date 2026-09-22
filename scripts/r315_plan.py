@@ -225,6 +225,9 @@ PREREG_SHA256 = {
     # Stage 0's verdict: the recipe is UNBRACKETED, with the fairness limitation that
     # creates for PB1 recorded BEFORE any Half-A or Half-B cell ran
     "R315_stage0_verdict.md":     "d2c8844dd53a8ab9",
+    # Half B's verdict: all five predictions pass, PB1 and PB3 both caveated, and an
+    # unplanned duplicate-cell null puts run-to-run nondeterminism at 0.0049
+    "R315_halfB_verdict.md":      "d0faa0e98a1bd7ba",
     # v2: the SmolLM2-135M backbone + the one-common-recipe regime, both [USER DECISION
     # 2026-09-21], frozen before any cell of THIS plan exists
     "R315_prereg_v2.md":          "fa44c71d1cdb4e1b",
