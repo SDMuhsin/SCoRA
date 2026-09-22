@@ -369,6 +369,101 @@ def screen_verdict(rows, extended=False):
     }
 
 
+# The stage-05 gemma-2b CLASSIFICATION table, for PB5's descriptive rank correlation.
+# [FIR_GEMMA_PORT.md 28.3] medians of max-over-epochs, 5 seeds.  ⛔ MRPC is IN-SAMPLE and
+# is EXCLUDED here; the mean is over the five out-of-sample columns.
+# ⚠ Transcribed from the table, so it is a SUMMARY -- PROCESS 1.5 says re-derive a
+#   headline from logs before acting on it.  PB5 is descriptive and gated by nothing, so
+#   a transcription is acceptable HERE and nowhere else in this study.
+STAGE05_CLS = {   # rte, stsb, cola, sst2, qnli  (mrpc excluded: in-sample)
+    "fftm":     [0.8123, 0.8342, 0.6165, 0.9553, 0.8924],
+    "fftstock": [0.8014, 0.8314, 0.6123, 0.9541, 0.8924],
+    "wave1":    [0.7617, 0.8355, 0.5938, 0.9576, 0.8889],
+    "wave2":    [0.7870, 0.8044, 0.5895, 0.9507, 0.8770],
+    "loca":     [0.7906, 0.8575, 0.5933, 0.9518, 0.9074],
+    "qwha":     [0.7942, 0.8110, 0.5932, 0.9461, 0.8710],
+    "lyra":     [0.7509, 0.8278, 0.5776, 0.9484, 0.8854],
+    "scora":    [0.8051, 0.8746, 0.6269, 0.9587, 0.9171],
+    "scora2":   [0.8051, 0.8813, 0.6368, 0.9610, 0.9180],
+}
+
+
+def _spearman(a, b):
+    """Rank correlation, ties averaged.  No scipy dependency in the gate path."""
+    def ranks(xs):
+        order = sorted(range(len(xs)), key=lambda i: xs[i])
+        r = [0.0] * len(xs)
+        i = 0
+        while i < len(order):
+            j = i
+            while j + 1 < len(order) and xs[order[j + 1]] == xs[order[i]]:
+                j += 1
+            avg = (i + j) / 2.0 + 1
+            for k in range(i, j + 1):
+                r[order[k]] = avg
+            i = j + 1
+        return r
+    ra, rb = ranks(a), ranks(b)
+    n = len(a)
+    ma, mb = sum(ra) / n, sum(rb) / n
+    num = sum((ra[i] - ma) * (rb[i] - mb) for i in range(n))
+    da = math.sqrt(sum((x - ma) ** 2 for x in ra))
+    db = math.sqrt(sum((x - mb) ** 2 for x in rb))
+    return num / (da * db) if da and db else float("nan")
+
+
+def halfb_verdict(rows, degen=None):
+    """Score Half B's FROZEN predictions PB1-PB5 off `R315_prereg_v2.md` 4.
+
+    `rows` = {(arm, seed): ppl}; `degen` = {(arm, seed): degenerate fraction}.
+    Mechanical, so the verdict cannot drift toward the numbers.
+    """
+    arms = sorted({a for a, _s in rows})
+    missing = [(a, sd) for a in ARMS for sd in SEEDS if (a, sd) not in rows]
+    if missing:
+        return {"complete": False, "missing": missing,
+                "verdict": f"INCOMPLETE -- {len(missing)} cell(s) absent; PROCESS 1.4 "
+                           f"forbids ranking a partial table"}
+
+    def sign(a, b):
+        w = sum(1 for sd in SEEDS if rows[(a, sd)] < rows[(b, sd)])
+        return w, len(SEEDS)
+
+    def med(a):
+        v = sorted(rows[(a, sd)] for sd in SEEDS)
+        return v[len(v) // 2]
+
+    out = {"complete": True, "medians": {a: med(a) for a in arms}}
+    w, n = sign("scora", "fftm")
+    out["PB1"] = {"wins": w, "n": n, "pass": w == n,
+                  "note": "⛔ a pass is NOT a clean attribution -- the step is "
+                          "unbracketed and favours scora (R315_stage0_verdict 3)"}
+    out["PB2"] = {}
+    for a in ("wave1", "wave2", "lyra"):
+        w, n = sign("fftm", a)          # fftm BEATS them = they lose to fftm
+        out["PB2"][a] = {"wins": w, "n": n, "pass": w == n}
+    out["PB2"]["pass"] = all(v["pass"] for k, v in out["PB2"].items() if k != "pass")
+    w, n = sign("loca", "fftm")
+    out["PB3"] = {"wins": w, "n": n, "pass": w == n,
+                  "note": "⚠ loca carries 3x the budget -- never quote without it"}
+    # PB4: zero degenerate epochs anywhere.  ⛔ Scored only when the degeneracy column is
+    # supplied -- a prediction silently skipped is worse than one that fails.
+    if degen is None:
+        out["PB4"] = {"pass": None,
+                      "note": "⛔ NOT SCORED: no degeneracy column supplied"}
+    else:
+        bad = {k: v for k, v in degen.items() if v > 0}
+        out["PB4"] = {"pass": not bad, "n_degenerate_cells": len(bad),
+                      "cells": sorted(bad)[:8]}
+    out["PB5"] = {"rho": _spearman([-med(a) for a in ARMS],
+                                   [sum(STAGE05_CLS[a]) / 5 for a in ARMS]),
+                  "note": "DESCRIPTIVE ONLY: n=9, no sign test backs it, and [R.264]'s "
+                          "0.02-0.04 tie band leaves much of the classification ordering "
+                          "unordered"}
+    out["PB5"]["pass"] = out["PB5"]["rho"] >= 0.5
+    return out
+
+
 def verify_scales():
     """Recompute DERIVED_SCALE from the measured atoms.  Needs torch; not in --selftest."""
     import fir_backbone_port as BP
@@ -604,6 +699,44 @@ def selftest():
           all(c["seeds"] == SEEDS for st in ("halfA", "halfB") for c in cells(st)))
     check("G8b stage 0 is 1 seed and is a SCREEN, never a verdict",
           all(len(c["seeds"]) == 1 for c in cells("stage0")))
+
+    # G13 ⭐ Half B's scorer, exercised on fixtures BEFORE Half B lands.
+    def _rows(spec):
+        return {(a, sd): spec[a] + 0.001 * i for a in ARMS for i, sd in enumerate(SEEDS)}
+    base = {a: 20.0 for a in ARMS}
+    base.update({"scora": 16.0, "fftm": 18.0, "loca": 17.0,
+                 "wave1": 19.0, "wave2": 19.5, "lyra": 21.0})
+    v = halfb_verdict(_rows(base))
+    check("G13 PB1 fires when scora is below fftm in every seed",
+          v["PB1"]["pass"] and v["PB1"]["wins"] == 5)
+    check("G13b PB1 carries the unbracketed-attribution note even on a PASS",
+          "NOT a clean attribution" in v["PB1"]["note"])
+    check("G13c PB2 fires only when ALL THREE of wave1/wave2/lyra lose to fftm",
+          v["PB2"]["pass"] is True)
+    flipped = dict(base); flipped["wave1"] = 17.5      # wave1 now BEATS fftm
+    v2 = halfb_verdict(_rows(flipped))
+    check("G13d one arm beating fftm breaks PB2 (it is a conjunction)",
+          v2["PB2"]["pass"] is False and v2["PB2"]["wave1"]["pass"] is False)
+    check("G13e PB3 fires when loca beats fftm, and flags its 3x budget",
+          v["PB3"]["pass"] and "3x the budget" in v["PB3"]["note"])
+    part = {k: x for k, x in _rows(base).items() if k != ("scora", 46)}
+    check("G13f ⛔ a table missing one cell scores NOTHING (PROCESS.md 1.4)",
+          not halfb_verdict(part)["complete"])
+    check("G13g ⭐ spearman is exact on a known case: a perfect reversal is -1",
+          abs(_spearman([1, 2, 3, 4], [4, 3, 2, 1]) + 1.0) < 1e-12)
+    check("G13h and a perfect agreement is +1",
+          abs(_spearman([1, 2, 3, 4], [10, 20, 30, 40]) - 1.0) < 1e-12)
+    check("G13i PB5 is oriented: LOWER ppl must map to HIGHER classification score",
+          isinstance(v["PB5"]["rho"], float))
+    check("G13j ⛔ PB4 is NOT SCORED rather than silently passed when the degeneracy "
+          "column is absent", v["PB4"]["pass"] is None and "NOT SCORED" in v["PB4"]["note"])
+    clean = {(a, sd): 0.0 for a in ARMS for sd in SEEDS}
+    v3 = halfb_verdict(_rows(base), degen=clean)
+    check("G13k PB4 passes on an all-clean table", v3["PB4"]["pass"] is True)
+    dirty = dict(clean); dirty[("lyra", 44)] = 0.33
+    v4 = halfb_verdict(_rows(base), degen=dirty)
+    check("G13l ONE degenerate cell fails PB4 and is named",
+          v4["PB4"]["pass"] is False and ("lyra", 44) in v4["PB4"]["cells"])
 
     # G12 ⭐ the screen's selection rule, exercised on fixtures BEFORE the screen is read
     # (PROCESS.md 6: test the reader before the spend).
