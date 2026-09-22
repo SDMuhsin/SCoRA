@@ -119,8 +119,18 @@ REF_ATOM = 0.138106793200498
 #     ablated.
 SLR_INIT_NORM = "unit"
 
+# ⭐ [MEASURED 2026-09-22, Stage 0, 6/6 cells] the screen's argmin was 2.0x, at the
+#   ladder EDGE and 2.167% better than the anchor -- far outside the 0.2% tie band.
+#   The prereg's edge rule therefore fires and ONE extension rung is owed at 4.0x.
+STAGE0_EDGE = 2.0
+
 COMMON_LR = 0.030
 LR_SCREEN = [0.5, 1.0, 2.0]    # multiplies the COMMON lr; never a per-arm one
+# ⛔ The prereg's EDGE RULE: an edge winner gets ONE extension rung in its direction, the
+#   rule is re-applied ONCE, and if the extension wins again the recipe is reported as
+#   UNBRACKETED and used anyway.  Frozen here so the extension cannot be chosen after
+#   seeing which way the screen went.
+LR_SCREEN_EXT = {0.5: 0.25, 2.0: 4.0}
 SCREEN_ARMS = ["scora", "fftm"]
 
 # A-PRIORI per-arm scale at 576x576, derived so that EVERY arm\'s atom == REF_ATOM.
@@ -275,7 +285,7 @@ def arm_flags(arm, lr_mult=1.0, rank=None, s=None):
     return f
 
 
-def screen_verdict(rows):
+def screen_verdict(rows, extended=False):
     """Apply Stage 0's FROZEN selection rule to the screen's rows.  Mechanical, so the
     reader cannot drift from `R315_prereg_v2.md` 2.
 
@@ -289,7 +299,12 @@ def screen_verdict(rows):
       * the selected value is ONE number applied to all nine arms and all four rungs.
     """
     mults = sorted({m for _a, m in rows})
-    missing = [(a, m) for a in SCREEN_ARMS for m in LR_SCREEN if (a, m) not in rows]
+    # ⛔ `extended` is a CLAIM that the extension rung was run, so it is checked against
+    #   the FROZEN multiplier rather than against whatever rows happen to be present --
+    #   otherwise a caller could pass extended=True on the original six cells and get a
+    #   verdict that silently drops the edge flag.
+    want = list(LR_SCREEN) + ([LR_SCREEN_EXT[STAGE0_EDGE]] if extended else [])
+    missing = [(a, m) for a in SCREEN_ARMS for m in want if (a, m) not in rows]
     if missing:
         return {"complete": False, "missing": missing,
                 "verdict": f"INCOMPLETE -- {len(missing)} screen cell(s) absent; "
@@ -301,6 +316,7 @@ def screen_verdict(rows):
     selected = 1.0 if tie else best
     at_edge = selected in (min(mults), max(mults)) and selected != 1.0
     return {
+        "extended": extended,
         "complete": True, "totals": totals, "argmin": best,
         "selected_mult": selected, "selected_lr": COMMON_LR * selected,
         "tie_with_anchor": tie,
@@ -310,8 +326,12 @@ def screen_verdict(rows):
             f"SELECTED lr = {COMMON_LR * selected:.6g} ({selected}x the published anchor)"
             + ("; the argmin was within 0.2% of the anchor, so the TIE RULE kept the "
                "anchor" if tie else "")
-            + ("; ⛔ WINNER IS AT A LADDER EDGE -- the prereg requires one extension rung "
-               "in that direction before this is used" if at_edge else "")),
+            + ("" if not at_edge else
+               ("; ⛔⛔ THE EXTENSION WON AGAIN -- the recipe is UNBRACKETED. Per the "
+                "prereg it is USED, and every row must carry that label"
+                if extended else
+                "; ⛔ WINNER IS AT A LADDER EDGE -- the prereg requires one extension "
+                "rung in that direction before this is used"))),
     }
 
 
@@ -357,6 +377,13 @@ def cells(stage):
             for p in LR_SCREEN:
                 out.append({"stage": "stage0", "arm": arm, "p": p,
                             "epochs": SCREEN_EPOCHS, "seeds": [SEEDS[0]]})
+    elif stage == "stage0ext":
+        # ⛔ Only reachable when the screen's winner was an edge; the multiplier is the
+        #   FROZEN one for that edge, never a value chosen after seeing the screen.
+        ext = LR_SCREEN_EXT[STAGE0_EDGE]
+        for arm in SCREEN_ARMS:
+            out.append({"stage": "stage0ext", "arm": arm, "p": ext,
+                        "epochs": SCREEN_EPOCHS, "seeds": [SEEDS[0]]})
     elif stage == "halfA":
         for (r, s) in LADDER:
             out.append({"stage": "halfA", "arm": "scora", "r": r, "s": s,
@@ -383,7 +410,7 @@ PLAN_VERSION = "v2"
 
 
 def cell_id(c):
-    if c["stage"] == "stage0":
+    if c["stage"] in ("stage0", "stage0ext"):
         return f"r315{PLAN_VERSION}-s0-{c['arm']}-p{_f(c['p']).replace('.', 'p')}"
     if c["stage"] == "halfA":
         return f"r315{PLAN_VERSION}-A-scora-r{c['r']}s{c['s']}"
@@ -396,7 +423,7 @@ def cell_cmd(c):
     f += common_flags(c["epochs"], c["seeds"], name)
     if c["stage"] == "halfA":
         f += arm_flags("scora", rank=c["r"], s=c["s"])
-    elif c["stage"] == "stage0":
+    elif c["stage"] in ("stage0", "stage0ext"):
         f += arm_flags(c["arm"], lr_mult=c["p"])
     else:
         f += arm_flags(c["arm"])
@@ -415,7 +442,7 @@ def digest():
 
 
 def show():
-    for st in ("stage0", "halfA", "halfB"):
+    for st in ("stage0", "stage0ext", "halfA", "halfB"):
         cs = cells(st)
         print(f"\n=== {st}: {len(cs)} cells, {n_seed_runs(st)} seed-runs ===")
         for c in cs:
@@ -559,6 +586,24 @@ def selftest():
     v = screen_verdict(_rows([20.0, 17.0, 15.0], [21.0, 18.0, 16.0]))
     check("G12d a 2x winner outside the tie band IS taken, and flagged as an edge",
           v["selected_mult"] == 2.0 and v["at_edge"], v["verdict"])
+    # G12g ⭐ the EXTENSION path: once run, an extension that wins again is reported as
+    # UNBRACKETED and used -- the prereg allows exactly one extension, not a search.
+    ext = {("scora", m): v for m, v in zip([0.5, 1.0, 2.0, 4.0], [20.0, 17.0, 15.0, 13.0])}
+    ext |= {("fftm", m): v for m, v in zip([0.5, 1.0, 2.0, 4.0], [21.0, 18.0, 16.0, 14.0])}
+    v = screen_verdict(ext, extended=True)
+    check("G12g an extension that wins again is UNBRACKETED and still selected",
+          v["selected_mult"] == 4.0 and v["at_edge"] and "UNBRACKETED" in v["verdict"],
+          v["verdict"])
+    ext2 = dict(ext); ext2[("scora", 4.0)] = 30.0; ext2[("fftm", 4.0)] = 30.0
+    v = screen_verdict(ext2, extended=True)
+    check("G12h an extension that loses brackets the ladder and hands back the 2x rung",
+          v["selected_mult"] == 2.0 and not v["at_edge"], v["verdict"])
+    v = screen_verdict({k: x for k, x in ext.items() if k[1] != 4.0}, extended=True)
+    check("G12i ⛔ claiming `extended` without the extension cells selects NOTHING",
+          not v["complete"])
+    check("G12j the extension multiplier is FROZEN per edge, not chosen after the fact",
+          LR_SCREEN_EXT == {0.5: 0.25, 2.0: 4.0})
+
     partial = {("scora", m): 17.0 for m in LR_SCREEN}
     v = screen_verdict(partial)
     check("G12e ⛔ a partial screen selects NOTHING (PROCESS.md 1.4)",
@@ -610,7 +655,7 @@ def selftest():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--show", action="store_true")
-    ap.add_argument("--cmd", choices=["stage0", "halfA", "halfB"])
+    ap.add_argument("--cmd", choices=["stage0", "stage0ext", "halfA", "halfB"])
     ap.add_argument("--verify-scales", dest="verify_scales", action="store_true",
                     help="re-measure every arm's atom at 576x576 (needs torch)")
     ap.add_argument("--selftest", action="store_true")

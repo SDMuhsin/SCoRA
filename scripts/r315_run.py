@@ -108,7 +108,7 @@ def run_cell(c, dry=False):
 
 def main(argv=None):
     ap = argparse.ArgumentParser()
-    ap.add_argument("--stage", choices=["stage0", "halfA", "halfB"])
+    ap.add_argument("--stage", choices=["stage0", "stage0ext", "halfA", "halfB"])
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--status", action="store_true")
     ap.add_argument("--selftest", action="store_true")
@@ -116,7 +116,7 @@ def main(argv=None):
     if a.selftest:
         return _selftest()
     if a.status:
-        for st in ("stage0", "halfA", "halfB"):
+        for st in ("stage0", "stage0ext", "halfA", "halfB"):
             cs = P.cells(st)
             done = sum(1 for c in cs if is_done(c))
             print(f"  {st:7s} {done}/{len(cs)} cells complete")
