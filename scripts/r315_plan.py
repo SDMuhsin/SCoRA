@@ -235,6 +235,8 @@ PREREG_SHA256 = {
     "R315_halfB_verdict.md":      "d0faa0e98a1bd7ba",
     # [USER REQUEST 2026-09-23] the extension rungs r=16..128, frozen before any ext cell
     "R315_halfAext_prereg.md":    "94f21004036e946a",
+    # the extension's verdict: monotone end to end, saturating INTO the frozen backbone
+    "R315_halfAext_verdict.md":   "6c370a2b5968cb3a",
     # v2: the SmolLM2-135M backbone + the one-common-recipe regime, both [USER DECISION
     # 2026-09-21], frozen before any cell of THIS plan exists
     "R315_prereg_v2.md":          "fa44c71d1cdb4e1b",
