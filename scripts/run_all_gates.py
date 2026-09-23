@@ -71,6 +71,9 @@ GATES = [
                                     "test, lower-perplexity orientation"),
     ("scripts/build_architecture_data.py",
      "the architecture figure's data: the drawn support, the synthesis, the rank"),
+    ("scripts/build_ladder_figure.py",
+     "the letter's (r,s) ladder figure: the cells it draws, its layout collisions, "
+     "and the six numbers the paragraph beside it quotes"),
     ("scripts/architecture_figure_audit.py",
      "the architecture figure's render: its frame, its mirror, its crops"),
 ]
