@@ -38,7 +38,7 @@ def markers(c):
 
 def _arm_label(c):
     """`train_clm` names its marker by the ARM it derived, not by the cell id."""
-    if c["stage"] == "halfA":
+    if c["stage"] in ("halfA", "halfAext"):
         return "scora"
     return c["arm"]
 
@@ -108,7 +108,8 @@ def run_cell(c, dry=False):
 
 def main(argv=None):
     ap = argparse.ArgumentParser()
-    ap.add_argument("--stage", choices=["stage0", "stage0ext", "halfA", "halfB"])
+    ap.add_argument("--stage", choices=["stage0", "stage0ext", "halfA",
+                                       "halfAext", "halfB"])
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--status", action="store_true")
     ap.add_argument("--selftest", action="store_true")
@@ -116,7 +117,7 @@ def main(argv=None):
     if a.selftest:
         return _selftest()
     if a.status:
-        for st in ("stage0", "stage0ext", "halfA", "halfB"):
+        for st in ("stage0", "stage0ext", "halfA", "halfAext", "halfB"):
             cs = P.cells(st)
             done = sum(1 for c in cs if is_done(c))
             print(f"  {st:7s} {done}/{len(cs)} cells complete")
@@ -200,7 +201,8 @@ def _selftest():
            and ((n >= 0 and mem >= 0) or (n == -1 and mem == -1))), f"{(n, mem)}")
 
     # G6 -- every planned cell id is unique, so no two cells share markers.
-    ids = [P.cell_id(c) for st in ("stage0", "halfA", "halfB") for c in P.cells(st)]
+    ids = [P.cell_id(c) for st in ("stage0", "stage0ext", "halfA", "halfAext",
+                                   "halfB") for c in P.cells(st)]
     check("G6 no two cells share a marker namespace", len(ids) == len(set(ids)))
 
     print(f"\nselftest: {passed} passed, {failed} failed")

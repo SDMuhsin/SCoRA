@@ -28,6 +28,7 @@ Usage:
 """
 import argparse
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -185,6 +186,10 @@ DERIVED_SCALE = {
 #   every rung, because `[R.312]` is the study that showed budget, not r or s, is the
 #   dominant axis -- a rung off-budget would be measuring that instead.
 LADDER = [(1, 128), (2, 64), (4, 32), (8, 16)]
+# ⭐ [USER REQUEST 2026-09-23] the extension rungs, frozen in R315_halfAext_prereg.md.
+#   ⛔ A SEPARATE list, and `halfA` still iterates LADDER alone: the four scored rungs must
+#     keep their exact cell set, ids and digest.  s=1 is the endpoint of the axis.
+LADDER_EXT = [(16, 8), (32, 4), (64, 2), (128, 1)]
 
 # Half B -- the nine arms, in the letter's table order.
 ARMS = FA.ARM_ORDER
@@ -228,6 +233,8 @@ PREREG_SHA256 = {
     # Half B's verdict: all five predictions pass, PB1 and PB3 both caveated, and an
     # unplanned duplicate-cell null puts run-to-run nondeterminism at 0.0049
     "R315_halfB_verdict.md":      "d0faa0e98a1bd7ba",
+    # [USER REQUEST 2026-09-23] the extension rungs r=16..128, frozen before any ext cell
+    "R315_halfAext_prereg.md":    "94f21004036e946a",
     # v2: the SmolLM2-135M backbone + the one-common-recipe regime, both [USER DECISION
     # 2026-09-21], frozen before any cell of THIS plan exists
     "R315_prereg_v2.md":          "fa44c71d1cdb4e1b",
@@ -520,6 +527,10 @@ def cells(stage):
         for (r, s) in LADDER:
             out.append({"stage": "halfA", "arm": "scora", "r": r, "s": s,
                         "epochs": EPOCHS, "seeds": list(SEEDS)})
+    elif stage == "halfAext":
+        for (r, s) in LADDER_EXT:
+            out.append({"stage": "halfAext", "arm": "scora", "r": r, "s": s,
+                        "epochs": EPOCHS, "seeds": list(SEEDS)})
     elif stage == "halfB":
         for arm in ARMS:
             out.append({"stage": "halfB", "arm": arm,
@@ -546,6 +557,8 @@ def cell_id(c):
         return f"r315{PLAN_VERSION}-s0-{c['arm']}-p{_f(c['p']).replace('.', 'p')}"
     if c["stage"] == "halfA":
         return f"r315{PLAN_VERSION}-A-scora-r{c['r']}s{c['s']}"
+    if c["stage"] == "halfAext":
+        return f"r315{PLAN_VERSION}-Aext-scora-r{c['r']}s{c['s']}"
     return f"r315{PLAN_VERSION}-B-{c['arm']}"
 
 
@@ -553,7 +566,7 @@ def cell_cmd(c):
     name = cell_id(c)
     f = ["env/bin/python", "-u", "src/train_clm.py"]
     f += common_flags(c["epochs"], c["seeds"], name)
-    if c["stage"] == "halfA":
+    if c["stage"] in ("halfA", "halfAext"):
         f += arm_flags("scora", rank=c["r"], s=c["s"])
     elif c["stage"] in ("stage0", "stage0ext"):
         f += arm_flags(c["arm"], lr=COMMON_LR * c["p"])
@@ -574,7 +587,7 @@ def digest():
 
 
 def show():
-    for st in ("stage0", "stage0ext", "halfA", "halfB"):
+    for st in ("stage0", "stage0ext", "halfA", "halfAext", "halfB"):
         cs = cells(st)
         print(f"\n=== {st}: {len(cs)} cells, {n_seed_runs(st)} seed-runs ===")
         for c in cs:
@@ -604,9 +617,37 @@ def selftest():
     check("G1b the ladder spans r = 1..8 with no repeats",
           sorted(r for r, _ in LADDER) == [1, 2, 4, 8])
 
+    # G14 ⭐ the extension ladder (R315_halfAext_prereg.md), gated like the frozen one.
+    check("G14 every extension rung is exactly 256 params/module (2*r*s)",
+          all(2 * r * s == 256 for r, s in LADDER_EXT),
+          detail=str([(r, s, 2 * r * s) for r, s in LADDER_EXT]))
+    check("G14b the extension spans r = 16..128 with no repeats",
+          sorted(r for r, _ in LADDER_EXT) == [16, 32, 64, 128])
+    check("G14c ⛔ the FROZEN ladder is untouched -- halfA still yields exactly its four "
+          "scored rungs, so no marker or id of it can shift",
+          [(c["r"], c["s"]) for c in cells("halfA")] == LADDER,
+          detail=str([(c["r"], c["s"]) for c in cells("halfA")]))
+    check("G14d ⛔ no extension cell id collides with a halfA one (a collision would let "
+          "the resumable driver SKIP a cell -- the v1/v2 incident, in a new form)",
+          not ({cell_id(c) for c in cells("halfAext")}
+               & {cell_id(c) for c in cells("halfA")}))
+    check("G14e the extension rungs carry --slr_init_norm unit too, so their per-row step "
+          "is EXACTLY REF_ATOM (the atom_of probe that said otherwise is the one-row "
+          "instrument R315_prereg_v2 1.2 names as defective)",
+          all("--slr_init_norm unit" in " ".join(arm_flags("scora", rank=r, s=s_))
+              for r, s_ in LADDER_EXT))
+    check("G14f every extension cell is scora at the study lr, 3 epochs, 5 seeds",
+          all(c["arm"] == "scora" and c["epochs"] == EPOCHS
+              and c["seeds"] == list(SEEDS) for c in cells("halfAext")))
+    check("G14g s=1 is the axis ENDPOINT -- no rung asks for s<1",
+          min(s_ for _r, s_ in LADDER_EXT) == 1)
+    check("G14h ⛔ the extension does NOT enter digest(), so v1's recorded plan digest "
+          "900a793917f2e778 stays reproducible", "halfAext" not in
+          inspect.getsource(digest))
+
     # G2 ⭐⭐ ONE COMMON RECIPE: every arm and every rung carries the SAME lr.
     lrs = {}
-    for st in ("halfA", "halfB"):
+    for st in ("halfA", "halfAext", "halfB"):
         for c in cells(st):
             cmd = cell_cmd(c)
             lrs[cell_id(c)] = cmd[cmd.index("--learning_rate") + 1]
@@ -620,7 +661,7 @@ def selftest():
     for knob in ("--weight_decay", "--num_train_epochs", "--warmup_ratio",
                  "--per_device_train_batch_size", "--block_size"):
         vals = set()
-        for st in ("halfA", "halfB"):
+        for st in ("halfA", "halfAext", "halfB"):
             for c in cells(st):
                 cmd = cell_cmd(c)
                 vals.add(cmd[cmd.index(knob) + 1])
