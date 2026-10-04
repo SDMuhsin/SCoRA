@@ -111,6 +111,9 @@ def GEMM(b: int, m: int, n: int) -> float:
     return 2.0 * b * m * n
 
 
+LORA_R = 1          # the smallest rank LoRA admits; see arm_build_flops
+
+
 def _haar_tail(d: int) -> int:
     """Final approximation-block length of the Mallat pyramid on length `d`
     (halve while even and > 1).  d=768 -> 3.  Mirrors haar_lengths() in
@@ -155,6 +158,8 @@ def _ARM_TO_COUNTER(key):
         return "lyra_factored", {}
     if key.startswith("scora"):
         return "slr_factored", {}
+    if key == "lora":
+        return "lora_matched_k", {"r": LORA_R}
     raise KeyError(key)
 
 
@@ -182,6 +187,13 @@ def arm_build_flops(key: str, d: int) -> float:
     if key.startswith("scora"):
         s_ = t_ = ADAPTER_K // 2
         return 2 * d * s_ + 2 * d * t_ + 2 * d * d
+    if key == "lora":
+        # dW = B A with B: d x r and A: r x d -- one GEMM, 2 d^2 r.
+        # ⛔ r=1 is not a matched budget: r(m+n) = 2d = 1536 parameters per
+        #    module against the 256 every other row trains, which is the floor
+        #    the letter's introduction states and the reason this row is a
+        #    reference and not a comparator.
+        return 2 * d * d * LORA_R
     raise KeyError(key)
 
 

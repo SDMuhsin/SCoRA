@@ -57,6 +57,8 @@ GATES = [
     ("scripts/r248_sign_audit.py",    "sign-stability audit"),
     ("scratchpad/phaseR/r261_rescan.py", "near-floor re-scan"),
     ("scripts/build_prl_tables.py",   "the letter's tables: arm set, five seeds per cell, the two headline gate outcomes"),
+    ("scripts/build_spl_tables.py",   "the SPL letter's folded table: every cell is the PRL cell, "
+                                      "one blank per arm per task the backbone does not run"),
     ("scripts/r313_plan.py",         "[R.313] the basis control: arg strings differ in exactly --slr_basis"),
     ("scripts/r314_plan.py",         "[R.314] the scale ladder: one flag per rung, and the frozen predictions scored mechanically"),
     ("src/train_clm.py",            "[clm] the causal-LM trainer: ADAPTER-ONLY receipt, and the adapter "

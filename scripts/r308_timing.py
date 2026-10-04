@@ -77,7 +77,7 @@ ALIAS = {"scora2": "scora",
 # the same math that this repo owns -- `fftm` (merged, the row [R.305] reports)
 # and `fftfast` -- so the method is not disadvantaged by its vendored code.
 ARM_ORDER = ["frozen", "fftm", "fftfast", "loca", "qwha",
-             "scora", "scora_factored", "wave1", "wave2", "lyra"]
+             "scora", "scora_factored", "wave1", "wave2", "lyra", "lora"]
 
 TITLES = {
     "frozen":         "frozen nn.Linear (reference)",
@@ -90,6 +90,11 @@ TITLES = {
     "wave1":          "WaveFT mu=1 (published)",
     "wave2":          "WaveFT mu=2 (repo fix)",
     "lyra":           "LYRA",
+    # ⛔ NOT AT THE BUDGET, and the row must say so: r=1 is the smallest rank
+    #    LoRA admits and costs r(m+n) = 1536 parameters per module against the
+    #    256 every other arm trains.  It is here as the non-frequency reference
+    #    Table I already carries, not as a matched comparator.
+    "lora":           "LoRA (r=1, 6x the budget)",
 }
 
 
@@ -134,6 +139,9 @@ def build(arm, device, dtype):
         from fourierft_fast import FourierFTFastLinear
         return FourierFTFastLinear(base, n_frequency=K, scaling=100.0,
                                    random_loc_seed=777).to(device)
+    if arm == "lora":
+        from bench_adapter_cost import LoRALinear, LORA_R
+        return LoRALinear(base, r=LORA_R, alpha=1.0).to(device)
     if arm == "lyra":
         from spectral_adapter import SpectralAdapterLinear
         return SpectralAdapterLinear(base, p=16, q=16, scaling=0.05, d_initial=0.07,
