@@ -37,3 +37,14 @@ sbatch/*/baseline_proxy.json
 env_stage06/
 runs_local/
 runs_local_control/
+
+# ⛔ THE PAPER AND ITS BUILDERS ARE NOT TRACKED (2026-10-04, [user]).
+#   `llmdocs` (above) holds the manuscripts; these five scripts generate the
+#   tables and figures inside them and are the same artefact by another name.
+#   `run_all_gates.py` already reports an absent instrument as MISSING and
+#   carries on, so a clone without them still runs every other gate.
+scripts/build_prl_tables.py
+scripts/build_spl_tables.py
+scripts/build_ladder_figure.py
+scripts/build_architecture_data.py
+scripts/r311_camera_ready.py

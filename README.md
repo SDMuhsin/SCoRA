@@ -26,14 +26,11 @@ scale `gamma` is fixed in closed form rather than searched.
 | `src/verify_slr.py` | its checks |
 | `src/train_glue.py` | encoder training and evaluation |
 | `src/train_clm.py` | causal-LM training, used by the rank-against-support ablation |
-| `scripts/build_spl_tables.py` | generates every table and figure in the paper, with `--selftest` |
 | `scripts/run_all_gates.py` | runs every instrument's checks |
 
 Comparator implementations: `src/merged_fourierft.py` (FourierFT), `src/haar_adapter.py`
 (WaveFT), `src/loca_adapter.py` (LoCA), `src/qwha_adapter.py` (QWHA),
 `src/spectral_adapter.py` (LYRA).
-
-The letter and its supplement are in `llmdocs/paper/scora_v2_spl/`.
 
 ## Running it
 
